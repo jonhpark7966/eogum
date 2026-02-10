@@ -31,7 +31,7 @@
 - [ ] Job queue (Redis/Celery)
 
 ### Infra
-- [ ] Cloudflare Tunnel 설정 (api.eogum.sudoremove.com)
+- [ ] Cloudflare Tunnel 설정 (api-eogum.sudoremove.com)
 - [ ] Vercel 커스텀 도메인 (eogum.sudoremove.com)
 - [ ] R2 bucket 생성 + lifecycle rule (1년)
 - [ ] 이메일 서비스 설정 (Resend 또는 SES)

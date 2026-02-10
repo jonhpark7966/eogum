@@ -39,6 +39,8 @@ export default function DashboardPage() {
   const [credits, setCredits] = useState<CreditBalance | null>(null);
   const [loading, setLoading] = useState(true);
 
+  const [error, setError] = useState<string | null>(null);
+
   const loadData = useCallback(async () => {
     const {
       data: { session },
@@ -48,14 +50,21 @@ export default function DashboardPage() {
       return;
     }
 
-    const token = session.access_token;
-    const [projectList, creditBalance] = await Promise.all([
-      api.listProjects(token),
-      api.getCredits(token),
-    ]);
-    setProjects(projectList);
-    setCredits(creditBalance);
-    setLoading(false);
+    try {
+      const token = session.access_token;
+      const [projectList, creditBalance] = await Promise.all([
+        api.listProjects(token),
+        api.getCredits(token),
+      ]);
+      setProjects(projectList);
+      setCredits(creditBalance);
+      setError(null);
+    } catch (e) {
+      console.error("API 호출 실패:", e);
+      setError("서버에 연결할 수 없습니다. 잠시 후 다시 시도해주세요.");
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -105,6 +114,11 @@ export default function DashboardPage() {
 
       {/* Content */}
       <main className="max-w-6xl mx-auto px-6 py-8">
+        {error && (
+          <div className="mb-6 p-4 bg-red-900/30 border border-red-800 rounded-lg text-red-300 text-sm">
+            {error}
+          </div>
+        )}
         <div className="flex justify-between items-center mb-8">
           <h2 className="text-2xl font-semibold">프로젝트</h2>
           <button

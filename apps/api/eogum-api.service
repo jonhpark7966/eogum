@@ -1,0 +1,15 @@
+[Unit]
+Description=eogum API Server
+After=network.target
+
+[Service]
+Type=simple
+User=jonhpark
+WorkingDirectory=/home/jonhpark/workspace/eogum/apps/api
+ExecStart=/home/jonhpark/workspace/eogum/apps/api/.venv/bin/uvicorn eogum.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+EnvironmentFile=/home/jonhpark/workspace/eogum/apps/api/.env
+
+[Install]
+WantedBy=multi-user.target

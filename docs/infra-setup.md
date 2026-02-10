@@ -95,7 +95,7 @@ tunnel: <TUNNEL_ID>
 credentials-file: /home/jonhpark/.cloudflared/<TUNNEL_ID>.json
 
 ingress:
-  - hostname: api.eogum.sudoremove.com
+  - hostname: api-eogum.sudoremove.com
     service: http://localhost:8000
   - service: http_status:404
 ```
@@ -103,7 +103,7 @@ ingress:
 ### DNS 설정
 ```bash
 # Cloudflare DNS에 CNAME 추가
-cloudflared tunnel route dns eogum-api api.eogum.sudoremove.com
+cloudflared tunnel route dns eogum-api api-eogum.sudoremove.com
 ```
 
 ### 서비스 등록 (자동 시작)
@@ -125,7 +125,7 @@ npx vercel link
 Vercel Dashboard > Settings > Environment Variables:
 - `NEXT_PUBLIC_SUPABASE_URL`
 - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
-- `NEXT_PUBLIC_API_URL` = `https://api.eogum.sudoremove.com/api/v1`
+- `NEXT_PUBLIC_API_URL` = `https://api-eogum.sudoremove.com/api/v1`
 
 ### 커스텀 도메인
 1. Vercel Dashboard > Settings > Domains
@@ -195,7 +195,7 @@ sudo systemctl start eogum-api
 - [ ] Cloudflare R2 버킷 생성 + lifecycle rule + CORS
 - [ ] R2 API 토큰 생성
 - [ ] Cloudflare Tunnel 설치 + 설정
-- [ ] DNS: api.eogum.sudoremove.com → Tunnel
+- [ ] DNS: api-eogum.sudoremove.com → Tunnel
 - [ ] DNS: eogum.sudoremove.com → Vercel
 - [ ] Vercel 프로젝트 연결 + 환경 변수
 - [ ] 홈 서버 .env 설정

@@ -19,6 +19,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://eogum.sudoremove.com",
+        "https://eogum.vercel.app",
         "http://localhost:3000",
     ],
     allow_credentials=True,

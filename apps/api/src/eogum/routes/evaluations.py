@@ -8,10 +8,17 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from eogum.auth import get_user_id
 from eogum.config import settings
+from collections import Counter
+
 from eogum.models.schemas import (
     AiDecision,
+    ConfusionMatrix,
+    DisagreementDetail,
+    EvalMetrics,
+    EvalReportResponse,
     EvaluationResponse,
     EvaluationSave,
+    ReasonBreakdown,
     SegmentsResponse,
     SegmentWithDecision,
     VideoUrlResponse,
@@ -258,3 +265,138 @@ def save_evaluation(
         data = result.data[0]
 
     return data
+
+
+@router.get("/eval-report", response_model=EvalReportResponse)
+def get_eval_report(project_id: str, user_id: str = Depends(get_user_id)):
+    """Compare AI decisions vs human ground truth and produce a report."""
+    db = get_db()
+
+    # Get evaluation
+    eval_result = (
+        db.table("evaluations")
+        .select("*")
+        .eq("project_id", project_id)
+        .eq("evaluator_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not eval_result.data:
+        raise HTTPException(status_code=404, detail="평가 데이터가 없습니다")
+
+    evaluation = eval_result.data[0]
+    segments = evaluation["segments"]
+
+    # Classify each segment
+    tp = tn = fp = fn = 0
+    ai_cut_ms = 0
+    truth_cut_ms = 0
+    ai_cut_count = 0
+    truth_cut_count = 0
+    fp_reasons: Counter = Counter()
+    fn_reasons: Counter = Counter()
+    fp_ms: Counter = Counter()
+    fn_ms: Counter = Counter()
+    disagreements: list[DisagreementDetail] = []
+
+    for seg in segments:
+        ai = seg.get("ai", {})
+        human = seg.get("human")
+        ai_action = ai.get("action", "keep")
+        ai_reason = ai.get("reason", "")
+        duration_ms = seg.get("end_ms", 0) - seg.get("start_ms", 0)
+
+        # Ground truth: human if reviewed, else same as AI (implicit agree)
+        if human:
+            truth_action = human.get("action", "keep")
+            human_reason = human.get("reason", "")
+            human_note = human.get("note", "")
+        else:
+            truth_action = ai_action
+            human_reason = ""
+            human_note = ""
+
+        # Count AI cuts and truth cuts
+        if ai_action == "cut":
+            ai_cut_count += 1
+            ai_cut_ms += duration_ms
+        if truth_action == "cut":
+            truth_cut_count += 1
+            truth_cut_ms += duration_ms
+
+        # Confusion matrix (cut = positive)
+        if ai_action == "cut" and truth_action == "cut":
+            tp += 1
+        elif ai_action == "keep" and truth_action == "keep":
+            tn += 1
+        elif ai_action == "cut" and truth_action == "keep":
+            fp += 1
+            fp_reasons[ai_reason or "(없음)"] += 1
+            fp_ms[ai_reason or "(없음)"] += duration_ms
+            disagreements.append(DisagreementDetail(
+                index=seg["index"],
+                start_ms=seg["start_ms"],
+                end_ms=seg["end_ms"],
+                text=seg.get("text", ""),
+                ai_action=ai_action,
+                ai_reason=ai_reason,
+                human_action=truth_action,
+                human_reason=human_reason,
+                human_note=human_note,
+            ))
+        elif ai_action == "keep" and truth_action == "cut":
+            fn += 1
+            fn_reasons[human_reason or "(없음)"] += 1
+            fn_ms[human_reason or "(없음)"] += duration_ms
+            disagreements.append(DisagreementDetail(
+                index=seg["index"],
+                start_ms=seg["start_ms"],
+                end_ms=seg["end_ms"],
+                text=seg.get("text", ""),
+                ai_action=ai_action,
+                ai_reason=ai_reason,
+                human_action=truth_action,
+                human_reason=human_reason,
+                human_note=human_note,
+            ))
+
+    total = tp + tn + fp + fn
+    total_disagree = fp + fn
+    agreement_rate = (total - total_disagree) / total if total > 0 else 0.0
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 1.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 1.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    accuracy = (tp + tn) / total if total > 0 else 0.0
+
+    human_reviewed = sum(1 for s in segments if s.get("human"))
+
+    return EvalReportResponse(
+        project_id=project_id,
+        avid_version=evaluation.get("avid_version"),
+        eogum_version=evaluation.get("eogum_version"),
+        total_segments=total,
+        human_reviewed=human_reviewed,
+        implicit_agree=total - human_reviewed,
+        agreement_rate=round(agreement_rate, 4),
+        confusion=ConfusionMatrix(tp=tp, tn=tn, fp=fp, fn=fn),
+        metrics=EvalMetrics(
+            accuracy=round(accuracy, 4),
+            precision=round(precision, 4),
+            recall=round(recall, 4),
+            f1=round(f1, 4),
+        ),
+        ai_cut_count=ai_cut_count,
+        ai_cut_ms=ai_cut_ms,
+        truth_cut_count=truth_cut_count,
+        truth_cut_ms=truth_cut_ms,
+        fp_reasons=sorted(
+            [ReasonBreakdown(reason=r, count=c, total_ms=fp_ms[r]) for r, c in fp_reasons.items()],
+            key=lambda x: x.count, reverse=True,
+        ),
+        fn_reasons=sorted(
+            [ReasonBreakdown(reason=r, count=c, total_ms=fn_ms[r]) for r, c in fn_reasons.items()],
+            key=lambda x: x.count, reverse=True,
+        ),
+        disagreements=sorted(disagreements, key=lambda x: x.index),
+    )

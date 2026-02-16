@@ -140,6 +140,58 @@ class VideoUrlResponse(BaseModel):
     duration_ms: int
 
 
+# ── Eval Report ──
+class ConfusionMatrix(BaseModel):
+    tp: int  # AI=cut, truth=cut (correct cut)
+    tn: int  # AI=keep, truth=keep (correct keep)
+    fp: int  # AI=cut, truth=keep (wrongly cut)
+    fn: int  # AI=keep, truth=cut (missed cut)
+
+
+class EvalMetrics(BaseModel):
+    accuracy: float
+    precision: float  # TP/(TP+FP) — AI cut 중 맞은 비율
+    recall: float  # TP/(TP+FN) — 실제 cut 중 AI가 찾은 비율
+    f1: float
+
+
+class ReasonBreakdown(BaseModel):
+    reason: str
+    count: int
+    total_ms: int
+
+
+class DisagreementDetail(BaseModel):
+    index: int
+    start_ms: int
+    end_ms: int
+    text: str
+    ai_action: str
+    ai_reason: str
+    human_action: str
+    human_reason: str
+    human_note: str
+
+
+class EvalReportResponse(BaseModel):
+    project_id: str
+    avid_version: str | None
+    eogum_version: str | None
+    total_segments: int
+    human_reviewed: int
+    implicit_agree: int
+    agreement_rate: float  # (total - disagreements) / total
+    confusion: ConfusionMatrix
+    metrics: EvalMetrics
+    ai_cut_count: int
+    ai_cut_ms: int
+    truth_cut_count: int
+    truth_cut_ms: int
+    fp_reasons: list[ReasonBreakdown]  # AI가 잘못 cut한 이유별
+    fn_reasons: list[ReasonBreakdown]  # AI가 놓친 cut의 이유별
+    disagreements: list[DisagreementDetail]
+
+
 # ── Downloads ──
 class DownloadResponse(BaseModel):
     download_url: str

@@ -132,6 +132,57 @@ export interface VideoUrlResponse {
   duration_ms: number;
 }
 
+export interface ConfusionMatrix {
+  tp: number;
+  tn: number;
+  fp: number;
+  fn: number;
+}
+
+export interface EvalMetrics {
+  accuracy: number;
+  precision: number;
+  recall: number;
+  f1: number;
+}
+
+export interface ReasonBreakdown {
+  reason: string;
+  count: number;
+  total_ms: number;
+}
+
+export interface DisagreementDetail {
+  index: number;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  ai_action: string;
+  ai_reason: string;
+  human_action: string;
+  human_reason: string;
+  human_note: string;
+}
+
+export interface EvalReportResponse {
+  project_id: string;
+  avid_version: string | null;
+  eogum_version: string | null;
+  total_segments: number;
+  human_reviewed: number;
+  implicit_agree: number;
+  agreement_rate: number;
+  confusion: ConfusionMatrix;
+  metrics: EvalMetrics;
+  ai_cut_count: number;
+  ai_cut_ms: number;
+  truth_cut_count: number;
+  truth_cut_ms: number;
+  fp_reasons: ReasonBreakdown[];
+  fn_reasons: ReasonBreakdown[];
+  disagreements: DisagreementDetail[];
+}
+
 // ── API Functions ──
 export const api = {
   // Upload
@@ -197,4 +248,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ segments }),
     }),
+
+  getEvalReport: (token: string, projectId: string) =>
+    apiFetch<EvalReportResponse>(`/projects/${projectId}/eval-report`, token),
 };

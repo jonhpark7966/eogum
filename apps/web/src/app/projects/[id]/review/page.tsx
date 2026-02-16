@@ -6,6 +6,7 @@ import { createClient } from "@/lib/supabase/client";
 import {
   api,
   type EvalSegment,
+  type EvalReportResponse,
   type SegmentWithDecision,
 } from "@/lib/api";
 import { useParams, useRouter } from "next/navigation";
@@ -58,6 +59,9 @@ export default function ReviewPage() {
   const [currentIndex, setCurrentIndex] = useState(-1);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [report, setReport] = useState<EvalReportResponse | null>(null);
+  const [showReport, setShowReport] = useState(false);
+  const [loadingReport, setLoadingReport] = useState(false);
 
   // Load all data
   const loadData = useCallback(async () => {
@@ -215,6 +219,23 @@ export default function ReviewPage() {
     setSaving(false);
   };
 
+  // Load report
+  const loadReport = async () => {
+    setLoadingReport(true);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      if (!session) return;
+      const r = await api.getEvalReport(session.access_token, projectId);
+      setReport(r);
+      setShowReport(true);
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "리포트 로딩 실패");
+    }
+    setLoadingReport(false);
+  };
+
   // Stats
   const totalSegments = segments.length;
   const reviewedCount = segments.filter((s) => s.human !== null).length;
@@ -256,6 +277,19 @@ export default function ReviewPage() {
               <span className="text-amber-400 text-xs">● 변경사항 있음</span>
             )}
             <button
+              onClick={() => {
+                if (showReport) {
+                  setShowReport(false);
+                } else {
+                  loadReport();
+                }
+              }}
+              disabled={loadingReport}
+              className="px-4 py-1.5 rounded-lg text-sm font-medium transition bg-gray-800 text-gray-300 hover:bg-gray-700"
+            >
+              {loadingReport ? "분석 중..." : showReport ? "목록으로" : "리포트"}
+            </button>
+            <button
               onClick={handleSave}
               disabled={saving || !dirty}
               className={`px-4 py-1.5 rounded-lg text-sm font-medium transition ${
@@ -293,7 +327,169 @@ export default function ReviewPage() {
         </div>
       </div>
 
+      {/* Report Panel */}
+      {showReport && report && (
+        <main className="max-w-4xl mx-auto px-6 py-6">
+          <div className="space-y-6">
+            {/* Header */}
+            <div>
+              <h2 className="text-lg font-bold mb-1">Eval Report</h2>
+              <p className="text-xs text-gray-500">
+                avid: {report.avid_version ?? "?"} / eogum: {report.eogum_version ?? "?"}
+              </p>
+            </div>
+
+            {/* Overview */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              {[
+                { label: "전체 세그먼트", value: report.total_segments, color: "text-white" },
+                { label: "직접 리뷰", value: report.human_reviewed, color: "text-white" },
+                { label: "일치율", value: `${(report.agreement_rate * 100).toFixed(1)}%`, color: report.agreement_rate >= 0.9 ? "text-green-400" : report.agreement_rate >= 0.8 ? "text-yellow-400" : "text-red-400" },
+                { label: "불일치", value: report.confusion.fp + report.confusion.fn, color: "text-red-400" },
+              ].map((item) => (
+                <div key={item.label} className="bg-gray-900 rounded-lg p-3">
+                  <div className="text-xs text-gray-500 mb-1">{item.label}</div>
+                  <div className={`text-xl font-bold ${item.color}`}>{item.value}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Confusion Matrix */}
+            <div className="bg-gray-900 rounded-lg p-4">
+              <h3 className="text-sm font-semibold mb-3">Confusion Matrix (cut = positive)</h3>
+              <div className="grid grid-cols-3 gap-px bg-gray-700 rounded overflow-hidden text-center text-sm">
+                <div className="bg-gray-900 p-2"></div>
+                <div className="bg-gray-900 p-2 text-gray-400 font-medium">Human: Cut</div>
+                <div className="bg-gray-900 p-2 text-gray-400 font-medium">Human: Keep</div>
+                <div className="bg-gray-900 p-2 text-gray-400 font-medium">AI: Cut</div>
+                <div className="bg-green-900/30 p-2 font-bold text-green-400">TP {report.confusion.tp}</div>
+                <div className="bg-red-900/30 p-2 font-bold text-red-400">FP {report.confusion.fp}</div>
+                <div className="bg-gray-900 p-2 text-gray-400 font-medium">AI: Keep</div>
+                <div className="bg-red-900/30 p-2 font-bold text-red-400">FN {report.confusion.fn}</div>
+                <div className="bg-green-900/30 p-2 font-bold text-green-400">TN {report.confusion.tn}</div>
+              </div>
+            </div>
+
+            {/* Metrics */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              {[
+                { label: "Accuracy", value: report.metrics.accuracy, desc: "전체 정확도" },
+                { label: "Precision", value: report.metrics.precision, desc: "AI cut 중 맞은 비율" },
+                { label: "Recall", value: report.metrics.recall, desc: "실제 cut 중 AI가 찾은 비율" },
+                { label: "F1", value: report.metrics.f1, desc: "Precision·Recall 조화평균" },
+              ].map((m) => (
+                <div key={m.label} className="bg-gray-900 rounded-lg p-3">
+                  <div className="text-xs text-gray-500 mb-1" title={m.desc}>{m.label}</div>
+                  <div className="text-xl font-bold">{(m.value * 100).toFixed(1)}%</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Time Impact */}
+            <div className="bg-gray-900 rounded-lg p-4">
+              <h3 className="text-sm font-semibold mb-3">시간 비교</h3>
+              <div className="grid grid-cols-2 gap-4 text-sm">
+                <div>
+                  <span className="text-gray-500">AI가 자른 시간:</span>{" "}
+                  <span className="font-mono">{formatTime(report.ai_cut_ms)}</span>
+                  <span className="text-gray-600 text-xs ml-1">({report.ai_cut_count}개)</span>
+                </div>
+                <div>
+                  <span className="text-gray-500">실제 잘라야 할 시간:</span>{" "}
+                  <span className="font-mono">{formatTime(report.truth_cut_ms)}</span>
+                  <span className="text-gray-600 text-xs ml-1">({report.truth_cut_count}개)</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Error Analysis */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {/* FP: AI가 잘못 자른 것 */}
+              <div className="bg-gray-900 rounded-lg p-4">
+                <h3 className="text-sm font-semibold mb-2 text-red-400">
+                  FP — AI가 잘못 자름 ({report.confusion.fp}개)
+                </h3>
+                <p className="text-xs text-gray-500 mb-3">AI가 cut했지만 사람은 keep</p>
+                {report.fp_reasons.length === 0 ? (
+                  <p className="text-xs text-gray-600">없음</p>
+                ) : (
+                  <div className="space-y-1">
+                    {report.fp_reasons.map((r) => (
+                      <div key={r.reason} className="flex justify-between text-sm">
+                        <span className="text-gray-300">{r.reason}</span>
+                        <span className="text-gray-500">{r.count}개 · {formatTime(r.total_ms)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* FN: AI가 놓친 것 */}
+              <div className="bg-gray-900 rounded-lg p-4">
+                <h3 className="text-sm font-semibold mb-2 text-amber-400">
+                  FN — AI가 놓침 ({report.confusion.fn}개)
+                </h3>
+                <p className="text-xs text-gray-500 mb-3">사람은 cut했지만 AI는 keep</p>
+                {report.fn_reasons.length === 0 ? (
+                  <p className="text-xs text-gray-600">없음</p>
+                ) : (
+                  <div className="space-y-1">
+                    {report.fn_reasons.map((r) => (
+                      <div key={r.reason} className="flex justify-between text-sm">
+                        <span className="text-gray-300">{r.reason}</span>
+                        <span className="text-gray-500">{r.count}개 · {formatTime(r.total_ms)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Disagreement Detail List */}
+            <div className="bg-gray-900 rounded-lg p-4">
+              <h3 className="text-sm font-semibold mb-3">
+                불일치 세그먼트 ({report.disagreements.length}개)
+              </h3>
+              <div className="space-y-2 max-h-[400px] overflow-y-auto">
+                {report.disagreements.map((d) => (
+                  <div
+                    key={d.index}
+                    className="bg-gray-800 rounded p-2 text-sm cursor-pointer hover:bg-gray-750"
+                    onClick={() => {
+                      setShowReport(false);
+                      setTimeout(() => {
+                        const el = segmentRefs.current.get(d.index);
+                        el?.scrollIntoView({ behavior: "smooth", block: "center" });
+                      }, 100);
+                    }}
+                  >
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="text-xs text-gray-500">#{d.index}</span>
+                      <span className="text-xs font-mono text-gray-400">
+                        {formatTime(d.start_ms)}→{formatTime(d.end_ms)}
+                      </span>
+                      <span className={`text-xs px-1.5 py-0.5 rounded ${d.ai_action === "cut" ? "bg-red-900/50 text-red-300" : "bg-green-900/50 text-green-300"}`}>
+                        AI: {d.ai_action} {d.ai_reason && `(${d.ai_reason})`}
+                      </span>
+                      <span className="text-xs text-gray-600">→</span>
+                      <span className={`text-xs px-1.5 py-0.5 rounded ${d.human_action === "cut" ? "bg-red-900/50 text-red-300" : "bg-green-900/50 text-green-300"}`}>
+                        사람: {d.human_action} {d.human_reason && `(${d.human_reason})`}
+                      </span>
+                    </div>
+                    <p className="text-xs text-gray-400 truncate">{d.text}</p>
+                    {d.human_note && (
+                      <p className="text-xs text-gray-500 mt-1">메모: {d.human_note}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </main>
+      )}
+
       {/* Segment List */}
+      {!showReport && (
       <main className="max-w-4xl mx-auto px-6 py-4">
         <div className="space-y-2">
           {segments.map((seg) => {
@@ -412,6 +608,7 @@ export default function ReviewPage() {
           })}
         </div>
       </main>
+      )}
     </div>
   );
 }

@@ -239,7 +239,7 @@ def save_evaluation(
                 "avid_version": avid_version,
                 "eogum_version": eogum_version,
             })
-            .eq("id", existing.data["id"])
+            .eq("id", existing.data[0]["id"])
             .execute()
         )
         data = result.data[0]

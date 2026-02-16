@@ -79,6 +79,59 @@ export interface DownloadResponse {
   filename: string;
 }
 
+// ── Evaluation ──
+export interface AiDecision {
+  action: string;
+  reason: string;
+  confidence: number;
+  note: string | null;
+}
+
+export interface HumanDecision {
+  action: string;
+  reason: string;
+  note: string;
+}
+
+export interface SegmentWithDecision {
+  index: number;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  ai: AiDecision | null;
+}
+
+export interface EvalSegment {
+  index: number;
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  ai: AiDecision | null;
+  human: HumanDecision | null;
+}
+
+export interface SegmentsResponse {
+  segments: SegmentWithDecision[];
+  source_duration_ms: number;
+}
+
+export interface EvaluationResponse {
+  id: string;
+  project_id: string;
+  evaluator_id: string;
+  version: string;
+  avid_version: string | null;
+  eogum_version: string | null;
+  segments: EvalSegment[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface VideoUrlResponse {
+  video_url: string;
+  duration_ms: number;
+}
+
 // ── API Functions ──
 export const api = {
   // Upload
@@ -123,4 +176,25 @@ export const api = {
       `/projects/${projectId}/download/${fileType}`,
       token
     ),
+
+  // Evaluations
+  getSegments: (token: string, projectId: string) =>
+    apiFetch<SegmentsResponse>(`/projects/${projectId}/segments`, token),
+
+  getVideoUrl: (token: string, projectId: string) =>
+    apiFetch<VideoUrlResponse>(`/projects/${projectId}/video-url`, token),
+
+  getEvaluation: async (token: string, projectId: string): Promise<EvaluationResponse | null> => {
+    try {
+      return await apiFetch<EvaluationResponse>(`/projects/${projectId}/evaluation`, token);
+    } catch {
+      return null;
+    }
+  },
+
+  saveEvaluation: (token: string, projectId: string, segments: EvalSegment[]) =>
+    apiFetch<EvaluationResponse>(`/projects/${projectId}/evaluation`, token, {
+      method: "POST",
+      body: JSON.stringify({ segments }),
+    }),
 };

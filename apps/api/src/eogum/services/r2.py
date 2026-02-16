@@ -57,6 +57,23 @@ def generate_presigned_download(r2_key: str, filename: str) -> str:
     )
 
 
+def generate_presigned_stream(r2_key: str) -> str:
+    """Presigned GET for inline streaming (no Content-Disposition: attachment)."""
+    client = get_r2_client()
+    return client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": settings.r2_bucket_name, "Key": r2_key},
+        ExpiresIn=3600,
+    )
+
+
+def download_to_bytes(r2_key: str) -> bytes:
+    """Download file from R2 and return as bytes."""
+    client = get_r2_client()
+    response = client.get_object(Bucket=settings.r2_bucket_name, Key=r2_key)
+    return response["Body"].read()
+
+
 def download_file(r2_key: str, local_path: str) -> str:
     """Download file from R2 to local path."""
     client = get_r2_client()

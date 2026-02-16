@@ -22,7 +22,7 @@ def _run_avid(args: list[str], timeout: int = 3600) -> subprocess.CompletedProce
         text=True,
         timeout=timeout,
         env={
-            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "PATH": f"{Path.home() / '.local/bin'}:{Path.home() / '.nvm/versions/node/v25.3.0/bin'}:/usr/local/bin:/usr/bin:/bin",
             "HOME": str(Path.home()),
             "PYTHONPATH": str(settings.avid_cli_path / "src"),
         },

@@ -190,6 +190,12 @@ export default function ProjectDetailPage() {
               >
                 SRT 다운로드
               </button>
+              <button
+                onClick={() => router.push(`/projects/${projectId}/review`)}
+                className="px-4 py-2 bg-blue-600 rounded-lg hover:bg-blue-500 transition font-medium"
+              >
+                구간 리뷰
+              </button>
             </div>
           </div>
         )}

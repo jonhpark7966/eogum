@@ -105,6 +105,22 @@ def _process_project(project_id: str) -> None:
         )
         _update_progress(db, job_id, 75)
 
+        # 5.5. Generate low-quality preview for review page
+        import subprocess as sp
+        preview_path = str(output_dir / "preview.mp4")
+        try:
+            sp.run([
+                "ffmpeg", "-i", source_path,
+                "-vf", "scale=-2:480",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "28",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                "-y", preview_path,
+            ], check=True, timeout=600, capture_output=True)
+            result_paths["preview"] = preview_path
+        except Exception:
+            logger.warning("Preview generation failed for project %s, skipping", project_id)
+
         # 6. Upload results to R2
         r2_keys = {}
         for key, local_path in result_paths.items():
@@ -196,5 +212,6 @@ def _guess_content_type(key: str) -> str:
         "srt": "text/plain",
         "report": "text/markdown",
         "project_json": "application/json",
+        "preview": "video/mp4",
     }
     return types.get(key, "application/octet-stream")

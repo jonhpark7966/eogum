@@ -83,6 +83,63 @@ class EditReportResponse(BaseModel):
     report_markdown: str
 
 
+# ── Segments & Evaluation ──
+class AiDecision(BaseModel):
+    action: str  # "keep" | "cut"
+    reason: str
+    confidence: float
+    note: str | None = None
+
+
+class HumanDecision(BaseModel):
+    action: str  # "keep" | "cut"
+    reason: str
+    note: str = ""
+
+
+class SegmentWithDecision(BaseModel):
+    index: int
+    start_ms: int
+    end_ms: int
+    text: str
+    ai: AiDecision | None = None
+
+
+class EvalSegment(BaseModel):
+    index: int
+    start_ms: int
+    end_ms: int
+    text: str
+    ai: AiDecision | None = None
+    human: HumanDecision | None = None
+
+
+class SegmentsResponse(BaseModel):
+    segments: list[SegmentWithDecision]
+    source_duration_ms: int
+
+
+class EvaluationSave(BaseModel):
+    segments: list[EvalSegment]
+
+
+class EvaluationResponse(BaseModel):
+    id: str
+    project_id: str
+    evaluator_id: str
+    version: str
+    avid_version: str | None
+    eogum_version: str | None
+    segments: list[EvalSegment]
+    created_at: datetime
+    updated_at: datetime
+
+
+class VideoUrlResponse(BaseModel):
+    video_url: str
+    duration_ms: int
+
+
 # ── Downloads ──
 class DownloadResponse(BaseModel):
     download_url: str

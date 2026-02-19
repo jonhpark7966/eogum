@@ -156,4 +156,8 @@ def _collect_results(source_path: str, output_dir: str | None) -> dict:
     if avid_json:
         results["project_json"] = str(avid_json[0])
 
+    storyline = base_dir / "storyline.json"
+    if storyline.exists():
+        results["storyline"] = str(storyline)
+
     return results

@@ -3,9 +3,11 @@
 export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
-import { api, type ProjectDetail, type ExtraSource } from "@/lib/api";
+import { api, uploadFile, type ProjectDetail, type ExtraSource } from "@/lib/api";
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 function formatDuration(seconds: number): string {
   const h = Math.floor(seconds / 3600);
@@ -153,26 +155,25 @@ export default function ProjectDetailPage() {
 
     try {
       const newSources: ExtraSource[] = [];
+      const totalSize = pendingFiles.reduce((sum, f) => sum + f.size, 0);
+      let prevUploaded = 0;
+
       for (let i = 0; i < pendingFiles.length; i++) {
         const file = pendingFiles[i];
-        setUploadProgress(Math.round((i / pendingFiles.length) * 100));
+        const baseUploaded = prevUploaded;
 
-        // Presign
-        const presign = await api.presign(session.access_token, {
-          filename: file.name,
-          content_type: file.type || "video/mp4",
-          size_bytes: file.size,
-        });
+        const r2Key = await uploadFile(
+          session.access_token,
+          file,
+          (loaded) => {
+            setUploadProgress(Math.round(((baseUploaded + loaded) / totalSize) * 100));
+          }
+        );
 
-        // Upload to R2
-        await fetch(presign.upload_url, {
-          method: "PUT",
-          body: file,
-          headers: { "Content-Type": file.type || "video/mp4" },
-        });
+        prevUploaded += file.size;
 
         newSources.push({
-          r2_key: presign.r2_key,
+          r2_key: r2Key,
           filename: file.name,
           size_bytes: file.size,
         });
@@ -325,6 +326,12 @@ export default function ProjectDetailPage() {
                 SRT 다운로드
               </button>
               <button
+                onClick={() => handleDownload("storyline")}
+                className="px-4 py-2 bg-gray-800 rounded-lg hover:bg-gray-700 transition border border-gray-700"
+              >
+                스토리라인
+              </button>
+              <button
                 onClick={() => router.push(`/projects/${projectId}/review`)}
                 className="px-4 py-2 bg-blue-600 rounded-lg hover:bg-blue-500 transition font-medium"
               >
@@ -373,7 +380,7 @@ export default function ProjectDetailPage() {
             {/* Registered extra sources */}
             {project.extra_sources.length > 0 && (
               <div className="mb-4 space-y-2">
-                {project.extra_sources.map((src) => (
+                {project.extra_sources.map((src, i) => (
                   <div
                     key={src.r2_key}
                     className="flex items-center justify-between bg-gray-800 rounded-lg px-4 py-2"
@@ -383,6 +390,12 @@ export default function ProjectDetailPage() {
                       <span className="text-xs text-gray-400">
                         {(src.size_bytes / 1024 / 1024).toFixed(1)} MB
                       </span>
+                      <button
+                        onClick={() => handleDownloadExtraSource(i)}
+                        className="text-blue-400 hover:text-blue-300 text-sm"
+                      >
+                        다운로드
+                      </button>
                       <button
                         onClick={() => handleRemoveExtraSource(src.r2_key)}
                         className="text-red-400 hover:text-red-300 text-sm"
@@ -505,10 +518,10 @@ export default function ProjectDetailPage() {
             </div>
 
             {/* Markdown report */}
-            <div className="prose prose-invert prose-sm max-w-none">
-              <pre className="whitespace-pre-wrap text-sm text-gray-300 bg-gray-800 rounded-lg p-4 overflow-auto">
+            <div className="prose prose-invert prose-sm max-w-none [&_table]:w-full [&_th]:bg-gray-800 [&_th]:px-3 [&_th]:py-2 [&_td]:px-3 [&_td]:py-1.5 [&_tr]:border-b [&_tr]:border-gray-700">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
                 {project.report.report_markdown}
-              </pre>
+              </ReactMarkdown>
             </div>
           </div>
         )}

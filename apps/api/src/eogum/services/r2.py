@@ -67,6 +67,53 @@ def generate_presigned_stream(r2_key: str) -> str:
     )
 
 
+def create_multipart_upload(r2_key: str, content_type: str) -> str:
+    """Initiate multipart upload, return upload_id."""
+    client = get_r2_client()
+    resp = client.create_multipart_upload(
+        Bucket=settings.r2_bucket_name,
+        Key=r2_key,
+        ContentType=content_type,
+    )
+    return resp["UploadId"]
+
+
+def generate_presigned_upload_part(r2_key: str, upload_id: str, part_number: int) -> str:
+    """Generate presigned URL for uploading a single part."""
+    client = get_r2_client()
+    return client.generate_presigned_url(
+        "upload_part",
+        Params={
+            "Bucket": settings.r2_bucket_name,
+            "Key": r2_key,
+            "UploadId": upload_id,
+            "PartNumber": part_number,
+        },
+        ExpiresIn=3600,
+    )
+
+
+def complete_multipart_upload(r2_key: str, upload_id: str, parts: list[dict]) -> None:
+    """Complete multipart upload. parts = [{"PartNumber": int, "ETag": str}, ...]"""
+    client = get_r2_client()
+    client.complete_multipart_upload(
+        Bucket=settings.r2_bucket_name,
+        Key=r2_key,
+        UploadId=upload_id,
+        MultipartUpload={"Parts": parts},
+    )
+
+
+def abort_multipart_upload(r2_key: str, upload_id: str) -> None:
+    """Abort a multipart upload."""
+    client = get_r2_client()
+    client.abort_multipart_upload(
+        Bucket=settings.r2_bucket_name,
+        Key=r2_key,
+        UploadId=upload_id,
+    )
+
+
 def download_to_bytes(r2_key: str) -> bytes:
     """Download file from R2 and return as bytes."""
     client = get_r2_client()

@@ -3,7 +3,7 @@
 export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
-import { api } from "@/lib/api";
+import { api, uploadFile } from "@/lib/api";
 import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
 
@@ -59,30 +59,10 @@ export default function NewProjectPage() {
       // Get video duration
       const duration = await getVideoDuration(file);
 
-      // Get presigned URL
-      const presign = await api.presign(token, {
-        filename: file.name,
-        content_type: file.type || "video/mp4",
-        size_bytes: file.size,
-      });
-
-      // Upload to R2
-      setUploadProgress(10);
-      const xhr = new XMLHttpRequest();
-      await new Promise<void>((resolve, reject) => {
-        xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable) {
-            setUploadProgress(10 + Math.round((e.loaded / e.total) * 80));
-          }
-        };
-        xhr.onload = () => {
-          if (xhr.status >= 200 && xhr.status < 300) resolve();
-          else reject(new Error(`업로드 실패: ${xhr.status}`));
-        };
-        xhr.onerror = () => reject(new Error("업로드 중 오류가 발생했습니다"));
-        xhr.open("PUT", presign.upload_url);
-        xhr.setRequestHeader("Content-Type", file.type || "video/mp4");
-        xhr.send(file);
+      // Upload to R2 via multipart
+      setUploadProgress(5);
+      const r2Key = await uploadFile(token, file, (loaded, total) => {
+        setUploadProgress(5 + Math.round((loaded / total) * 85));
       });
 
       setUploadProgress(95);
@@ -92,7 +72,7 @@ export default function NewProjectPage() {
         name,
         cut_type: cutType,
         language,
-        source_r2_key: presign.r2_key,
+        source_r2_key: r2Key,
         source_filename: file.name,
         source_duration_seconds: duration,
         source_size_bytes: file.size,

@@ -8,7 +8,7 @@ from eogum.services.r2 import generate_presigned_download
 
 router = APIRouter(prefix="/projects/{project_id}/download", tags=["downloads"])
 
-_DOWNLOAD_TYPES = {"fcpxml", "srt", "report", "project_json", "source"}
+_DOWNLOAD_TYPES = {"fcpxml", "srt", "report", "project_json", "storyline", "source"}
 
 
 @router.get("/extra-source/{index}", response_model=DownloadResponse)
@@ -88,7 +88,7 @@ def download_file(project_id: str, file_type: str, user_id: str = Depends(get_us
     if not r2_key:
         raise HTTPException(status_code=404, detail=f"{file_type} 파일을 찾을 수 없습니다")
 
-    ext_map = {"fcpxml": ".fcpxml", "srt": ".srt", "report": ".md", "project_json": ".json"}
+    ext_map = {"fcpxml": ".fcpxml", "srt": ".srt", "report": ".md", "project_json": ".json", "storyline": ".json"}
     filename = f"{project.data['name']}{ext_map.get(file_type, '')}"
 
     download_url = generate_presigned_download(r2_key, filename)

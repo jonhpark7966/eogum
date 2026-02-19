@@ -81,6 +81,22 @@ export interface PresignResponse {
   r2_key: string;
 }
 
+export interface MultipartPartUrl {
+  part_number: number;
+  upload_url: string;
+}
+
+export interface MultipartInitiateResponse {
+  upload_id: string;
+  r2_key: string;
+  part_size: number;
+  part_urls: MultipartPartUrl[];
+}
+
+export interface MultipartCompleteResponse {
+  r2_key: string;
+}
+
 export interface DownloadResponse {
   download_url: string;
   filename: string;
@@ -199,6 +215,24 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
+  initiateMultipart: (
+    token: string,
+    data: { filename: string; content_type: string; size_bytes: number }
+  ) =>
+    apiFetch<MultipartInitiateResponse>("/upload/multipart/initiate", token, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  completeMultipart: (
+    token: string,
+    data: { r2_key: string; upload_id: string; parts: { part_number: number; etag: string }[] }
+  ) =>
+    apiFetch<MultipartCompleteResponse>("/upload/multipart/complete", token, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
   // Projects
   listProjects: (token: string) => apiFetch<Project[]>("/projects", token),
 
@@ -277,3 +311,51 @@ export const api = {
   getEvalReport: (token: string, projectId: string) =>
     apiFetch<EvalReportResponse>(`/projects/${projectId}/eval-report`, token),
 };
+
+// ── Multipart Upload Utility ──
+const UPLOAD_CONCURRENCY = 3;
+
+export async function uploadFile(
+  token: string,
+  file: File,
+  onProgress?: (loaded: number, total: number) => void
+): Promise<string> {
+  const contentType = file.type || "video/mp4";
+
+  const initResp = await api.initiateMultipart(token, {
+    filename: file.name,
+    content_type: contentType,
+    size_bytes: file.size,
+  });
+
+  const { part_urls, part_size, upload_id, r2_key } = initResp;
+  const completedParts: { part_number: number; etag: string }[] = [];
+  let totalUploaded = 0;
+
+  for (let i = 0; i < part_urls.length; i += UPLOAD_CONCURRENCY) {
+    const batch = part_urls.slice(i, i + UPLOAD_CONCURRENCY);
+    const results = await Promise.all(
+      batch.map(async (part) => {
+        const start = (part.part_number - 1) * part_size;
+        const end = Math.min(start + part_size, file.size);
+        const chunk = file.slice(start, end);
+
+        const resp = await fetch(part.upload_url, {
+          method: "PUT",
+          body: chunk,
+        });
+        if (!resp.ok) throw new Error(`Part ${part.part_number} 업로드 실패: ${resp.status}`);
+
+        const etag = resp.headers.get("ETag") || "";
+        totalUploaded += end - start;
+        onProgress?.(totalUploaded, file.size);
+        return { part_number: part.part_number, etag };
+      })
+    );
+    completedParts.push(...results);
+  }
+
+  completedParts.sort((a, b) => a.part_number - b.part_number);
+  await api.completeMultipart(token, { r2_key, upload_id, parts: completedParts });
+  return r2_key;
+}

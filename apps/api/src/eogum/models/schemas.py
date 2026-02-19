@@ -204,6 +204,36 @@ class EvalReportResponse(BaseModel):
     disagreements: list[DisagreementDetail]
 
 
+# ── Multipart Upload ──
+class MultipartInitiateRequest(BaseModel):
+    filename: str
+    content_type: str
+    size_bytes: int
+
+
+class MultipartPartUrl(BaseModel):
+    part_number: int
+    upload_url: str
+
+
+class MultipartInitiateResponse(BaseModel):
+    upload_id: str
+    r2_key: str
+    part_size: int
+    part_urls: list[MultipartPartUrl]
+
+
+class MultipartCompletePart(BaseModel):
+    part_number: int
+    etag: str
+
+
+class MultipartCompleteRequest(BaseModel):
+    r2_key: str
+    upload_id: str
+    parts: list[MultipartCompletePart]
+
+
 # ── Downloads ──
 class DownloadResponse(BaseModel):
     download_url: str

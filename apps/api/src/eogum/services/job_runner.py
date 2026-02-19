@@ -101,7 +101,7 @@ def _process_project(project_id: str) -> None:
         _update_progress(db, job_id, 30)
 
         # 4. Transcript overview (Pass 1)
-        storyline_path = avid.transcript_overview(srt_path, output_path=str(temp_dir / "storyline.json"))
+        storyline_path = avid.transcript_overview(srt_path, output_path=str(output_dir / "storyline.json"))
         _update_progress(db, job_id, 50)
 
         # 5. Cut (Pass 2)
@@ -195,19 +195,28 @@ def _update_progress(db, job_id: str, progress: int) -> None:
 
 
 def _save_report(db, project_id: str, total_duration: int, report_markdown: str) -> None:
-    # Parse cut stats from report (simple heuristic)
+    import re
+
     cut_duration = 0
     cut_percentage = 0.0
 
-    for line in report_markdown.split("\n"):
-        if "절약" in line or "saved" in line.lower() or "cut" in line.lower():
-            # Try to extract percentage
-            import re
-            pct_match = re.search(r"(\d+\.?\d*)%", line)
-            if pct_match:
-                cut_percentage = float(pct_match.group(1))
-                cut_duration = int(total_duration * cut_percentage / 100)
-                break
+    # Try to find "합계" row in markdown table: | **합계** | **878개** | **24:31.665** |
+    total_match = re.search(r"합계.*?\|\s*\**(\d+):(\d+)\.(\d+)\**\s*\|", report_markdown)
+    if total_match:
+        minutes = int(total_match.group(1))
+        seconds = int(total_match.group(2))
+        cut_duration = minutes * 60 + seconds
+        if total_duration > 0:
+            cut_percentage = round(cut_duration / total_duration * 100, 1)
+    else:
+        # Fallback: look for percentage pattern near "절약" or "saved"
+        for line in report_markdown.split("\n"):
+            if "절약" in line or "saved" in line.lower():
+                pct_match = re.search(r"(\d+\.?\d*)%", line)
+                if pct_match:
+                    cut_percentage = float(pct_match.group(1))
+                    cut_duration = int(total_duration * cut_percentage / 100)
+                    break
 
     db.table("edit_reports").insert({
         "project_id": project_id,
@@ -225,6 +234,7 @@ def _guess_content_type(key: str) -> str:
         "srt": "text/plain",
         "report": "text/markdown",
         "project_json": "application/json",
+        "storyline": "application/json",
         "preview": "video/mp4",
     }
     return types.get(key, "application/octet-stream")

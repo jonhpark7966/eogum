@@ -247,6 +247,12 @@ export const api = {
       token
     ),
 
+  downloadExtraSource: (token: string, projectId: string, index: number) =>
+    apiFetch<DownloadResponse>(
+      `/projects/${projectId}/download/extra-source/${index}`,
+      token
+    ),
+
   // Evaluations
   getSegments: (token: string, projectId: string) =>
     apiFetch<SegmentsResponse>(`/projects/${projectId}/segments`, token),

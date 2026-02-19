@@ -113,6 +113,20 @@ export default function ProjectDetailPage() {
     window.open(result.download_url, "_blank");
   };
 
+  const handleDownloadExtraSource = async (index: number) => {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    if (!session) return;
+
+    const result = await api.downloadExtraSource(
+      session.access_token,
+      projectId,
+      index
+    );
+    window.open(result.download_url, "_blank");
+  };
+
   const handleRemoveExtraSource = async (r2Key: string) => {
     const {
       data: { session },
@@ -291,7 +305,13 @@ export default function ProjectDetailPage() {
         {project.status === "completed" && (
           <div className="bg-gray-900 rounded-lg p-6 mb-8">
             <h3 className="font-medium mb-4">다운로드</h3>
-            <div className="flex gap-3">
+            <div className="flex flex-wrap gap-3">
+              <button
+                onClick={() => handleDownload("source")}
+                className="px-4 py-2 bg-gray-800 rounded-lg hover:bg-gray-700 transition border border-gray-700"
+              >
+                원본 소스 다운로드
+              </button>
               <button
                 onClick={() => handleDownload("fcpxml")}
                 className="px-4 py-2 bg-white text-black font-medium rounded-lg hover:bg-gray-200 transition"
@@ -311,6 +331,34 @@ export default function ProjectDetailPage() {
                 구간 리뷰
               </button>
             </div>
+
+            {/* Extra source downloads */}
+            {project.extra_sources.length > 0 && (
+              <div className="mt-4">
+                <h4 className="text-sm text-gray-400 mb-2">멀티캠 소스</h4>
+                <div className="space-y-2">
+                  {project.extra_sources.map((src, i) => (
+                    <div
+                      key={src.r2_key}
+                      className="flex items-center justify-between bg-gray-800 rounded-lg px-4 py-2"
+                    >
+                      <span className="text-sm truncate mr-4">{src.filename}</span>
+                      <div className="flex items-center gap-3">
+                        <span className="text-xs text-gray-400">
+                          {(src.size_bytes / 1024 / 1024 / 1024).toFixed(1)} GB
+                        </span>
+                        <button
+                          onClick={() => handleDownloadExtraSource(i)}
+                          className="text-blue-400 hover:text-blue-300 text-sm"
+                        >
+                          다운로드
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 

@@ -16,6 +16,7 @@ export default function NewProjectPage() {
   const [cutType, setCutType] = useState("subtitle_cut");
   const [language, setLanguage] = useState("ko");
   const [file, setFile] = useState<File | null>(null);
+  const [context, setContext] = useState("");
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [error, setError] = useState("");
@@ -68,6 +69,10 @@ export default function NewProjectPage() {
       setUploadProgress(95);
 
       // Create project
+      const projectSettings: Record<string, unknown> = {};
+      if (context.trim()) {
+        projectSettings.transcription_context = context.trim();
+      }
       const project = await api.createProject(token, {
         name,
         cut_type: cutType,
@@ -76,6 +81,7 @@ export default function NewProjectPage() {
         source_filename: file.name,
         source_duration_seconds: duration,
         source_size_bytes: file.size,
+        settings: projectSettings,
       });
 
       setUploadProgress(100);
@@ -196,6 +202,20 @@ export default function NewProjectPage() {
               <option value="en">English</option>
               <option value="ja">日本語</option>
             </select>
+          </div>
+
+          {/* Context */}
+          <div>
+            <label className="block text-sm font-medium mb-2">
+              컨텍스트 <span className="text-gray-500 font-normal">(선택)</span>
+            </label>
+            <textarea
+              value={context}
+              onChange={(e) => setContext(e.target.value)}
+              placeholder="전사 정확도를 높이기 위한 배경 정보를 입력하세요. 예: 출연자 이름, 전문 용어, 주제 등"
+              rows={3}
+              className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-3 focus:outline-none focus:border-gray-500 resize-y"
+            />
           </div>
 
           {error && (

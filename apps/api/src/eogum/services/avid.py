@@ -43,7 +43,7 @@ def _run_avid(args: list[str], timeout: int = 3600) -> subprocess.CompletedProce
     return result
 
 
-def transcribe(source_path: str, language: str = "ko", output_dir: str | None = None) -> str:
+def transcribe(source_path: str, language: str = "ko", output_dir: str | None = None, context: str | None = None) -> str:
     """Run avid transcribe. Returns path to generated SRT file."""
     args = [
         "transcribe", source_path,
@@ -53,6 +53,8 @@ def transcribe(source_path: str, language: str = "ko", output_dir: str | None = 
     ]
     if output_dir:
         args += ["-d", output_dir]
+    if context:
+        args += ["--context", context]
 
     result = _run_avid(args, timeout=7200)
 

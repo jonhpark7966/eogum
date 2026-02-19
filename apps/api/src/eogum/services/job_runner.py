@@ -97,7 +97,8 @@ def _process_project(project_id: str) -> None:
         _update_progress(db, job_id, 10)
 
         # 3. Transcribe
-        srt_path = avid.transcribe(source_path, language=project["language"], output_dir=str(temp_dir))
+        transcription_context = (project.get("settings") or {}).get("transcription_context")
+        srt_path = avid.transcribe(source_path, language=project["language"], output_dir=str(temp_dir), context=transcription_context)
         _update_progress(db, job_id, 30)
 
         # 4. Transcript overview (Pass 1)

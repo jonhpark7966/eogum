@@ -249,6 +249,7 @@ export const api = {
       source_filename: string;
       source_duration_seconds: number;
       source_size_bytes: number;
+      settings?: Record<string, unknown>;
     }
   ) =>
     apiFetch<Project>("/projects", token, {

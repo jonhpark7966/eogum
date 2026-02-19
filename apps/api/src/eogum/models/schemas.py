@@ -15,6 +15,17 @@ class PresignResponse(BaseModel):
     r2_key: str
 
 
+# ── Extra Sources (Multicam) ──
+class ExtraSourceItem(BaseModel):
+    r2_key: str
+    filename: str
+    size_bytes: int
+
+
+class UpdateExtraSourcesRequest(BaseModel):
+    extra_sources: list[ExtraSourceItem]
+
+
 # ── Projects ──
 class ProjectCreate(BaseModel):
     name: str
@@ -35,6 +46,7 @@ class ProjectResponse(BaseModel):
     language: str
     source_filename: str | None
     source_duration_seconds: int | None
+    extra_sources: list[dict] = []
     created_at: datetime
     updated_at: datetime
 

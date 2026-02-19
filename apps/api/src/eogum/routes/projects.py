@@ -5,6 +5,7 @@ from eogum.models.schemas import (
     ProjectCreate,
     ProjectDetailResponse,
     ProjectResponse,
+    UpdateExtraSourcesRequest,
 )
 from eogum.services.credit import get_balance
 from eogum.services.database import get_db
@@ -91,6 +92,71 @@ def retry_project(project_id: str, user_id: str = Depends(get_user_id)):
         )
 
     # Clean up old failed jobs and reports
+    db.table("jobs").delete().eq("project_id", project_id).execute()
+    db.table("edit_reports").delete().eq("project_id", project_id).execute()
+
+    # Reset project status
+    updated = db.table("projects").update({"status": "queued"}).eq("id", project_id).execute().data[0]
+
+    # Enqueue for processing
+    enqueue(project_id)
+
+    return updated
+
+
+@router.put("/{project_id}/extra-sources", response_model=ProjectResponse)
+def update_extra_sources(
+    project_id: str,
+    req: UpdateExtraSourcesRequest,
+    user_id: str = Depends(get_user_id),
+):
+    db = get_db()
+
+    project = db.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).single().execute()
+    if not project.data:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+
+    if project.data["status"] not in ("completed", "failed"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="완료 또는 실패한 프로젝트만 추가 소스를 설정할 수 있습니다",
+        )
+
+    extra_sources = [s.model_dump() for s in req.extra_sources]
+    updated = db.table("projects").update({"extra_sources": extra_sources}).eq("id", project_id).execute().data[0]
+    return updated
+
+
+@router.post("/{project_id}/multicam", response_model=ProjectResponse)
+def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
+    db = get_db()
+
+    project = db.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).single().execute()
+    if not project.data:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+
+    if project.data["status"] not in ("completed", "failed"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="완료 또는 실패한 프로젝트만 멀티캠 재처리할 수 있습니다",
+        )
+
+    if not project.data.get("extra_sources"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="추가 소스가 등록되지 않았습니다",
+        )
+
+    # Check credits
+    duration = project.data["source_duration_seconds"]
+    balance = get_balance(user_id)
+    if balance["available_seconds"] < duration:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=f"크레딧이 부족합니다. 필요: {duration}초, 사용 가능: {balance['available_seconds']}초",
+        )
+
+    # Clean up old jobs and reports
     db.table("jobs").delete().eq("project_id", project_id).execute()
     db.table("edit_reports").delete().eq("project_id", project_id).execute()
 

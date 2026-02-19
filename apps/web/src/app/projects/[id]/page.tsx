@@ -3,9 +3,9 @@
 export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
-import { api, type ProjectDetail } from "@/lib/api";
+import { api, type ProjectDetail, type ExtraSource } from "@/lib/api";
 import { useParams, useRouter } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 function formatDuration(seconds: number): string {
   const h = Math.floor(seconds / 3600);
@@ -40,6 +40,13 @@ export default function ProjectDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [retrying, setRetrying] = useState(false);
+
+  // Multicam state
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [multicamProcessing, setMulticamProcessing] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const projectId = params.id as string;
 
@@ -104,6 +111,88 @@ export default function ProjectDetailPage() {
       fileType
     );
     window.open(result.download_url, "_blank");
+  };
+
+  const handleRemoveExtraSource = async (r2Key: string) => {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    if (!session || !project) return;
+
+    const updated = project.extra_sources.filter((s) => s.r2_key !== r2Key);
+    try {
+      await api.updateExtraSources(session.access_token, projectId, updated);
+      await loadProject();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "삭제에 실패했습니다");
+    }
+  };
+
+  const handleUploadExtraSources = async () => {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    if (!session || !project || pendingFiles.length === 0) return;
+
+    setUploading(true);
+    setUploadProgress(0);
+
+    try {
+      const newSources: ExtraSource[] = [];
+      for (let i = 0; i < pendingFiles.length; i++) {
+        const file = pendingFiles[i];
+        setUploadProgress(Math.round((i / pendingFiles.length) * 100));
+
+        // Presign
+        const presign = await api.presign(session.access_token, {
+          filename: file.name,
+          content_type: file.type || "video/mp4",
+          size_bytes: file.size,
+        });
+
+        // Upload to R2
+        await fetch(presign.upload_url, {
+          method: "PUT",
+          body: file,
+          headers: { "Content-Type": file.type || "video/mp4" },
+        });
+
+        newSources.push({
+          r2_key: presign.r2_key,
+          filename: file.name,
+          size_bytes: file.size,
+        });
+      }
+
+      // Save all extra sources (existing + new)
+      const allSources = [...project.extra_sources, ...newSources];
+      await api.updateExtraSources(session.access_token, projectId, allSources);
+      setPendingFiles([]);
+      setUploadProgress(100);
+      await loadProject();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "업로드에 실패했습니다");
+    } finally {
+      setUploading(false);
+      setUploadProgress(null);
+    }
+  };
+
+  const handleMulticamReprocess = async () => {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    if (!session) return;
+
+    setMulticamProcessing(true);
+    try {
+      await api.multicamReprocess(session.access_token, projectId);
+      await loadProject();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "멀티캠 적용에 실패했습니다");
+    } finally {
+      setMulticamProcessing(false);
+    }
   };
 
   if (loading) {
@@ -221,6 +310,123 @@ export default function ProjectDetailPage() {
               >
                 구간 리뷰
               </button>
+            </div>
+          </div>
+        )}
+
+        {/* Multicam Sources */}
+        {(project.status === "completed" || project.status === "failed") && (
+          <div className="bg-gray-900 rounded-lg p-6 mb-8">
+            <h3 className="font-medium mb-2">멀티캠 소스</h3>
+            <p className="text-sm text-gray-400 mb-4">
+              오디오 크로스 코릴레이션으로 자동 싱크, 크레딧 차감
+            </p>
+
+            {/* Registered extra sources */}
+            {project.extra_sources.length > 0 && (
+              <div className="mb-4 space-y-2">
+                {project.extra_sources.map((src) => (
+                  <div
+                    key={src.r2_key}
+                    className="flex items-center justify-between bg-gray-800 rounded-lg px-4 py-2"
+                  >
+                    <span className="text-sm truncate mr-4">{src.filename}</span>
+                    <div className="flex items-center gap-3">
+                      <span className="text-xs text-gray-400">
+                        {(src.size_bytes / 1024 / 1024).toFixed(1)} MB
+                      </span>
+                      <button
+                        onClick={() => handleRemoveExtraSource(src.r2_key)}
+                        className="text-red-400 hover:text-red-300 text-sm"
+                      >
+                        삭제
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Pending files */}
+            {pendingFiles.length > 0 && (
+              <div className="mb-4 space-y-2">
+                {pendingFiles.map((file, i) => (
+                  <div
+                    key={`${file.name}-${i}`}
+                    className="flex items-center justify-between bg-gray-800/50 border border-dashed border-gray-700 rounded-lg px-4 py-2"
+                  >
+                    <span className="text-sm truncate mr-4">{file.name}</span>
+                    <div className="flex items-center gap-3">
+                      <span className="text-xs text-gray-400">
+                        {(file.size / 1024 / 1024).toFixed(1)} MB
+                      </span>
+                      <button
+                        onClick={() =>
+                          setPendingFiles((prev) => prev.filter((_, j) => j !== i))
+                        }
+                        className="text-gray-400 hover:text-white text-sm"
+                      >
+                        제거
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Upload progress */}
+            {uploadProgress !== null && (
+              <div className="mb-4">
+                <div className="w-full bg-gray-800 rounded-full h-2">
+                  <div
+                    className="h-2 rounded-full bg-blue-500 transition-all duration-300"
+                    style={{ width: `${uploadProgress}%` }}
+                  />
+                </div>
+                <p className="text-xs text-gray-400 mt-1">{uploadProgress}% 업로드 중...</p>
+              </div>
+            )}
+
+            {/* Actions */}
+            <div className="flex gap-3 items-center">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="video/*"
+                multiple
+                className="hidden"
+                onChange={(e) => {
+                  if (e.target.files) {
+                    setPendingFiles((prev) => [...prev, ...Array.from(e.target.files!)]);
+                  }
+                  e.target.value = "";
+                }}
+              />
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
+                className="px-4 py-2 bg-gray-800 rounded-lg hover:bg-gray-700 transition border border-gray-700 disabled:opacity-50"
+              >
+                파일 추가
+              </button>
+              {pendingFiles.length > 0 && (
+                <button
+                  onClick={handleUploadExtraSources}
+                  disabled={uploading}
+                  className="px-4 py-2 bg-blue-600 rounded-lg hover:bg-blue-500 transition font-medium disabled:opacity-50"
+                >
+                  {uploading ? "업로드 중..." : "업로드"}
+                </button>
+              )}
+              {project.extra_sources.length > 0 && !uploading && (
+                <button
+                  onClick={handleMulticamReprocess}
+                  disabled={multicamProcessing}
+                  className="px-5 py-2 bg-white text-black font-medium rounded-lg hover:bg-gray-200 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {multicamProcessing ? "적용 중..." : "멀티캠 적용"}
+                </button>
+              )}
             </div>
           </div>
         )}

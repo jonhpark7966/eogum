@@ -24,6 +24,12 @@ export async function apiFetch<T>(
 }
 
 // ── Types ──
+export interface ExtraSource {
+  r2_key: string;
+  filename: string;
+  size_bytes: number;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -32,6 +38,7 @@ export interface Project {
   language: string;
   source_filename: string | null;
   source_duration_seconds: number | null;
+  extra_sources: ExtraSource[];
   created_at: string;
   updated_at: string;
 }
@@ -220,6 +227,15 @@ export const api = {
 
   retryProject: (token: string, id: string) =>
     apiFetch<Project>(`/projects/${id}/retry`, token, { method: "POST" }),
+
+  updateExtraSources: (token: string, id: string, extra_sources: ExtraSource[]) =>
+    apiFetch<Project>(`/projects/${id}/extra-sources`, token, {
+      method: "PUT",
+      body: JSON.stringify({ extra_sources }),
+    }),
+
+  multicamReprocess: (token: string, id: string) =>
+    apiFetch<Project>(`/projects/${id}/multicam`, token, { method: "POST" }),
 
   // Credits
   getCredits: (token: string) => apiFetch<CreditBalance>("/credits", token),

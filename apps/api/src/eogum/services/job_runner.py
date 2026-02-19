@@ -85,6 +85,15 @@ def _process_project(project_id: str) -> None:
         _update_progress(db, job_id, 5)
 
         r2.download_file(project["source_r2_key"], source_path)
+
+        # 2.5. Download extra sources (multicam)
+        extra_source_paths: list[str] = []
+        for i, es in enumerate(project.get("extra_sources") or []):
+            ext = Path(es["filename"]).suffix
+            local_path = str(temp_dir / f"extra_{i}{ext}")
+            r2.download_file(es["r2_key"], local_path)
+            extra_source_paths.append(local_path)
+
         _update_progress(db, job_id, 10)
 
         # 3. Transcribe
@@ -102,6 +111,7 @@ def _process_project(project_id: str) -> None:
             srt_path=srt_path,
             context_path=storyline_path,
             output_dir=str(output_dir),
+            extra_sources=extra_source_paths or None,
         )
         _update_progress(db, job_id, 75)
 

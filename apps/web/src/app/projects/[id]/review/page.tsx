@@ -77,12 +77,16 @@ export default function ReviewPage() {
     try {
       const [segRes, vidRes, evalRes] = await Promise.all([
         api.getSegments(token, projectId),
-        api.getVideoUrl(token, projectId),
+        api.getVideoUrl(token, projectId).catch(() => null),
         api.getEvaluation(token, projectId),
       ]);
 
-      setVideoUrl(vidRes.video_url);
-      setDurationMs(vidRes.duration_ms || segRes.source_duration_ms);
+      if (vidRes) {
+        setVideoUrl(vidRes.video_url);
+        setDurationMs(vidRes.duration_ms || segRes.source_duration_ms);
+      } else {
+        setDurationMs(segRes.source_duration_ms);
+      }
 
       // Merge: start from segments, overlay saved evaluation if exists
       const evalMap = new Map<number, EvalSegment>();
@@ -305,17 +309,25 @@ export default function ReviewPage() {
       </header>
 
       {/* Video Player (sticky) */}
-      <div className="sticky top-[53px] z-20 bg-gray-950 border-b border-gray-800">
-        <div className="max-w-4xl mx-auto">
-          <video
-            ref={videoRef}
-            src={videoUrl}
-            controls
-            className="w-full max-h-[40vh] bg-black"
-            preload="metadata"
-          />
+      {videoUrl ? (
+        <div className="sticky top-[53px] z-20 bg-gray-950 border-b border-gray-800">
+          <div className="max-w-4xl mx-auto">
+            <video
+              ref={videoRef}
+              src={videoUrl}
+              controls
+              className="w-full max-h-[40vh] bg-black"
+              preload="metadata"
+            />
+          </div>
         </div>
-      </div>
+      ) : (
+        <div className="bg-gray-900 border-b border-gray-800">
+          <div className="max-w-4xl mx-auto px-6 py-3 text-center text-sm text-gray-500">
+            영상 미리보기를 사용할 수 없습니다
+          </div>
+        </div>
+      )}
 
       {/* Stats Bar */}
       <div className="bg-gray-900/80 backdrop-blur border-b border-gray-800">

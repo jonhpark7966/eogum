@@ -130,20 +130,23 @@ def get_video_url(project_id: str, user_id: str = Depends(get_user_id)):
     r2_keys = _get_completed_job(db, project_id, user_id)
 
     preview_key = r2_keys.get("preview")
-    if not preview_key:
-        raise HTTPException(status_code=404, detail="프리뷰 영상이 없습니다")
 
-    # Get source duration
+    # Get project info (duration + source fallback)
     project = (
         db.table("projects")
-        .select("source_duration_seconds")
+        .select("source_duration_seconds, source_r2_key")
         .eq("id", project_id)
         .single()
         .execute()
     )
     duration_ms = (project.data.get("source_duration_seconds") or 0) * 1000
 
-    video_url = generate_presigned_stream(preview_key)
+    # Fall back to source video if no preview exists
+    stream_key = preview_key or project.data.get("source_r2_key")
+    if not stream_key:
+        raise HTTPException(status_code=404, detail="프리뷰 영상이 없습니다")
+
+    video_url = generate_presigned_stream(stream_key)
     return VideoUrlResponse(video_url=video_url, duration_ms=duration_ms)
 
 

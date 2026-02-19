@@ -1,6 +1,5 @@
 """Wrapper around avid (auto-video-edit) CLI commands."""
 
-import json
 import logging
 import subprocess
 from pathlib import Path
@@ -12,6 +11,14 @@ logger = logging.getLogger(__name__)
 # Use avid's own venv python so avid internal subprocess calls
 # (e.g. skills/subtitle-cut/main.py) use the correct interpreter
 _AVID_PYTHON = str(settings.avid_cli_path / ".venv" / "bin" / "python3")
+
+# Shared env for all avid subprocess calls
+_AVID_ENV = {
+    "PATH": f"{settings.avid_cli_path / '.venv/bin'}:{Path.home() / '.local/bin'}:{Path.home() / '.nvm/versions/node/v25.3.0/bin'}:/usr/local/bin:/usr/bin:/bin",
+    "HOME": str(Path.home()),
+    "PYTHONPATH": str(settings.avid_cli_path / "src"),
+    "CHALNA_API_URL": settings.chalna_url,
+}
 
 
 def _run_avid(args: list[str], timeout: int = 3600) -> subprocess.CompletedProcess:
@@ -25,15 +32,12 @@ def _run_avid(args: list[str], timeout: int = 3600) -> subprocess.CompletedProce
         capture_output=True,
         text=True,
         timeout=timeout,
-        env={
-            "PATH": f"{settings.avid_cli_path / '.venv/bin'}:{Path.home() / '.local/bin'}:{Path.home() / '.nvm/versions/node/v25.3.0/bin'}:/usr/local/bin:/usr/bin:/bin",
-            "HOME": str(Path.home()),
-            "PYTHONPATH": str(settings.avid_cli_path / "src"),
-        },
+        env=_AVID_ENV,
     )
 
     if result.returncode != 0:
-        logger.error("avid failed: %s", result.stderr)
+        logger.error("avid stdout: %s", result.stdout[-500:] if result.stdout else "")
+        logger.error("avid stderr: %s", result.stderr[-500:] if result.stderr else "")
         raise RuntimeError(f"avid command failed: {result.stderr[:500]}")
 
     return result
@@ -41,27 +45,46 @@ def _run_avid(args: list[str], timeout: int = 3600) -> subprocess.CompletedProce
 
 def transcribe(source_path: str, language: str = "ko", output_dir: str | None = None) -> str:
     """Run avid transcribe. Returns path to generated SRT file."""
-    args = ["transcribe", source_path, "-l", language]
+    args = [
+        "transcribe", source_path,
+        "-l", language,
+        "--chalna-url", settings.chalna_url,
+        "--llm-refine",
+    ]
     if output_dir:
         args += ["-d", output_dir]
 
-    result = _run_avid(args, timeout=3600)
+    result = _run_avid(args, timeout=7200)
 
     # Find the generated SRT path from output
     # avid CLI prints "완료: /path/to/file.srt"
-    for line in result.stdout.strip().split("\n"):
-        if line.endswith(".srt"):
-            # Strip prefix like "완료: " if present
-            path = line.strip().split(": ", 1)[-1]
-            return path
+    for line in reversed(result.stdout.strip().split("\n")):
+        line = line.strip()
+        if "완료" in line and ".srt" in line:
+            path = line.split(": ", 1)[-1].strip()
+            if Path(path).exists():
+                return path
 
     # Fallback: look for SRT in output dir
-    src = Path(source_path)
-    srt_path = (Path(output_dir) if output_dir else src.parent) / f"{src.stem}.srt"
+    search_dir = Path(output_dir) if output_dir else Path(source_path).parent
+    src_stem = Path(source_path).stem
+
+    # Try exact name first
+    srt_path = search_dir / f"{src_stem}.srt"
     if srt_path.exists():
         return str(srt_path)
 
-    raise RuntimeError("SRT file not found after transcription")
+    # Try any SRT file in the directory
+    srt_files = list(search_dir.glob("*.srt"))
+    if srt_files:
+        logger.warning("SRT not found at expected path, using: %s", srt_files[0])
+        return str(srt_files[0])
+
+    raise RuntimeError(
+        f"SRT file not found after transcription. "
+        f"Searched: {search_dir}/{src_stem}.srt, "
+        f"stdout: {result.stdout[-300:]}"
+    )
 
 
 def transcript_overview(srt_path: str, output_path: str | None = None) -> str:
@@ -72,16 +95,25 @@ def transcript_overview(srt_path: str, output_path: str | None = None) -> str:
 
     _run_avid(args, timeout=1800)
 
-    # Find storyline.json
-    if output_path:
+    # If output_path was specified and exists, return it
+    if output_path and Path(output_path).exists():
         return output_path
 
+    # Fallback: search for storyline JSON near the SRT
     srt = Path(srt_path)
-    storyline_path = srt.parent / f"{srt.stem}_storyline.json"
-    if storyline_path.exists():
-        return str(storyline_path)
+    for pattern in [
+        f"{srt.stem}_storyline.json",
+        f"{srt.stem}.storyline.json",
+        "storyline.json",
+    ]:
+        candidate = srt.parent / pattern
+        if candidate.exists():
+            return str(candidate)
 
-    raise RuntimeError("Storyline file not found after transcript-overview")
+    raise RuntimeError(
+        f"Storyline file not found after transcript-overview. "
+        f"Expected: {output_path or srt.parent / f'{srt.stem}_storyline.json'}"
+    )
 
 
 def subtitle_cut(
@@ -140,24 +172,30 @@ def _collect_results(source_path: str, output_dir: str | None) -> dict:
 
     results = {}
 
-    fcpxml = base_dir / f"{stem}.fcpxml"
-    if fcpxml.exists():
-        results["fcpxml"] = str(fcpxml)
+    # FCPXML — may be {stem}.fcpxml or {stem}.final.fcpxml etc.
+    fcpxml_files = list(base_dir.glob(f"{stem}*.fcpxml"))
+    if fcpxml_files:
+        results["fcpxml"] = str(fcpxml_files[0])
 
-    srt = base_dir / f"{stem}.srt"
-    if srt.exists():
-        results["srt"] = str(srt)
+    # SRT — may be {stem}.srt or {stem}.final.srt etc.
+    srt_files = list(base_dir.glob(f"{stem}*.srt"))
+    if srt_files:
+        results["srt"] = str(srt_files[0])
 
-    report = base_dir / f"{stem}.report.md"
-    if report.exists():
-        results["report"] = str(report)
+    # Report
+    report_files = list(base_dir.glob(f"{stem}*.report.md"))
+    if report_files:
+        results["report"] = str(report_files[0])
 
+    # AVID project JSON
     avid_json = list(base_dir.glob(f"{stem}*.avid.json"))
     if avid_json:
         results["project_json"] = str(avid_json[0])
 
+    # Storyline
     storyline = base_dir / "storyline.json"
     if storyline.exists():
         results["storyline"] = str(storyline)
 
+    logger.info("Collected results from %s: %s", base_dir, list(results.keys()))
     return results

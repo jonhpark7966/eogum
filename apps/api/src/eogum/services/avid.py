@@ -3,17 +3,20 @@
 import json
 import logging
 import subprocess
-import sys
 from pathlib import Path
 
 from eogum.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Use avid's own venv python so avid internal subprocess calls
+# (e.g. skills/subtitle-cut/main.py) use the correct interpreter
+_AVID_PYTHON = str(settings.avid_cli_path / ".venv" / "bin" / "python3")
+
 
 def _run_avid(args: list[str], timeout: int = 3600) -> subprocess.CompletedProcess:
     """Run an avid-cli command."""
-    cmd = [sys.executable, "-m", "avid.cli"] + args
+    cmd = [_AVID_PYTHON, "-m", "avid.cli"] + args
     logger.info("Running avid: %s", " ".join(cmd))
 
     result = subprocess.run(
@@ -23,7 +26,7 @@ def _run_avid(args: list[str], timeout: int = 3600) -> subprocess.CompletedProce
         text=True,
         timeout=timeout,
         env={
-            "PATH": f"{Path.home() / '.local/bin'}:{Path.home() / '.nvm/versions/node/v25.3.0/bin'}:/usr/local/bin:/usr/bin:/bin",
+            "PATH": f"{settings.avid_cli_path / '.venv/bin'}:{Path.home() / '.local/bin'}:{Path.home() / '.nvm/versions/node/v25.3.0/bin'}:/usr/local/bin:/usr/bin:/bin",
             "HOME": str(Path.home()),
             "PYTHONPATH": str(settings.avid_cli_path / "src"),
         },

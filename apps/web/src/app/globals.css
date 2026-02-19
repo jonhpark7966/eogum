@@ -99,6 +99,12 @@ body {
   50% { background-position: 100% 50%; }
 }
 
+/* ── Shimmer (processing progress bar) ── */
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+
 /* ── Dot grid background ── */
 .dot-grid {
   background-image: radial-gradient(circle, rgba(255,255,255,0.03) 1px, transparent 1px);

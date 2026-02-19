@@ -3,6 +3,7 @@
 import json
 import logging
 import subprocess
+import sys
 from pathlib import Path
 
 from eogum.config import settings
@@ -12,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 def _run_avid(args: list[str], timeout: int = 3600) -> subprocess.CompletedProcess:
     """Run an avid-cli command."""
-    cmd = ["python", "-m", "avid.cli"] + args
+    cmd = [sys.executable, "-m", "avid.cli"] + args
     logger.info("Running avid: %s", " ".join(cmd))
 
     result = subprocess.run(

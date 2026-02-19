@@ -39,6 +39,7 @@ export default function ProjectDetailPage() {
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [retrying, setRetrying] = useState(false);
 
   const projectId = params.id as string;
 
@@ -73,6 +74,23 @@ export default function ProjectDetailPage() {
     }, 5000);
     return () => clearInterval(interval);
   }, [loadProject, project?.status]);
+
+  const handleRetry = async () => {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    if (!session) return;
+
+    setRetrying(true);
+    try {
+      await api.retryProject(session.access_token, projectId);
+      await loadProject();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "재시도에 실패했습니다");
+    } finally {
+      setRetrying(false);
+    }
+  };
 
   const handleDownload = async (fileType: string) => {
     const {
@@ -170,6 +188,13 @@ export default function ProjectDetailPage() {
             <p className="text-sm text-gray-400 mt-2">
               홀딩된 크레딧은 자동으로 복구되었습니다.
             </p>
+            <button
+              onClick={handleRetry}
+              disabled={retrying}
+              className="mt-4 px-5 py-2 bg-white text-black font-medium rounded-lg hover:bg-gray-200 transition disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {retrying ? "재시도 중..." : "재시도"}
+            </button>
           </div>
         )}
 

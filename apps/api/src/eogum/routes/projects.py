@@ -67,6 +67,38 @@ def get_project(project_id: str, user_id: str = Depends(get_user_id)):
     return data
 
 
+@router.post("/{project_id}/retry", response_model=ProjectResponse)
+def retry_project(project_id: str, user_id: str = Depends(get_user_id)):
+    db = get_db()
+
+    project = db.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).single().execute()
+    if not project.data:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+
+    if project.data["status"] != "failed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="실패한 프로젝트만 재시도할 수 있습니다",
+        )
+
+    # Check credits
+    duration = project.data["source_duration_seconds"]
+    balance = get_balance(user_id)
+    if balance["available_seconds"] < duration:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=f"크레딧이 부족합니다. 필요: {duration}초, 사용 가능: {balance['available_seconds']}초",
+        )
+
+    # Reset project status
+    updated = db.table("projects").update({"status": "queued"}).eq("id", project_id).execute().data[0]
+
+    # Enqueue for processing
+    enqueue(project_id)
+
+    return updated
+
+
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_project(project_id: str, user_id: str = Depends(get_user_id)):
     db = get_db()

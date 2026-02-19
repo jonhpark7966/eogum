@@ -218,6 +218,9 @@ export const api = {
   deleteProject: (token: string, id: string) =>
     apiFetch<void>(`/projects/${id}`, token, { method: "DELETE" }),
 
+  retryProject: (token: string, id: string) =>
+    apiFetch<Project>(`/projects/${id}/retry`, token, { method: "POST" }),
+
   // Credits
   getCredits: (token: string) => apiFetch<CreditBalance>("/credits", token),
 

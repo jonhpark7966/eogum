@@ -4,6 +4,7 @@ export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
 import { api, type CreditBalance, type Project } from "@/lib/api";
+import type { MouseEvent } from "react";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 
@@ -40,6 +41,25 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
 
   const [error, setError] = useState<string | null>(null);
+  const [retryingId, setRetryingId] = useState<string | null>(null);
+
+  const handleRetry = async (e: MouseEvent, projectId: string) => {
+    e.stopPropagation();
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    if (!session) return;
+
+    setRetryingId(projectId);
+    try {
+      await api.retryProject(session.access_token, projectId);
+      await loadData();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "재시도에 실패했습니다");
+    } finally {
+      setRetryingId(null);
+    }
+  };
 
   const loadData = useCallback(async () => {
     const {
@@ -160,11 +180,22 @@ export default function DashboardPage() {
                     </span>
                   </div>
                 </div>
-                <span
-                  className={`text-sm font-medium ${STATUS_COLORS[project.status] ?? "text-gray-400"}`}
-                >
-                  {STATUS_LABELS[project.status] ?? project.status}
-                </span>
+                <div className="flex items-center gap-3">
+                  {project.status === "failed" && (
+                    <button
+                      onClick={(e) => handleRetry(e, project.id)}
+                      disabled={retryingId === project.id}
+                      className="px-3 py-1 text-xs bg-white text-black font-medium rounded hover:bg-gray-200 transition disabled:opacity-50"
+                    >
+                      {retryingId === project.id ? "재시도 중..." : "재시도"}
+                    </button>
+                  )}
+                  <span
+                    className={`text-sm font-medium ${STATUS_COLORS[project.status] ?? "text-gray-400"}`}
+                  >
+                    {STATUS_LABELS[project.status] ?? project.status}
+                  </span>
+                </div>
               </button>
             ))}
           </div>

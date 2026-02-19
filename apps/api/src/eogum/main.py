@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
@@ -8,11 +9,37 @@ from eogum.config import settings
 from eogum.routes import credits, downloads, evaluations, health, projects, upload
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Recover stuck projects on startup
+    from eogum.services.database import get_db
+    from eogum.services.job_runner import enqueue
+
+    db = get_db()
+    stuck = (
+        db.table("projects")
+        .select("id")
+        .in_("status", ["queued", "processing"])
+        .execute()
+    )
+    for p in stuck.data:
+        logger.info("Recovering stuck project: %s", p["id"])
+        db.table("projects").update({"status": "queued"}).eq("id", p["id"]).execute()
+        enqueue(p["id"])
+
+    if stuck.data:
+        logger.info("Recovered %d stuck project(s)", len(stuck.data))
+
+    yield
 
 app = FastAPI(
     title="어검 (eogum) API",
     description="Auto Video Edit Online Service",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(

@@ -27,6 +27,8 @@ async def lifespan(app: FastAPI):
     )
     for p in stuck.data:
         logger.info("Recovering stuck project: %s", p["id"])
+        db.table("jobs").delete().eq("project_id", p["id"]).execute()
+        db.table("edit_reports").delete().eq("project_id", p["id"]).execute()
         db.table("projects").update({"status": "queued"}).eq("id", p["id"]).execute()
         enqueue(p["id"])
 

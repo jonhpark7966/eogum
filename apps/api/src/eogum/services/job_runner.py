@@ -169,7 +169,10 @@ def _process_project(project_id: str) -> None:
         }).eq("id", job_id).execute()
         db.table("projects").update({"status": "failed"}).eq("id", project_id).execute()
 
-        email.send_failure_email(user_email, project["name"], project_id, str(e)[:200])
+        try:
+            email.send_failure_email(user_email, project["name"], project_id, str(e)[:200])
+        except Exception:
+            logger.exception("Failed to send failure email for project %s", project_id)
 
     finally:
         # Cleanup temp files

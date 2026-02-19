@@ -90,6 +90,10 @@ def retry_project(project_id: str, user_id: str = Depends(get_user_id)):
             detail=f"크레딧이 부족합니다. 필요: {duration}초, 사용 가능: {balance['available_seconds']}초",
         )
 
+    # Clean up old failed jobs and reports
+    db.table("jobs").delete().eq("project_id", project_id).execute()
+    db.table("edit_reports").delete().eq("project_id", project_id).execute()
+
     # Reset project status
     updated = db.table("projects").update({"status": "queued"}).eq("id", project_id).execute().data[0]
 

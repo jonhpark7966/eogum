@@ -45,9 +45,12 @@ def transcribe(source_path: str, language: str = "ko", output_dir: str | None = 
     result = _run_avid(args, timeout=3600)
 
     # Find the generated SRT path from output
+    # avid CLI prints "완료: /path/to/file.srt"
     for line in result.stdout.strip().split("\n"):
         if line.endswith(".srt"):
-            return line.strip()
+            # Strip prefix like "완료: " if present
+            path = line.strip().split(": ", 1)[-1]
+            return path
 
     # Fallback: look for SRT in output dir
     src = Path(source_path)

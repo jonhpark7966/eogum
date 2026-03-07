@@ -3,6 +3,7 @@
 import json
 import logging
 import subprocess
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -217,8 +218,8 @@ def save_evaluation(
         pass
 
     try:
-        # eogum repo is the parent of apps/api
-        eogum_repo = settings.avid_cli_path.parent.parent.parent / "eogum"
+        # eogum repo: this file is at apps/api/src/eogum/routes/evaluations.py
+        eogum_repo = Path(__file__).resolve().parent.parent.parent.parent.parent
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=str(eogum_repo),
@@ -231,43 +232,23 @@ def save_evaluation(
 
     segments_json = [seg.model_dump() for seg in req.segments]
 
-    # Upsert: try update first, then insert
-    existing = (
+    # Atomic upsert using unique index on (project_id, evaluator_id)
+    result = (
         db.table("evaluations")
-        .select("id")
-        .eq("project_id", project_id)
-        .eq("evaluator_id", user_id)
-        .limit(1)
-        .execute()
-    )
-
-    if existing.data:
-        result = (
-            db.table("evaluations")
-            .update({
-                "segments": segments_json,
-                "avid_version": avid_version,
-                "eogum_version": eogum_version,
-            })
-            .eq("id", existing.data[0]["id"])
-            .execute()
-        )
-        data = result.data[0]
-    else:
-        result = (
-            db.table("evaluations")
-            .insert({
+        .upsert(
+            {
                 "project_id": project_id,
                 "evaluator_id": user_id,
                 "segments": segments_json,
                 "avid_version": avid_version,
                 "eogum_version": eogum_version,
-            })
-            .execute()
+            },
+            on_conflict="project_id,evaluator_id",
         )
-        data = result.data[0]
+        .execute()
+    )
 
-    return data
+    return result.data[0]
 
 
 @router.get("/eval-report", response_model=EvalReportResponse)

@@ -17,8 +17,6 @@ function formatDuration(seconds: number): string {
 }
 
 const STATUS_CONFIG: Record<string, { label: string; color: string; icon: string; bg: string }> = {
-  created:    { label: "생성됨",    color: "text-gray-400",   icon: "○", bg: "bg-gray-400/10" },
-  uploading:  { label: "업로드 중", color: "text-blue-400",   icon: "↑", bg: "bg-blue-400/10" },
   queued:     { label: "대기 중",   color: "text-amber-400",  icon: "◷", bg: "bg-amber-400/10" },
   processing: { label: "처리 중",   color: "text-cyan-400",   icon: "⟳", bg: "bg-cyan-400/10" },
   completed:  { label: "완료",      color: "text-emerald-400",icon: "✓", bg: "bg-emerald-400/10" },

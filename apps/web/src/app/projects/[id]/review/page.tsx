@@ -62,6 +62,7 @@ export default function ReviewPage() {
   const [report, setReport] = useState<EvalReportResponse | null>(null);
   const [showReport, setShowReport] = useState(false);
   const [loadingReport, setLoadingReport] = useState(false);
+  const [saveError, setSaveError] = useState("");
 
   // Load all data
   const loadData = useCallback(async () => {
@@ -210,15 +211,16 @@ export default function ReviewPage() {
   // Save
   const handleSave = async () => {
     setSaving(true);
+    setSaveError("");
     try {
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      if (!session) return;
+      if (!session) { setSaving(false); return; }
       await api.saveEvaluation(session.access_token, projectId, segments);
       setDirty(false);
     } catch (err) {
-      alert(err instanceof Error ? err.message : "저장 실패");
+      setSaveError(err instanceof Error ? err.message : "저장 실패");
     }
     setSaving(false);
   };
@@ -226,16 +228,17 @@ export default function ReviewPage() {
   // Load report
   const loadReport = async () => {
     setLoadingReport(true);
+    setSaveError("");
     try {
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      if (!session) return;
+      if (!session) { setLoadingReport(false); return; }
       const r = await api.getEvalReport(session.access_token, projectId);
       setReport(r);
       setShowReport(true);
     } catch (err) {
-      alert(err instanceof Error ? err.message : "리포트 로딩 실패");
+      setSaveError(err instanceof Error ? err.message : "리포트 로딩 실패");
     }
     setLoadingReport(false);
   };
@@ -307,6 +310,16 @@ export default function ReviewPage() {
           </div>
         </div>
       </header>
+
+      {/* Error banner */}
+      {saveError && (
+        <div className="max-w-6xl mx-auto px-6 py-2">
+          <div className="bg-red-900/50 border border-red-700 rounded-lg px-4 py-2 text-red-200 text-sm flex items-center justify-between">
+            <span>{saveError}</span>
+            <button onClick={() => setSaveError("")} className="text-red-400 hover:text-red-200 ml-3">✕</button>
+          </div>
+        </div>
+      )}
 
       {/* Video Player (sticky) */}
       {videoUrl ? (

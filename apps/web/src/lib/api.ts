@@ -298,8 +298,10 @@ export const api = {
   getEvaluation: async (token: string, projectId: string): Promise<EvaluationResponse | null> => {
     try {
       return await apiFetch<EvaluationResponse>(`/projects/${projectId}/evaluation`, token);
-    } catch {
-      return null;
+    } catch (err) {
+      // 404 = no evaluation yet → expected
+      if (err instanceof Error && err.message.includes("404")) return null;
+      throw err;
     }
   },
 

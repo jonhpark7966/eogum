@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     avid_output_dir: Path = Path("/tmp/eogum/outputs")
 
     # Chalna
-    chalna_url: str = "http://localhost:8001"
+    chalna_url: str = "http://localhost:7861"
 
     # Email
     resend_api_key: str = ""

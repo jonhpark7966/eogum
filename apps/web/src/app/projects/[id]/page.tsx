@@ -25,8 +25,6 @@ function formatSize(bytes: number): string {
 }
 
 const STATUS_CONFIG: Record<string, { label: string; color: string; icon: string; bg: string }> = {
-  created:    { label: "생성됨",    color: "text-gray-400",    icon: "○", bg: "bg-gray-400/10" },
-  uploading:  { label: "업로드 중", color: "text-blue-400",    icon: "↑", bg: "bg-blue-400/10" },
   queued:     { label: "대기 중",   color: "text-amber-400",   icon: "◷", bg: "bg-amber-400/10" },
   processing: { label: "처리 중",   color: "text-cyan-400",    icon: "⟳", bg: "bg-cyan-400/10" },
   completed:  { label: "완료",      color: "text-emerald-400", icon: "✓", bg: "bg-emerald-400/10" },
@@ -34,10 +32,8 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; icon: string
 };
 
 const JOB_TYPE_LABELS: Record<string, string> = {
-  transcribe: "자막 생성",
-  transcript_overview: "구조 분석",
-  subtitle_cut: "강의 편집",
-  podcast_cut: "팟캐스트 편집",
+  subtitle_cut: "편집 처리",
+  podcast_cut: "편집 처리",
 };
 
 /* ── Section wrapper ── */
@@ -116,15 +112,23 @@ export default function ProjectDetailPage() {
   const handleDownload = async (fileType: string) => {
     const { data: { session } } = await supabase.auth.getSession();
     if (!session) return;
-    const result = await api.getDownload(session.access_token, projectId, fileType);
-    window.open(result.download_url, "_blank");
+    try {
+      const result = await api.getDownload(session.access_token, projectId, fileType);
+      window.open(result.download_url, "_blank");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "다운로드 링크 생성에 실패했습니다");
+    }
   };
 
   const handleDownloadExtraSource = async (index: number) => {
     const { data: { session } } = await supabase.auth.getSession();
     if (!session) return;
-    const result = await api.downloadExtraSource(session.access_token, projectId, index);
-    window.open(result.download_url, "_blank");
+    try {
+      const result = await api.downloadExtraSource(session.access_token, projectId, index);
+      window.open(result.download_url, "_blank");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "다운로드 링크 생성에 실패했습니다");
+    }
   };
 
   const handleRemoveExtraSource = async (r2Key: string) => {
@@ -205,7 +209,7 @@ export default function ProjectDetailPage() {
 
   if (!project) return null;
 
-  const statusConfig = STATUS_CONFIG[project.status] ?? STATUS_CONFIG.created;
+  const statusConfig = STATUS_CONFIG[project.status] ?? { label: project.status, color: "text-gray-400", icon: "○", bg: "bg-gray-400/10" };
   const isProcessing = project.status === "processing" || project.status === "queued";
   const isCompleted = project.status === "completed";
   const isFailed = project.status === "failed";
@@ -355,6 +359,8 @@ export default function ProjectDetailPage() {
                 { key: "source", label: "원본 소스", icon: "📁", desc: "원본 영상 파일" },
                 { key: "fcpxml", label: "FCPXML", icon: "🎬", desc: "Final Cut Pro 프로젝트" },
                 { key: "srt", label: "SRT 자막", icon: "💬", desc: "자막 파일" },
+                { key: "report", label: "편집 리포트", icon: "📄", desc: "편집 보고서 (.md)" },
+                { key: "project_json", label: "프로젝트 JSON", icon: "📦", desc: "avid 프로젝트 파일" },
                 { key: "storyline", label: "스토리라인", icon: "📋", desc: "구조 분석 JSON" },
               ].map(({ key, label, icon, desc }) => (
                 <button

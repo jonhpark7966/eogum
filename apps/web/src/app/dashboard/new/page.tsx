@@ -89,6 +89,7 @@ export default function NewProjectPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "오류가 발생했습니다");
       setUploading(false);
+      setUploadProgress(0);
     }
   };
 

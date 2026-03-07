@@ -2,16 +2,21 @@
 """Query Supabase for projects with evaluation data and their job result_r2_keys."""
 
 import json
-import os
 import sys
 
 # Use the supabase client from the API's venv
 sys.path.insert(0, "/home/jonhpark/workspace/eogum/apps/api/.venv/lib/python3.12/site-packages")
 
+from dotenv import load_dotenv
+import os
+
+# Load .env from the API directory
+load_dotenv("/home/jonhpark/workspace/eogum/apps/api/.env")
+
 from supabase import create_client
 
-SUPABASE_URL = "https://qacisezaacxakdzptfih.supabase.co"
-SUPABASE_SERVICE_KEY = "***REMOVED***"
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 

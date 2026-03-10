@@ -91,7 +91,7 @@ def transcribe(source_path: str, language: str = "ko", output_dir: str | None = 
 
 def transcript_overview(srt_path: str, output_path: str | None = None) -> str:
     """Run avid transcript-overview (Pass 1). Returns path to storyline.json."""
-    args = ["transcript-overview", srt_path]
+    args = ["transcript-overview", srt_path, "--provider", "claude"]
     if output_path:
         args += ["-o", output_path]
 
@@ -127,7 +127,7 @@ def subtitle_cut(
     extra_sources: list[str] | None = None,
 ) -> dict:
     """Run avid subtitle-cut (Pass 2). Returns result paths dict."""
-    args = ["subtitle-cut", source_path, "--srt", srt_path]
+    args = ["subtitle-cut", source_path, "--srt", srt_path, "--provider", "claude"]
     if context_path:
         args += ["--context", context_path]
     if output_dir:
@@ -150,7 +150,7 @@ def podcast_cut(
     extra_sources: list[str] | None = None,
 ) -> dict:
     """Run avid podcast-cut (Pass 2). Returns result paths dict."""
-    args = ["podcast-cut", source_path]
+    args = ["podcast-cut", source_path, "--provider", "claude"]
     if srt_path:
         args += ["--srt", srt_path]
     if context_path:

@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from eogum.config import settings
-from eogum.routes import credits, downloads, evaluations, health, projects, upload
+from eogum.routes import credits, downloads, evaluations, health, projects, upload, youtube
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -63,6 +63,7 @@ app.include_router(projects.router, prefix="/api/v1")
 app.include_router(credits.router, prefix="/api/v1")
 app.include_router(downloads.router, prefix="/api/v1")
 app.include_router(evaluations.router, prefix="/api/v1")
+app.include_router(youtube.router, prefix="/api/v1")
 
 
 def run():

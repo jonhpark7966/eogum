@@ -159,9 +159,12 @@ def _process_project(project_id: str) -> None:
         db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
 
         # 10. Send email
-        report = db.table("edit_reports").select("cut_percentage").eq("project_id", project_id).single().execute()
-        cut_pct = report.data["cut_percentage"] if report.data else 0
-        email.send_completion_email(user_email, project["name"], project_id, cut_pct)
+        try:
+            report = db.table("edit_reports").select("cut_percentage").eq("project_id", project_id).limit(1).execute()
+            cut_pct = report.data[0]["cut_percentage"] if report.data else 0
+            email.send_completion_email(user_email, project["name"], project_id, cut_pct)
+        except Exception:
+            logger.exception("Failed to send completion email for project %s", project_id)
 
     except Exception as e:
         logger.exception("Project %s failed", project_id)

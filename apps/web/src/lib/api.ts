@@ -16,7 +16,7 @@ export async function apiFetch<T>(
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.detail || `API error: ${res.status}`);
+    throw new Error(body.detail || `API error: ${res.status} ${res.statusText}`);
   }
 
   if (res.status === 204) return undefined as T;
@@ -206,6 +206,34 @@ export interface EvalReportResponse {
   disagreements: DisagreementDetail[];
 }
 
+// ── YouTube ──
+export interface YouTubeInfoResponse {
+  title: string;
+  duration_seconds: number;
+  filesize_approx_bytes: number;
+  thumbnail: string;
+  uploader: string;
+  upload_date: string;
+}
+
+export interface YouTubeDownloadResponse {
+  task_id: string;
+  title: string;
+  duration_seconds: number;
+  filesize_approx_bytes: number;
+}
+
+export interface YouTubeTaskResponse {
+  task_id: string;
+  status: string;
+  progress: number;
+  error: string | null;
+  r2_key: string | null;
+  filename: string | null;
+  duration_seconds: number;
+  filesize_bytes: number;
+}
+
 // ── API Functions ──
 export const api = {
   // Upload
@@ -300,7 +328,7 @@ export const api = {
       return await apiFetch<EvaluationResponse>(`/projects/${projectId}/evaluation`, token);
     } catch (err) {
       // 404 = no evaluation yet → expected
-      if (err instanceof Error && err.message.includes("404")) return null;
+      if (err instanceof Error && (err.message.includes("404") || err.message.includes("평가 데이터가 없습니다"))) return null;
       throw err;
     }
   },
@@ -313,6 +341,22 @@ export const api = {
 
   getEvalReport: (token: string, projectId: string) =>
     apiFetch<EvalReportResponse>(`/projects/${projectId}/eval-report`, token),
+
+  // YouTube
+  getYouTubeInfo: (token: string, url: string) =>
+    apiFetch<YouTubeInfoResponse>("/youtube/info", token, {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    }),
+
+  startYouTubeDownload: (token: string, url: string) =>
+    apiFetch<YouTubeDownloadResponse>("/youtube/download", token, {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    }),
+
+  getYouTubeDownloadStatus: (token: string, taskId: string) =>
+    apiFetch<YouTubeTaskResponse>(`/youtube/download/${taskId}`, token),
 };
 
 // ── Multipart Upload Utility ──

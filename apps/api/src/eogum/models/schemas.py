@@ -240,6 +240,42 @@ class DownloadResponse(BaseModel):
     filename: str
 
 
+# ── YouTube ──
+class YouTubeInfoRequest(BaseModel):
+    url: str
+
+
+class YouTubeInfoResponse(BaseModel):
+    title: str
+    duration_seconds: int
+    filesize_approx_bytes: int
+    thumbnail: str
+    uploader: str
+    upload_date: str
+
+
+class YouTubeDownloadRequest(BaseModel):
+    url: str
+
+
+class YouTubeDownloadResponse(BaseModel):
+    task_id: str
+    title: str
+    duration_seconds: int
+    filesize_approx_bytes: int
+
+
+class YouTubeTaskResponse(BaseModel):
+    task_id: str
+    status: str  # pending | downloading | uploading | completed | failed
+    progress: float
+    error: str | None = None
+    r2_key: str | None = None
+    filename: str | None = None
+    duration_seconds: int
+    filesize_bytes: int
+
+
 # ── Health ──
 class HealthResponse(BaseModel):
     status: str

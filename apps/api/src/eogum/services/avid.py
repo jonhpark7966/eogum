@@ -166,6 +166,66 @@ def podcast_cut(
     return _collect_results(source_path, output_dir)
 
 
+def multicam_add_sources(
+    project_json_path: str,
+    source_path: str,
+    extra_source_paths: list[str],
+    output_dir: str,
+) -> dict:
+    """Add multicam sources to existing avid project and re-export FCPXML.
+
+    Does NOT re-run transcribe or subtitle-cut. Only:
+    1. Audio sync extra sources to main source
+    2. Add them to the avid project
+    3. Re-export FCPXML
+
+    Returns dict of result file paths.
+    """
+    import asyncio
+    import sys
+
+    # Add avid src to path for imports
+    avid_src = str(settings.avid_cli_path / "src")
+    if avid_src not in sys.path:
+        sys.path.insert(0, avid_src)
+
+    from avid.models.project import Project
+    from avid.export.fcpxml import FCPXMLExporter
+    from avid.services.audio_sync import AudioSyncService
+
+    # Load existing project
+    project = Project.load(Path(project_json_path))
+    logger.info("Loaded avid project: %d tracks, %d edit_decisions", len(project.tracks), len(project.edit_decisions))
+
+    # Sync and add extra sources
+    sync_service = AudioSyncService()
+    extra_paths = [Path(p) for p in extra_source_paths]
+    asyncio.run(sync_service.add_extra_sources(project, Path(source_path), extra_paths))
+    logger.info("Added %d extra sources", len(extra_source_paths))
+
+    # Save updated project JSON
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    updated_json = out_dir / Path(project_json_path).name
+    project.save(updated_json)
+
+    # Re-export FCPXML
+    exporter = FCPXMLExporter()
+    stem = Path(source_path).stem
+    fcpxml_path = out_dir / f"{stem}_subtitle_cut.fcpxml"
+    asyncio.run(exporter.export(project, fcpxml_path))
+    logger.info("Exported FCPXML: %s", fcpxml_path)
+
+    results = {"project_json": str(updated_json), "fcpxml": str(fcpxml_path)}
+
+    # Copy over SRT if it exists in output_dir
+    for srt in out_dir.glob("*.srt"):
+        results["srt"] = str(srt)
+        break
+
+    return results
+
+
 def _collect_results(source_path: str, output_dir: str | None) -> dict:
     """Collect result file paths after processing."""
     src = Path(source_path)

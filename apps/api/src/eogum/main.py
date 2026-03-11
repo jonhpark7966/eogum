@@ -21,13 +21,14 @@ async def lifespan(app: FastAPI):
     db = get_db()
     stuck = (
         db.table("projects")
-        .select("id")
+        .select("id, status")
         .in_("status", ["queued", "processing"])
         .execute()
     )
     for p in stuck.data:
-        logger.info("Recovering stuck project: %s", p["id"])
-        db.table("jobs").delete().eq("project_id", p["id"]).execute()
+        logger.info("Recovering stuck project: %s (was %s)", p["id"], p["status"])
+        # Only delete incomplete jobs (not completed ones)
+        db.table("jobs").delete().eq("project_id", p["id"]).in_("status", ["running", "pending"]).execute()
         db.table("edit_reports").delete().eq("project_id", p["id"]).execute()
         db.table("projects").update({"status": "queued"}).eq("id", p["id"]).execute()
         enqueue(p["id"])

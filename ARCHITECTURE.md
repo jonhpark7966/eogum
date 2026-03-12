@@ -3,6 +3,21 @@
 > 최종 갱신: 2026-03-12
 > 기준: 현재 저장소 구현
 
+## 0. 문서 계층
+
+이 문서는 현재 런타임 구조와 사용자 플로우를 설명하는 상위 문서다.
+모듈화와 테스트 계획은 아래 별도 문서로 분리한다.
+
+- [backend-module-map.md](/home/jonhpark/workspace/eogum/docs/backend-module-map.md): 백엔드 모듈 경계와 의존성 규칙
+- [backend-testing-strategy.md](/home/jonhpark/workspace/eogum/docs/backend-testing-strategy.md): 백엔드 테스트 계층과 우선순위
+- [backend-refactoring-roadmap.md](/home/jonhpark/workspace/eogum/docs/backend-refactoring-roadmap.md): 백엔드 리팩터링 순서
+- [avid-integration-spec.md](/home/jonhpark/workspace/eogum/docs/avid-integration-spec.md): `avid` 연동 상위 명세
+- [avid-submodule-layout.md](/home/jonhpark/workspace/eogum/docs/avid-submodule-layout.md): `avid` submodule 목표 경로와 backend 참조 규칙
+- [avid-cli-spec.md](/home/jonhpark/workspace/eogum/docs/avid-cli-spec.md): `avid-cli` 명령 명세
+
+현재 우선순위는 백엔드다.
+프론트엔드는 백엔드 API 와 worker 경계가 안정된 뒤에 다룬다.
+
 ## 1. 시스템 개요
 
 ```text
@@ -34,6 +49,8 @@
 
 - 프론트엔드는 Next.js 16 + React 19 + Tailwind v4 기반이다.
 - 백엔드는 FastAPI 단일 프로세스이며, 프로젝트 처리는 in-memory queue + background thread 로 돌아간다.
+- 현재 리팩터링의 source of truth 는 백엔드 API 와 worker 이며, 프론트는 소비자다.
+- 목표 구조에서 백엔드는 `avid` Python 모듈이 아니라 `avid-cli` 를 명시적으로 호출한다.
 - 소스 입력은 두 가지다.
   - 파일 업로드: 브라우저에서 R2 로 멀티파트 직접 업로드
   - YouTube URL: 백엔드에서 `yt-dlp` 로 다운로드 후 R2 업로드

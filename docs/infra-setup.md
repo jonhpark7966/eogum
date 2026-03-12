@@ -3,6 +3,12 @@
 > 기준 코드: 2026-03-12
 > 대상: Supabase + Cloudflare R2 + FastAPI API + Next.js Web
 
+이 문서는 현재 코드 기준 셋업 문서다.
+`avid` 를 submodule + CLI-only 구조로 옮기는 목표 문서는 아래를 본다.
+
+- [docs/avid-submodule-layout.md](/home/jonhpark/workspace/eogum/docs/avid-submodule-layout.md)
+- [docs/avid-cli-spec.md](/home/jonhpark/workspace/eogum/docs/avid-cli-spec.md)
+
 ## 1. 사전 준비
 
 필수 준비물:

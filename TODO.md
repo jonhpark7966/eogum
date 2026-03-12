@@ -28,6 +28,22 @@
 - [ ] R2 데이터 자동 백업 시스템
 - [ ] 1년 보관 만료 전 알림 시스템 (유저에게 + 관리자에게)
 
+### FCP 호환성 — ProRes 변환 문제
+- **문제**: H.264 소스로 FCPXML 생성 시, FCP에서 relink하면 CPU 100% + 앱 크래시
+  - 원인: H.264 keyframe 간격 5초(GOP ~300프레임) × 수백 개 편집 클립 = 각 클립마다 최대 300프레임 디코딩 필요
+  - H.264 keyint=60(1초)으로 재인코딩해도 여전히 크래시
+  - ProRes Proxy로 변환하면 문제 해결 (모든 프레임 독립 디코딩 가능)
+- **현재 워크어라운드**: 소스를 ProRes Proxy로 변환 후 FCPXML 생성
+  - 문제: 용량 폭증 (212MB H.264 → 17GB ProRes Proxy)
+  - R2 저장/전송 비용 비현실적
+- [ ] **해결 방안 조사**:
+  - [ ] FCP Proxy 워크플로우: 원본 H.264 유지 + ProRes Proxy를 편집용으로만 생성, 최종 출력 시 원본 relink
+  - [ ] FCPXML 내 proxy media 참조 방식 조사 (optimized/proxy media attribute)
+  - [ ] 클라이언트 로컬에서 ProRes 변환 (데스크탑 앱 연동 시)
+  - [ ] FCP-compatible intermediate codec 비교: ProRes Proxy vs ProRes LT vs DNxHR LB (용량/품질 트레이드오프)
+  - [ ] 클립 수 자체를 줄이는 최적화 (인접 keep 구간 병합, 짧은 컷 구간 무시)
+  - [ ] Apple의 FCP H.264 성능 제한 공식 문서 확인
+
 ### Export Formats
 - [ ] Premiere Pro XML 지원 (avid 로드맵)
 - [ ] DaVinci Resolve 지원

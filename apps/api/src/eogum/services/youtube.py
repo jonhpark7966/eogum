@@ -43,7 +43,8 @@ def get_video_info(url: str) -> dict:
             "yt-dlp",
             "--dump-json",
             "--no-download",
-            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+            "-f", "bestvideo+bestaudio/best",
+            "--merge-output-format", "mp4",
             url,
         ],
         capture_output=True,
@@ -106,7 +107,7 @@ def _download_worker(task: DownloadTask) -> None:
         proc = subprocess.Popen(
             [
                 "yt-dlp",
-                "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+                "-f", "bestvideo+bestaudio/best",
                 "--merge-output-format", "mp4",
                 "--newline",  # Progress on new lines for parsing
                 "-o", output_template,

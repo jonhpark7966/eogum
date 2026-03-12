@@ -1,611 +1,358 @@
-# 어검 (Eogum) — 아키텍처 & 워크플로우 문서
+# 어검 (Eogum) 아키텍처
 
-> 최종 갱신: 2026-03-07
-> 대상: avid CLI + FastAPI backend + Next.js frontend
+> 최종 갱신: 2026-03-12
+> 기준: 현재 저장소 구현
 
----
+## 1. 시스템 개요
 
-## 목차
-
-1. [시스템 구성도](#1-시스템-구성도)
-2. [워크플로우 상세](#2-워크플로우-상세)
-3. [DB 스키마](#3-db-스키마)
-4. [API 엔드포인트 맵](#4-api-엔드포인트-맵)
-5. [파일 & 스토리지 경로](#5-파일--스토리지-경로)
-6. [문제점 분석](#6-문제점-분석)
-7. [수정 우선순위](#7-수정-우선순위)
-
----
-
-## 1. 시스템 구성도
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          사용자 브라우저                                 │
-│  Next.js 16 + React 19 + Tailwind v4 (Vercel: eogum.sudoremove.com)    │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────┐ ┌────────────────┐  │
-│  │  Landing  │ │Dashboard │ │New Project│ │Project │ │ Review Page    │  │
-│  │  page.tsx │ │ page.tsx │ │ page.tsx  │ │page.tsx│ │ review/page.tsx│  │
-│  └──────────┘ └──────────┘ └──────────┘ └────────┘ └────────────────┘  │
-│         │             │           │           │              │          │
-│         └─────────────┴───────────┴───────────┴──────────────┘          │
-│                               │ lib/api.ts                              │
-│                    fetch(Bearer JWT) + R2 presigned PUT                  │
-└────────────────────────────────┬────────────────────────────────────────┘
-                                 │
-                    ┌────────────┴────────────┐
-                    │   Cloudflare R2          │
-                    │   (presigned URL 직접)   │
-                    │   sources/{uuid}.ext     │
-                    │   results/{pid}/{files}  │
-                    └─────────────────────────┘
-                                 │
-┌────────────────────────────────┴────────────────────────────────────────┐
-│                FastAPI Backend (:8000, 홈서버)                           │
-│                api-eogum.sudoremove.com (Cloudflare Tunnel)             │
-│                                                                         │
-│  ┌─── Routes ───────────────────────────────────────────────────┐       │
-│  │ upload.py   projects.py  downloads.py  credits.py  eval.py   │       │
-│  └──────────────────────┬───────────────────────────────────────┘       │
-│                         │                                               │
-│  ┌─── Services ─────────┴───────────────────────────────────────┐       │
-│  │ job_runner.py → avid.py → [subprocess] → avid CLI            │       │
-│  │      │                                     │                 │       │
-│  │      ├─ credit.py (hold → confirm/release) │                 │       │
-│  │      ├─ r2.py (download/upload)            ▼                 │       │
-│  │      └─ email.py (Resend)         Chalna STT (:7861)         │       │
-│  └──────────────────────────────────────────────────────────────┘       │
-│                                                                         │
-│  External: Supabase (DB+Auth) │ Cloudflare R2 │ Resend (Email)         │
-└─────────────────────────────────────────────────────────────────────────┘
+```text
+[Browser]
+  |
+  +-- Next.js Web (Vercel or local)
+  |     - Supabase OAuth / SSR session
+  |     - R2 multipart direct upload
+  |     - Project dashboard / detail / review
+  |
+  +-- FastAPI API (:8000)
+        - JWT verification via Supabase JWKS
+        - Supabase DB access
+        - Cloudflare R2 upload/download
+        - Background job runner
+        - YouTube background downloader
+        - avid CLI orchestration
+        - Optional email notifications
+  |
+  +-- External services
+        - Supabase (Auth + Postgres)
+        - Cloudflare R2
+        - Chalna STT
+        - Resend
+        - avid CLI / auto-video-edit repo
 ```
 
-**Tech Stack:**
+핵심 특성:
 
-| Layer | Technology | Hosting |
-|-------|-----------|---------|
-| Frontend | Next.js 16 + React 19 + Tailwind v4 | Vercel |
-| Auth | Supabase Auth (Google/GitHub OAuth) | Supabase Cloud |
-| Database | PostgreSQL | Supabase Cloud |
-| API Server | FastAPI (Python 3.12) | 홈 서버 |
-| Processing | avid CLI (auto-video-edit) | 홈 서버 |
-| STT | Chalna (RTX 5090) | 홈 서버 (GPU) |
-| AI | Codex CLI (transcript-overview) | 홈 서버 |
-| Storage | Cloudflare R2 | Cloudflare |
-| Email | Resend | SaaS |
+- 프론트엔드는 Next.js 16 + React 19 + Tailwind v4 기반이다.
+- 백엔드는 FastAPI 단일 프로세스이며, 프로젝트 처리는 in-memory queue + background thread 로 돌아간다.
+- 소스 입력은 두 가지다.
+  - 파일 업로드: 브라우저에서 R2 로 멀티파트 직접 업로드
+  - YouTube URL: 백엔드에서 `yt-dlp` 로 다운로드 후 R2 업로드
+- 사람 평가 데이터는 Supabase `evaluations` 테이블에 저장되고, 이후 FCPXML 재-export 에 재사용할 수 있다.
 
----
+## 2. 주요 사용자 플로우
 
-## 2. 워크플로우 상세
+### 2.1 로그인
 
-### 2.1 회원가입/로그인
+1. 랜딩 페이지에서 Google 또는 GitHub 로그인
+2. Supabase OAuth 완료 후 `/auth/callback`
+3. 콜백 라우트가 세션 교환 후 `/dashboard` 로 리다이렉트
+4. 미로그인 사용자는 `/` 와 `/auth/callback` 외 페이지 접근 시 middleware 에 의해 `/` 로 이동
 
-```
-사용자 → "Google/GitHub 로그인" 클릭
-         │
-         ▼
-[page.tsx] supabase.auth.signInWithOAuth({provider, redirectTo: '/auth/callback'})
-         │
-         ▼
-OAuth 프로바이더 → 인증 → /auth/callback?code=xxx
-         │
-         ▼
-[auth/callback/route.ts] supabase.auth.exchangeCodeForSession(code)
-         │                → cookie에 access_token 저장
-         ▼
-redirect → /dashboard
-```
+관련 파일:
 
-**관련 파일:** `page.tsx`, `auth/callback/route.ts`, `lib/supabase/middleware.ts`
-**DB:** `auth.users` (Supabase 관리)
+- [page.tsx](/home/jonhpark/workspace/eogum/apps/web/src/app/page.tsx)
+- [route.ts](/home/jonhpark/workspace/eogum/apps/web/src/app/auth/callback/route.ts)
+- [middleware.ts](/home/jonhpark/workspace/eogum/apps/web/src/middleware.ts)
+- [middleware.ts](/home/jonhpark/workspace/eogum/apps/web/src/lib/supabase/middleware.ts)
 
----
+### 2.2 프로젝트 생성
 
-### 2.2 프로젝트 생성 (업로드)
+#### A. 파일 업로드 플로우
 
-```
-┌─ STEP 1: 파일 선택 & 메타데이터 ──────────────────────────────────────┐
-│                                                                        │
-│ [dashboard/new/page.tsx]                                               │
-│  파일 선택 → getVideoDuration() → <video> 태그로 duration 추출          │
-│  name, cutType(subtitle_cut|podcast_cut), language(ko|en|ja)           │
-│  context (선택사항, 전문용어 힌트)                                       │
-│                                                                        │
-├─ STEP 2: Multipart Upload ─────────────────────────────────────────────┤
-│                                                                        │
-│ [lib/api.ts: uploadFile()]                                             │
-│  POST /upload/multipart/initiate                                       │
-│    → [upload.py] → r2.create_multipart_upload()                        │
-│    → r2_key = "sources/{uuid}.{ext}", part_size = 100MB                │
-│    ← {upload_id, r2_key, part_urls[]}                                  │
-│                                                                        │
-│  PUT {part_url} × N (3개씩 동시, chunk = file.slice)                   │
-│    → R2에 직접 업로드, ETag 수집                                        │
-│    → progress: 5% → 90%                                                │
-│                                                                        │
-│  POST /upload/multipart/complete                                       │
-│    → [upload.py] → r2.complete_multipart_upload()                      │
-│    ← {r2_key}                                                          │
-│                                                                        │
-├─ STEP 3: 프로젝트 생성 ───────────────────────────────────────────────┤
-│                                                                        │
-│  POST /projects                                                        │
-│    → [projects.py: create_project()]                                   │
-│      ├─ credit.get_balance() → available >= duration ?                 │
-│      ├─ DB INSERT → projects (status: "queued")                        │
-│      ├─ job_runner.enqueue(project_id) → deque에 추가                  │
-│      └─ ← ProjectResponse                                             │
-│                                                                        │
-│  → progress: 95% → redirect → /projects/{id}                          │
-└────────────────────────────────────────────────────────────────────────┘
-```
+1. `/dashboard/new` 에서 파일 선택
+2. 프론트가 브라우저에서 duration 메타데이터 추출
+3. `POST /upload/multipart/initiate`
+4. 브라우저가 presigned URL 로 R2 멀티파트 업로드
+5. `POST /upload/multipart/complete`
+6. `POST /projects`
+7. 백엔드가 프로젝트를 `queued` 로 만들고 background queue 에 추가
 
-**DB 변경:** `projects` INSERT (status="queued")
-**R2:** `sources/{uuid}.{ext}` 생성
+#### B. YouTube URL 플로우
 
----
+1. `/dashboard/new` 에서 `YouTube URL` 모드 선택
+2. `POST /youtube/info` 로 메타데이터 확인
+3. `POST /youtube/download` 으로 백그라운드 다운로드 시작
+4. 프론트가 `GET /youtube/download/{task_id}` 를 폴링
+5. 다운로드 완료 후 반환된 `r2_key` 로 `POST /projects`
 
-### 2.3 프로세싱 파이프라인 (핵심)
+현재 구현 메모:
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│ [job_runner.py: _process_project(project_id)]                            │
-│                                                                          │
-│  ① Load project + user email                                             │
-│     DB: SELECT * FROM projects WHERE id=?                                │
-│     DB: SELECT FROM profiles + auth.admin.get_user_by_id()               │
-│                                                                          │
-│  ② Update status + create job                                            │
-│     DB: UPDATE projects SET status="processing"                          │
-│     DB: INSERT jobs (status="running", type=cut_type)                    │
-│                                                                          │
-│  ③ Hold credits                     ┌────────────────────────────────┐   │
-│     DB: SELECT credits              │ credit.py: hold_credits()      │   │
-│     DB: UPDATE credits              │  → read balance                │   │
-│         SET held += duration        │  → check available >= duration │   │
-│     DB: INSERT credit_transactions  │  → update held_seconds        │   │
-│         (type="hold")               │  → insert transaction         │   │
-│                                     └────────────────────────────────┘   │
-│  ④ Download source from R2 → /tmp/eogum/{pid}/source.ext   [progress 5%]│
-│                                                                          │
-│  ⑤ Download extra_sources (multicam, 있으면)                [progress 10%]│
-│                                                                          │
-│  ⑥ avid CLI: transcribe                                    [progress 30%]│
-│     cmd: python -m avid.cli transcribe {source}                          │
-│          -l {lang} --chalna-url http://localhost:7861 --llm-refine       │
-│          [-d output_dir] [--context "전문용어..."]                        │
-│     → Chalna STT → SRT 파일 생성                                         │
-│     → stdout에서 "완료: /path.srt" 파싱 (or glob fallback)               │
-│     timeout: 7200s (2h)                                                  │
-│                                                                          │
-│  ⑦ avid CLI: transcript-overview                            [progress 50%]│
-│     cmd: python -m avid.cli transcript-overview {srt} [-o storyline.json]│
-│     → Codex LLM → storyline.json (내러티브 구조 분석)                     │
-│     timeout: 1800s (30m)                                                 │
-│                                                                          │
-│  ⑧ avid CLI: subtitle-cut (or podcast-cut)                  [progress 75%]│
-│     cmd: python -m avid.cli subtitle-cut {source} --srt {srt}           │
-│          --context {storyline.json} -d {output_dir} --final              │
-│          [--extra-source path1 --extra-source path2]                     │
-│     → .fcpxml, .srt, .report.md, .avid.json 생성                        │
-│     → _collect_results(): glob으로 결과 파일 수집                         │
-│     timeout: 1800s (30m)                                                 │
-│                                                                          │
-│  ⑨ ffmpeg: preview 생성 (실패해도 job 계속)                              │
-│     cmd: ffmpeg -i source -vf scale=-2:480 -crf 28 preview.mp4          │
-│     timeout: 600s                                                        │
-│                                                                          │
-│  ⑩ Upload results to R2                                     [progress 85%]│
-│     r2_keys = {fcpxml, srt, report, project_json, storyline, preview}    │
-│     → r2.upload_file() for each                                          │
-│                                                                          │
-│  ⑪ Save edit report                                                      │
-│     report.md → regex 파싱("합계" 행) → cut_duration 추출                 │
-│     DB: INSERT edit_reports                                              │
-│                                                                          │
-│  ⑫ Confirm credit usage                                                  │
-│     DB: UPDATE credits SET balance -= duration, held -= duration         │
-│     DB: INSERT credit_transactions (type="usage")                        │
-│                                                                          │
-│  ⑬ Mark complete                                                         │
-│     DB: UPDATE jobs SET status="completed", progress=100, result_r2_keys │
-│     DB: UPDATE projects SET status="completed"                           │
-│                                                                          │
-│  ⑭ Send completion email (Resend, 미설정 시 skip)                        │
-│                                                                          │
-│  ⑮ Cleanup: rm -rf /tmp/eogum/{pid}/                                     │
-│                                                                          │
-│  ──── 실패 시 (exception handler) ────                                    │
-│  → credit.release_hold() → held -= duration                              │
-│  → DB: jobs.status="failed", error_message                               │
-│  → DB: projects.status="failed"                                          │
-│  → email.send_failure_email()                                            │
-│  → cleanup                                                               │
-└──────────────────────────────────────────────────────────────────────────┘
-```
+- YouTube download task 자체는 DB 가 아니라 메모리에 저장된다.
+- 프로젝트 생성 시 크레딧 부족이면 402를 반환한다.
 
-**Frontend 폴링 (처리 중):**
-```
-[projects/[id]/page.tsx]
-  status가 "queued" or "processing"이면:
-    setInterval(GET /projects/{id}, 5000)  → job.progress 기반 프로그레스 바
-    completed/failed 되면 폴링 중지
-```
+관련 파일:
 
----
+- [page.tsx](/home/jonhpark/workspace/eogum/apps/web/src/app/dashboard/new/page.tsx)
+- [upload.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/routes/upload.py)
+- [youtube.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/routes/youtube.py)
+- [youtube.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/services/youtube.py)
 
-### 2.4 결과 확인 & 다운로드
+### 2.3 프로세싱 파이프라인
 
-```
-[projects/[id]/page.tsx — completed 상태]
+프로젝트 생성 후 흐름:
 
-  결과 표시:
-    edit_report → cut_percentage, cut_duration, report_markdown
+1. `projects.status = queued`
+2. `job_runner.enqueue(project_id)`
+3. worker 가 프로젝트를 꺼내 `processing` 으로 변경
+4. `jobs` 레코드 1개 생성
+5. 크레딧 hold
+6. 원본 소스 다운로드
+7. `extra_sources` 가 있으면 함께 다운로드
+8. avid `transcribe`
+9. avid `transcript-overview --provider claude`
+10. avid `subtitle-cut` 또는 `podcast-cut --provider claude`
+11. `ffmpeg` 로 `preview.mp4` 생성 시도
+12. 결과물 R2 업로드
+13. `edit_reports` 저장
+14. 크레딧 usage 확정
+15. `jobs.status = completed`, `projects.status = completed`
+16. 완료 이메일 전송 시도
 
-  다운로드 버튼 클릭:
-    handleDownload(fileType) → GET /projects/{id}/download/{type}
-      [downloads.py]
-        type="source" → project.source_r2_key → presigned URL (1h)
-        나머지      → job.result_r2_keys[type] → presigned URL (1h)
-    → window.open(download_url)
+실패 시:
 
-  지원 타입: source, fcpxml, srt, report, project_json, storyline
-  (주의: preview는 download type에 없음, video-url 스트리밍만 가능)
-```
+1. hold 해제
+2. `jobs.status = failed`
+3. `projects.status = failed`
+4. 실패 이메일 전송 시도
+5. 임시 디렉터리 정리
 
----
+startup recovery:
 
-### 2.5 세그먼트 리뷰 (평가)
+- 앱 시작 시 `queued` 또는 `processing` 프로젝트를 다시 `queued` 로 돌리고 재-enqueue 한다.
+- 이 과정에서 `running` / `pending` jobs 와 `edit_reports` 를 지운다.
 
-```
-[projects/[id]/review/page.tsx]
+관련 파일:
 
-  ① 데이터 로드:
-     GET /segments    → avid.json에서 세그먼트 + AI 판단 추출 (overlap 매칭)
-     GET /video-url   → preview or source 스트리밍 URL
-     GET /evaluation  → 기존 평가 (없으면 null)
+- [job_runner.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/services/job_runner.py)
+- [avid.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/services/avid.py)
+- [main.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/main.py)
 
-  ② UI:
-     비디오 플레이어 (sticky) + 세그먼트 목록 (AI cut=빨강, keep=초록)
-     각 세그먼트에 Human Decision (keep/cut + reason + note)
+### 2.4 결과 확인
 
-  ③ 저장:
-     POST /evaluation → check-then-insert upsert → evaluations 테이블
+프로젝트 상세 페이지(`/projects/{id}`)에서 제공하는 기능:
 
-  ④ 리포트 (on-demand):
-     GET /eval-report → AI vs Human 비교 → confusion matrix + F1
-```
+- 프로젝트 상태 표시
+- 진행 중이면 job progress polling
+- 편집 리포트 렌더링
+- 결과 파일 다운로드
+- 멀티캠 소스 업로드 / 제거 / 다운로드
+- 리뷰 페이지 이동
 
----
+백엔드가 지원하는 다운로드 타입:
 
-### 2.6 멀티캠 & 재시도
+- `source`
+- `fcpxml`
+- `srt`
+- `report`
+- `project_json`
+- `storyline`
+- `preview`
 
-```
-[멀티캠 추가 — projects/[id]/page.tsx]
-  파일 추가 → 순차 업로드 → PUT /extra-sources → POST /multicam
-  → 기존 jobs/reports 삭제 → status="queued" → 2.3 파이프라인 재실행
+현재 프론트 UI 에서 노출하는 기본 다운로드 버튼:
 
-[재시도 — dashboard 또는 projects/[id]]
-  POST /projects/{id}/retry
-  → status=="failed" 확인 → 크레딧 확인 → jobs/reports 삭제
-  → status="queued" → 2.3 파이프라인 재실행
-```
+- `source`
+- `fcpxml`
+- `srt`
+- `report`
+- `project_json`
+- `storyline`
 
----
+`preview` 는 백엔드 다운로드는 가능하지만, 현재 UI 에서는 별도 버튼보다 리뷰 플레이어용 `video-url` 사용이 중심이다.
 
-### 2.7 서버 시작 & 복구
+관련 파일:
 
-```
-[main.py: lifespan()]
-  SELECT * FROM projects WHERE status IN ("queued", "processing")
-  각각: DELETE jobs, DELETE reports, SET status="queued", enqueue()
+- [page.tsx](/home/jonhpark/workspace/eogum/apps/web/src/app/projects/[id]/page.tsx)
+- [downloads.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/routes/downloads.py)
 
-  빠지는 케이스:
-  - status="failed" + job 0개 → 복구 안 됨
-  - worker가 이미 "failed" 마킹한 후 서버 죽음 → 복구 안 됨
-```
+### 2.5 세그먼트 리뷰 / 평가
 
----
+리뷰 페이지(`/projects/{id}/review`) 흐름:
 
-## 3. DB 스키마
+1. `GET /projects/{id}/segments`
+2. `GET /projects/{id}/video-url`
+3. `GET /projects/{id}/evaluation`
+4. 사람이 keep / cut, reason, note 입력
+5. `POST /projects/{id}/evaluation`
+6. 필요할 때 `GET /projects/{id}/eval-report`
 
-```
-projects ─────────────────────────────────────────
-  id                    uuid PK
-  user_id               uuid FK→auth.users
-  name                  text
-  status                text  (queued|processing|completed|failed)
-  cut_type              text  (subtitle_cut|podcast_cut)
-  language              text  (ko|en|ja)
-  source_r2_key         text
-  source_filename       text
-  source_duration_seconds int
-  source_size_bytes     bigint
-  extra_sources         jsonb [{r2_key, filename, size_bytes}]
-  settings              jsonb {transcription_context?}
-  created_at, updated_at timestamptz
+구현 포인트:
 
-jobs ─────────────────────────────────────────────
-  id                    uuid PK
-  project_id            uuid FK→projects
-  user_id               uuid FK→auth.users
-  type                  text  (subtitle_cut|podcast_cut)
-  status                text  (running|completed|failed)
-  progress              int   (0-100)
-  error_message         text  nullable
-  result_r2_keys        jsonb {fcpxml?,srt?,report?,project_json?,storyline?,preview?}
-  started_at, completed_at, created_at timestamptz
+- 백엔드는 `evaluation` 이 없으면 404를 반환한다.
+- 프론트는 이 404를 정상 상태로 처리하고 `null` 로 간주한다.
+- 저장은 `project_id,evaluator_id` unique key 기반 atomic upsert 이다.
+- `video-url` 은 preview 가 있으면 preview, 없으면 source 를 스트리밍한다.
 
-edit_reports ──────────────────────────────────────
-  id                    uuid PK
-  project_id            uuid FK→projects
-  total_duration_seconds int
-  cut_duration_seconds  int
-  cut_percentage        float
-  edit_summary          jsonb
-  report_markdown       text
-  created_at, updated_at timestamptz
+관련 파일:
 
-credits ───────────────────────────────────────────
-  user_id               uuid PK FK→auth.users
-  balance_seconds       int
-  held_seconds          int
-  total_granted_seconds int
-  updated_at            timestamptz
+- [review/page.tsx](/home/jonhpark/workspace/eogum/apps/web/src/app/projects/[id]/review/page.tsx)
+- [evaluations.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/routes/evaluations.py)
 
-credit_transactions ───────────────────────────────
-  id                    uuid PK
-  user_id               uuid FK→auth.users
-  job_id                uuid FK→jobs nullable
-  amount_seconds        int
-  type                  text  (hold|usage|hold_release)
-  description           text
-  created_at            timestamptz
+### 2.6 평가 반영 재-export / 멀티캠
 
-evaluations ───────────────────────────────────────
-  id                    uuid PK
-  project_id            uuid FK→projects
-  evaluator_id          uuid FK→auth.users
-  segments              jsonb [{index, start_ms, end_ms, text, ai:{}, human:{}}]
-  version               text
-  avid_version          text nullable
-  eogum_version         text nullable
-  created_at, updated_at timestamptz
-```
+`POST /projects/{id}/multicam` 의 현재 의미는 단순 멀티캠 처리보다 넓다.
 
----
+실행 조건:
+
+- 프로젝트 상태가 `completed` 또는 `failed`
+- 최신 completed job 이 존재
+- `project_json` 결과물이 존재
+- 평가 데이터 또는 `extra_sources` 중 하나 이상 존재
+
+실행 내용:
+
+1. 기존 `project_json` 다운로드
+2. 평가 데이터가 있으면 human decision 을 avid `edit_decisions` 에 반영
+3. 기존 extra source 가 avid project 에 있으면 먼저 제거
+4. `extra_sources` 가 있으면 오디오 싱크 후 추가
+5. 업데이트된 `project_json` 저장
+6. FCPXML 재-export
+7. 최신 completed job 의 `result_r2_keys.project_json` / `fcpxml` 갱신
+8. 프로젝트 상태를 다시 `completed` 로 복구
+
+실패 동작:
+
+- 원래 completed 결과물이 남아 있다고 가정하고 프로젝트 상태를 `completed` 로 되돌린다.
+
+관련 파일:
+
+- [projects.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/routes/projects.py)
+- [avid.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/services/avid.py)
+
+## 3. 데이터 모델 요약
+
+| 테이블 | 주요 컬럼 | 설명 |
+|--------|----------|------|
+| `profiles` | `id`, `display_name`, `plan` | 사용자 프로필 |
+| `credits` | `user_id`, `balance_seconds`, `held_seconds` | 사용자 크레딧 잔액 |
+| `credit_transactions` | `user_id`, `amount_seconds`, `type`, `job_id` | 크레딧 사용 이력 |
+| `projects` | `status`, `cut_type`, `language`, `source_*`, `settings`, `extra_sources` | 프로젝트 메타데이터 |
+| `jobs` | `project_id`, `type`, `status`, `progress`, `result_r2_keys` | 처리 시도 단위 |
+| `edit_reports` | `project_id`, `cut_duration_seconds`, `cut_percentage`, `report_markdown` | 편집 요약 |
+| `evaluations` | `project_id`, `evaluator_id`, `avid_version`, `eogum_version`, `segments` | 사람 평가 결과 |
+
+메모:
+
+- `projects.extra_sources` 는 멀티캠 재-export 용 추가 소스 목록이다.
+- 현재 코드는 processing attempt 당 `jobs` 행 1개만 만들며 `type` 에 `subtitle_cut` 또는 `podcast_cut` 이 저장된다.
 
 ## 4. API 엔드포인트 맵
 
 모든 엔드포인트 prefix: `/api/v1`
 
-| Method | Path | Handler | 역할 |
-|--------|------|---------|------|
-| GET | `/health` | health.py | 서버 상태 |
-| POST | `/upload/presign` | upload.py | 단건 presigned URL |
-| POST | `/upload/multipart/initiate` | upload.py | 멀티파트 시작 |
-| POST | `/upload/multipart/complete` | upload.py | 멀티파트 완료 |
-| **POST** | **`/projects`** | projects.py | **프로젝트 생성 + 큐** |
-| GET | `/projects` | projects.py | 목록 |
-| GET | `/projects/{id}` | projects.py | 상세 (jobs+report) |
-| POST | `/projects/{id}/retry` | projects.py | 재시도 |
-| PUT | `/projects/{id}/extra-sources` | projects.py | 멀티캠 소스 등록 |
-| POST | `/projects/{id}/multicam` | projects.py | 멀티캠 재처리 |
-| DELETE | `/projects/{id}` | projects.py | 삭제 |
-| GET | `/credits` | credits.py | 잔액 |
-| GET | `/credits/transactions` | credits.py | 거래 내역 |
-| GET | `/projects/{id}/download/{type}` | downloads.py | 결과물 URL |
-| GET | `/projects/{id}/download/extra-source/{idx}` | downloads.py | 멀티캠 소스 URL |
-| GET | `/projects/{id}/segments` | evaluations.py | 세그먼트+AI판단 |
-| GET | `/projects/{id}/video-url` | evaluations.py | 프리뷰 스트림 URL |
-| GET | `/projects/{id}/evaluation` | evaluations.py | 기존 평가 |
-| POST | `/projects/{id}/evaluation` | evaluations.py | 평가 저장 |
-| GET | `/projects/{id}/eval-report` | evaluations.py | AI vs Human 리포트 |
-
----
-
-## 5. 파일 & 스토리지 경로
-
-### R2 (Cloudflare)
-```
-eogum/
-├── sources/{uuid}.mp4              ← 사용자 업로드 원본
-└── results/{project_id}/
-    ├── source.final.fcpxml         ← FCP XML
-    ├── source.final.srt            ← 자막
-    ├── source.report.md            ← 편집 리포트
-    ├── source.avid.json            ← avid 프로젝트
-    ├── storyline.json              ← 스토리 구조
-    └── preview.mp4                 ← 480p 프리뷰
-```
-
-### Local Temp (처리 중에만 존재)
-```
-/tmp/eogum/{project_id}/
-├── source.mp4                      ← R2에서 다운로드
-├── extra_0.mp4                     ← 멀티캠 (있으면)
-├── source.srt                      ← avid transcribe 출력
-└── output/
-    ├── storyline.json              ← transcript-overview
-    ├── source.final.fcpxml         ← subtitle-cut/podcast-cut
-    ├── source.final.srt
-    ├── source.report.md
-    ├── source.avid.json
-    └── preview.mp4                 ← ffmpeg
-```
-
----
-
-## 6. 문제점 분석
-
-### 요약 매트릭스
-
-Codex CLI (gpt-5) 리뷰 2회 실행 결과: **Backend FAIL / Frontend FAIL**
-
-| 심각도 | 건수 | 설명 |
+| Method | Path | 역할 |
 |--------|------|------|
-| CRITICAL | 3 | 데이터 유실/무결성 위험 |
-| MAJOR | 16 | 안정성/UX 문제 |
-| MINOR | 4 | 개선 사항 |
+| GET | `/health` | 서버 상태 |
+| POST | `/upload/presign` | 단건 presigned upload URL |
+| POST | `/upload/multipart/initiate` | 멀티파트 업로드 시작 |
+| POST | `/upload/multipart/complete` | 멀티파트 업로드 완료 |
+| POST | `/projects` | 프로젝트 생성 및 queue 등록 |
+| GET | `/projects` | 프로젝트 목록 |
+| GET | `/projects/{id}` | 프로젝트 상세 |
+| POST | `/projects/{id}/retry` | 실패 프로젝트 재시도 |
+| PUT | `/projects/{id}/extra-sources` | 멀티캠 추가 소스 등록/수정 |
+| POST | `/projects/{id}/multicam` | 평가 반영 재-export 및 멀티캠 처리 |
+| DELETE | `/projects/{id}` | 프로젝트 삭제 |
+| GET | `/credits` | 잔액 조회 |
+| GET | `/credits/transactions` | 크레딧 거래 내역 |
+| GET | `/projects/{id}/download/{type}` | 결과물 다운로드 URL |
+| GET | `/projects/{id}/download/extra-source/{idx}` | 추가 소스 다운로드 URL |
+| GET | `/projects/{id}/segments` | 세그먼트 + AI 판단 조회 |
+| GET | `/projects/{id}/video-url` | 리뷰 플레이어용 스트리밍 URL |
+| GET | `/projects/{id}/evaluation` | 기존 평가 조회 |
+| POST | `/projects/{id}/evaluation` | 평가 저장 |
+| GET | `/projects/{id}/eval-report` | AI vs Human 비교 리포트 |
+| POST | `/youtube/info` | YouTube 메타데이터 조회 |
+| POST | `/youtube/download` | YouTube 다운로드 시작 |
+| GET | `/youtube/download/{task_id}` | YouTube 다운로드 상태 조회 |
 
-### CRITICAL — 데이터 유실/무결성
+## 5. 파일 및 스토리지 경로
 
-#### C1. In-memory job queue 유실
-- **위치:** `job_runner.py:14` — `_queue: deque[str] = deque()`
-- **문제:** 서버 재시작 시 큐 소멸. 실제로 프로젝트 `11d144f6`이 job 0개, status=failed
-- **재현:** 프로젝트 enqueue → 서버 kill → 재시작 → startup recovery는 "failed"를 무시
-- **해결:** projects.status="queued"를 큐로 사용. worker가 직접 DB에서 "queued" 프로젝트를 poll
+### Cloudflare R2
 
-#### C2. 크레딧 연산 비원자적
-- **위치:** `credit.py:18-41` — `hold_credits()`
-- **문제:** `get_balance()` (SELECT) → `update held_seconds` (UPDATE). 두 API 요청이 동시에 오면 둘 다 "잔액 충분" 판단 후 각각 hold → 초과 사용
-- **코드:**
-  ```python
-  balance = get_balance(user_id)                    # ← 시점 A: balance=18000
-  if balance["available_seconds"] < seconds: raise  # 통과
-  db.table("credits").update({
-      "held_seconds": balance["held_seconds"] + seconds,  # ← 시점 B: 다른 요청이 이미 hold 했을 수 있음
-  }).eq("user_id", user_id).execute()
-  ```
-- **해결:** Supabase RPC (PostgreSQL function)로 SELECT + CHECK + UPDATE를 단일 트랜잭션 처리
+```text
+sources/{uuid}.{ext}
+results/{project_id}/{artifact}
+```
 
-#### ~~C3. Evaluation upsert 비원자적~~ ✅ 해결됨 (2026-03-07)
-- **위치:** `evaluations.py`
-- DB에 이미 UNIQUE(project_id, evaluator_id) 인덱스 존재. 코드를 `.upsert(on_conflict=...)` 로 변경 완료
+예상 artifact:
 
----
+- `*.fcpxml`
+- `*.srt`
+- `*.report.md`
+- `*.avid.json`
+- `storyline.json`
+- `preview.mp4`
 
-### MAJOR — 안정성/UX
+### 로컬 임시 디렉터리
 
-#### M1. retry/multicam이 active worker 미체크
-- **위치:** `projects.py:71-104`, `projects.py:130-168`
-- **문제:** retry가 old job DELETE + status="queued" + enqueue. 이때 worker가 동일 프로젝트를 처리 중이면 두 worker가 동시에 실행
-- **해결:** enqueue 전에 `_queue`에 같은 project가 있는지, `_running`인 project와 같은지 체크. 또는 status를 CAS(Compare-And-Swap)로 변경
+기본값: `/tmp/eogum`
 
-#### M2. Startup recovery가 failed(job 0개) 무시
-- **위치:** `main.py:22-26`
-- **문제:** `status IN ("queued", "processing")`만 복구. status="failed"이면서 job이 0개인 프로젝트(에러가 job 생성 전에 발생)는 영원히 stuck
-- **해결:** `status="failed"` AND job 0개인 프로젝트도 "queued"로 복구
+```text
+/tmp/eogum/{project_id}/
+  source.ext
+  extra_0.ext
+  extra_1.ext
+  *.srt
+  output/
+    *.fcpxml
+    *.report.md
+    *.avid.json
+    storyline.json
+    preview.mp4
 
-#### ~~M3. 다운로드 try-catch 없음~~ ✅ 해결됨
-- handleDownload, handleDownloadExtraSource 모두 try-catch 적용 완료
+/tmp/eogum/multicam_{project_id}/
+  source.ext
+  extra_0.ext
+  output/
+    *.fcpxml
+    *.avid.json
 
-#### M4. fetch timeout 없음
-- **위치:** `lib/api.ts:3-24` — `apiFetch()`
-- **문제:** AbortController 미사용. 서버 다운 시 fetch가 무한 대기
-- **해결:** AbortController + 30초 timeout
+/tmp/eogum/yt_{task_id}/
+  downloaded-video.mp4
+```
 
-#### ~~M5. alert() 사용~~ ✅ 해결됨
-- 인라인 에러 배너 (setSaveError) 적용 완료
+## 6. 현재 제약과 리스크
 
-#### ~~M6. saving 플래그 미리셋~~ ✅ 해결됨
-- early return 전에 setSaving(false) 호출하도록 수정 완료
+### 6.1 영속성
 
-#### ~~M7. getEvaluation 에러 전부 null~~ ✅ 해결됨
-- 404만 null 반환, 나머지 rethrow 적용 완료
+- 프로젝트 처리 queue 는 메모리에만 있다.
+- YouTube download task 도 메모리에만 있다.
+- 프로세스 재시작 시 startup recovery 는 프로젝트는 일부 복구하지만 YouTube task 는 복구하지 못한다.
 
-#### ~~M8. 업로드 실패 시 progress 미리셋~~ ✅ 해결됨
-- catch에 `setUploadProgress(0)` 적용 완료
+### 6.2 동시성
 
-#### M9. duration 검증 없음
-- **위치:** `dashboard/new/page.tsx:61`, `schemas.py:36`
-- **문제:** 0초 or 극단적 길이(24h+) 허용 → 크레딧 0차감 or 처리 불가능
-- **해결:** Frontend: duration > 0 && < 86400 체크. Backend: `source_duration_seconds: int = Field(gt=0, le=86400)`
+- worker 는 1개뿐이라 동시에 1개 프로젝트만 처리한다.
+- `retry` 와 `multicam` 에 active worker 충돌 방지 로직이 없다.
 
-#### M10. cut_type/settings 미검증
-- **위치:** `schemas.py:32,38`
-- **문제:** `cut_type: str` → 아무 문자열 허용. `settings: dict = {}` → 임의 JSON
-- **해결:** `cut_type: Literal["subtitle_cut", "podcast_cut"]`, settings 스키마 정의
+### 6.3 recovery 범위
 
-#### M11. SRT 경로 파싱 brittle
-- **위치:** `avid.py:62-68`
-- **문제:** stdout에서 "완료" + ".srt" 패턴 regex → avid 출력 형식 변경 시 깨짐
-- **해결:** avid CLI에 `--json-output` 옵션 추가, structured output 반환
+- startup recovery 는 `queued`, `processing` 만 다룬다.
+- `failed` 이면서 job 이 비정상적으로 비어 있는 프로젝트는 자동 복구 대상이 아니다.
 
-#### M12. glob 결과 순서 의존
-- **위치:** `avid.py:178-195` — `_collect_results()`
-- **문제:** `glob("{stem}*.fcpxml")[0]` → 여러 파일 있으면 잘못된 파일 선택
-- **해결:** `.final.` 접미사 우선 or 최신 mtime 선택
+### 6.4 입력 검증
 
-#### M13. 리포트 파싱 regex 취약
-- **위치:** `job_runner.py:204-220`
-- **문제:** `"합계"` 한국어 패턴에 의존. 영어 리포트 시 cut_duration=0
-- **해결:** avid.json의 structured data에서 cut_duration 직접 파싱
+- `source_duration_seconds`, `cut_type`, `settings` 검증이 아직 느슨하다.
+- 프론트와 백엔드 모두 극단적인 입력값 방어가 충분하지 않다.
 
-#### ~~M14. preview 다운로드 불가~~ ✅ 해결됨
-- `_DOWNLOAD_TYPES`에 preview 추가 완료
+### 6.5 네트워크/업로드 내구성
 
-#### M15. 멀티파트 실패 시 retry/abort 없음
-- **위치:** `lib/api.ts:336-357` — `uploadFile()`
-- **문제:** 파트 실패 시 throw만. R2에 미완성 multipart 잔류
-- **해결:** part retry (3회) + 전체 실패 시 r2.abort_multipart_upload() 호출
+- 프론트 `fetch` timeout 이 없다.
+- 폴링 backoff 가 없다.
+- 멀티파트 업로드는 part retry 및 abort cleanup 이 없다.
 
-#### M16. 폴링 에러 시 backoff 없음
-- **위치:** `dashboard/page.tsx:256-260`
-- **문제:** 서버 다운 시 10초마다 실패 요청 반복, 에러 배너만 표시
-- **해결:** exponential backoff (10s → 20s → 40s, max 60s)
+### 6.6 외부 도구 의존성
 
----
+- avid CLI 출력과 결과 파일 경로 파싱이 일부 stdout/glob 규칙에 의존한다.
+- 편집 리포트 파싱은 markdown 패턴에 의존한다.
+- `ffmpeg`, `ffprobe`, `yt-dlp`, Chalna, avid `.venv` 가 모두 정상이어야 한다.
 
-### MINOR
+## 7. 참고 파일
 
-| ID | 위치 | 문제 |
-|----|------|------|
-| ~~m1~~ | ~~`config.py:25`~~ | ~~✅ 해결됨: `chalna_url` 기본값이 `"http://localhost:7861"`로 수정 완료~~ |
-| m2 | `evaluations.py:90-110` | segment-decision 매칭 O(n×m). 대형 영상에서 느림 |
-| m3 | `review/page.tsx` | 키보드 단축키 없음 (100+ 세그먼트를 마우스로만) |
-| m4 | `projects/[id]/page.tsx` | 멀티캠 크레딧 비용 구체적 미표시 |
-
----
-
-## 7. 수정 우선순위
-
-### Phase 1 — 즉시 (각 5-15분, 코드 수정만)
-
-| # | ID | 작업 | 파일 | 상태 |
-|---|-----|------|------|------|
-| 1 | M3 | 다운로드 try-catch | `projects/[id]/page.tsx` | ✅ |
-| 2 | M5+M6 | alert()→인라인에러 + saving리셋 | `review/page.tsx` | ✅ |
-| 3 | M8 | 업로드 실패 시 progress=0 | `new/page.tsx` | ✅ |
-| 4 | M10 | cut_type Literal 타입 | `schemas.py` | |
-| 5 | M14 | download types에 preview | `downloads.py` | ✅ |
-| 6 | m1 | chalna_url 기본값 7861 | `config.py` | ✅ |
-| 7 | M7 | getEvaluation 404만 null | `api.ts` | ✅ |
-| 8 | M9 | duration 검증 추가 | `new/page.tsx` + `schemas.py` | |
-
-> **추가 수정 (2026-03-07):**
-> - C3: evaluation upsert → `.upsert(on_conflict=...)` 원자적 처리로 변경
-> - `evaluations.py`: eogum_version 경로 수정 (avid_cli_path 기반 → `__file__` 기반)
-> - `projects/[id]/page.tsx`: 다운로드 버튼에 report, project_json 추가
-> - `projects/[id]/page.tsx`: 미사용 STATUS_CONFIG 항목(created, uploading) 제거
-> - `projects/[id]/page.tsx`: JOB_TYPE_LABELS에서 실제 생성되지 않는 job type(transcribe, transcript_overview) 제거
-> - `dashboard/page.tsx`: 미사용 STATUS_CONFIG 항목(created, uploading) 제거
-
-### Phase 2 — 단기 (각 30분-2시간, 설계 변경)
-
-| # | ID | 작업 | 파일 |
-|---|-----|------|------|
-| 1 | C1 | DB 기반 job queue | `job_runner.py`, `main.py` |
-| 2 | M1 | retry시 active worker 체크 | `projects.py` |
-| 3 | M4 | apiFetch AbortController | `api.ts` |
-| 4 | M16 | 폴링 exponential backoff | `dashboard/page.tsx` 등 |
-| 5 | M2 | startup recovery 보강 | `main.py` |
-| 6 | M15 | 멀티파트 part retry + abort | `api.ts` |
-
-### Phase 3 — 중기 (아키텍처 변경)
-
-| # | ID | 작업 |
-|---|-----|------|
-| 1 | C2 | 크레딧 PostgreSQL function |
-| ~~2~~ | ~~C3~~ | ~~Evaluation UNIQUE + upsert~~ ✅ 해결됨 |
-| 3 | M11-13 | avid CLI structured output |
-| 4 | — | Rate limiting 미들웨어 |
-| 5 | — | Supabase Realtime (폴링 대체) |
-
----
-
-## Appendix: Codex Review 결과
-
-2026-02-22 실행. Backend/Frontend 양쪽 **FAIL**.
-
-리뷰 로그: `codex-review-logs/review_20260222_180344.json` (backend), `review_20260222_180410.json` (frontend)
+- [main.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/main.py)
+- [job_runner.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/services/job_runner.py)
+- [avid.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/services/avid.py)
+- [youtube.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/services/youtube.py)
+- [api.ts](/home/jonhpark/workspace/eogum/apps/web/src/lib/api.ts)
+- [dashboard/new/page.tsx](/home/jonhpark/workspace/eogum/apps/web/src/app/dashboard/new/page.tsx)
+- [projects/[id]/page.tsx](/home/jonhpark/workspace/eogum/apps/web/src/app/projects/[id]/page.tsx)
+- [projects/[id]/review/page.tsx](/home/jonhpark/workspace/eogum/apps/web/src/app/projects/[id]/review/page.tsx)

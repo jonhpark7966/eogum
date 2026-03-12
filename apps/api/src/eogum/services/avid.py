@@ -166,6 +166,87 @@ def podcast_cut(
     return _collect_results(source_path, output_dir)
 
 
+def apply_evaluation_to_project(project, eval_segments: list) -> int:
+    """Apply human evaluation decisions to project's edit_decisions.
+
+    Replaces AI edit_decisions with human overrides where they exist.
+    Returns the number of changes applied.
+    """
+    import sys
+
+    avid_src = str(settings.avid_cli_path / "src")
+    if avid_src not in sys.path:
+        sys.path.insert(0, avid_src)
+
+    from avid.models.timeline import EditDecision, EditReason, EditType, TimeRange
+
+    # Determine primary video track ID for edit_decisions
+    video_tracks = project.get_video_tracks()
+    primary_video_track_id = video_tracks[0].id if video_tracks else None
+    audio_tracks = project.get_audio_tracks()
+    # Collect audio track IDs that belong to the primary source
+    primary_audio_track_ids = None
+    if video_tracks:
+        primary_source_id = video_tracks[0].source_file_id
+        primary_audio_track_ids = [
+            t.id for t in audio_tracks if t.source_file_id == primary_source_id
+        ]
+
+    # Collect human-reviewed segments with their final action
+    human_overrides = []
+    for seg in eval_segments:
+        human = seg.get("human")
+        if human:
+            human_overrides.append((seg["start_ms"], seg["end_ms"], human["action"]))
+
+    if not human_overrides:
+        logger.info("No human overrides to apply")
+        return 0
+
+    original_count = len(project.edit_decisions)
+
+    # Remove existing edit_decisions that overlap with any human-reviewed segment
+    new_decisions = []
+    for ed in project.edit_decisions:
+        ed_start = ed.range.start_ms
+        ed_end = ed.range.end_ms
+
+        overlaps_human = False
+        for h_start, h_end, _ in human_overrides:
+            if ed_start < h_end and ed_end > h_start:
+                overlaps_human = True
+                break
+
+        if not overlaps_human:
+            new_decisions.append(ed)
+
+    # Add CUT decisions for human "cut" segments
+    cuts_added = 0
+    for h_start, h_end, action in human_overrides:
+        if action == "cut":
+            new_decisions.append(EditDecision(
+                range=TimeRange(start_ms=h_start, end_ms=h_end),
+                edit_type=EditType.CUT,
+                reason=EditReason.MANUAL,
+                confidence=1.0,
+                note="human evaluation override",
+                active_video_track_id=primary_video_track_id,
+                active_audio_track_ids=primary_audio_track_ids,
+            ))
+            cuts_added += 1
+
+    # Sort by start time
+    new_decisions.sort(key=lambda ed: ed.range.start_ms)
+    project.edit_decisions = new_decisions
+
+    changes = abs(original_count - len(new_decisions)) + cuts_added
+    logger.info(
+        "Applied evaluation: %d human overrides, %d original decisions → %d new decisions (%d cuts added)",
+        len(human_overrides), original_count, len(new_decisions), cuts_added,
+    )
+    return changes
+
+
 def multicam_add_sources(
     project_json_path: str,
     source_path: str,

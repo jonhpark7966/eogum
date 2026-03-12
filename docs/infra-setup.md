@@ -19,7 +19,8 @@
 - 홈 서버 또는 리눅스 머신
 - Python 3.11+
 - `ffmpeg`, `ffprobe`, `yt-dlp` 가 서비스 사용자 PATH 에서 실행 가능해야 함
-- `auto-video-edit` 저장소가 `AVID_CLI_PATH` 에 존재하고 `.venv` 포함
+- `auto-video-edit` backend 가 `AVID_BACKEND_ROOT` 에 존재하고 `.venv` 포함
+- `AVID_BIN` 이 실제 `avid-cli` 실행 파일을 가리켜야 함
 - Chalna 서버가 `CHALNA_URL` 에서 응답해야 함
 - avid CLI 에서 사용할 Claude provider 설정 완료
 
@@ -172,7 +173,8 @@ cp .env.example .env
 - `R2_ACCESS_KEY_ID`
 - `R2_SECRET_ACCESS_KEY`
 - `R2_BUCKET_NAME`
-- `AVID_CLI_PATH`
+- `AVID_BACKEND_ROOT`
+- `AVID_BIN`
 - `CHALNA_URL` (기본값 `http://localhost:7861`)
 - `RESEND_API_KEY` / `EMAIL_FROM` (선택)
 
@@ -186,12 +188,14 @@ cp .env.example .env
 - `ffprobe`
 - `yt-dlp`
 
-추가로 `AVID_CLI_PATH` 가 가리키는 avid 저장소에서 아래가 동작해야 한다.
+추가로 `AVID_BACKEND_ROOT` / `AVID_BIN` 이 가리키는 avid backend 에서 아래가 동작해야 한다.
 
 ```bash
-cd /path/to/auto-video-edit/apps/backend
+cd /path/to/eogum/third_party/auto-video-edit/apps/backend
 source .venv/bin/activate
-python -m avid.cli --help
+avid-cli --help
+avid-cli version --json
+avid-cli doctor --provider claude --json
 ```
 
 `transcript-overview`, `subtitle-cut`, `podcast-cut` 단계는 현재 `--provider claude` 를 사용한다.
@@ -260,7 +264,7 @@ sudo systemctl start eogum-api
 - [ ] R2 버킷 및 CORS 설정
 - [ ] API `.env` 작성
 - [ ] `ffmpeg`, `ffprobe`, `yt-dlp` 설치
-- [ ] avid 저장소 `.venv` 준비
+- [ ] `AVID_BACKEND_ROOT` / `AVID_BIN` 준비
 - [ ] Chalna 실행
 - [ ] `apps/api` 실행
 - [ ] `apps/web` 에서 `NEXT_PUBLIC_*` 환경 변수 설정 후 실행

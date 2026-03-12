@@ -129,11 +129,10 @@ def update_extra_sources(
 
 @router.post("/{project_id}/multicam", response_model=ProjectResponse)
 def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
-    """Re-export FCPXML with evaluation overrides and optional multicam sources."""
+    """Re-export project outputs via avid-cli with evaluation overrides and optional multicam sources."""
     import json
     import logging
     import shutil
-    import sys
     import threading
     from pathlib import Path
 
@@ -206,80 +205,41 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
             local_project_json = temp_dir / Path(project_json_key).name
             local_project_json.write_bytes(project_json_bytes)
 
-            # Add avid src to path for imports
-            avid_src = str(settings.avid_cli_path / "src")
-            if avid_src not in sys.path:
-                sys.path.insert(0, avid_src)
-
-            from avid.export.fcpxml import FCPXMLExporter
-            from avid.models.project import Project
-
-            # Load avid project
-            avid_project = Project.load(local_project_json)
-            logger.info(
-                "Loaded avid project: %d sources, %d tracks, %d edit_decisions",
-                len(avid_project.source_files), len(avid_project.tracks), len(avid_project.edit_decisions),
-            )
-
-            # Step 1: Apply evaluation overrides to edit_decisions
+            evaluation_path = None
             if eval_segments:
-                avid.apply_evaluation_to_project(avid_project, eval_segments)
+                evaluation_path = temp_dir / "evaluation.json"
+                evaluation_path.write_text(
+                    json.dumps({"segments": eval_segments}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
 
-            # Step 2: Add multicam sources (if any)
-            # First, remove any previously-added extra sources to avoid duplicates
-            if len(avid_project.source_files) > 1:
-                primary_source_id = avid_project.source_files[0].id
-                avid_project.source_files = [avid_project.source_files[0]]
-                avid_project.tracks = [
-                    t for t in avid_project.tracks
-                    if t.source_file_id == primary_source_id
-                ]
-                logger.info("Stripped extra sources, now %d sources", len(avid_project.source_files))
-
+            source_path = None
+            extra_paths: list[str] = []
             if has_extra_sources:
-                from avid.services.audio_sync import AudioSyncService
-
-                # Download main source
                 source_ext = Path(project.data["source_filename"]).suffix
-                source_path = temp_dir / f"source{source_ext}"
-                r2.download_file(project.data["source_r2_key"], str(source_path))
+                local_source_path = temp_dir / f"source{source_ext}"
+                r2.download_file(project.data["source_r2_key"], str(local_source_path))
+                source_path = str(local_source_path)
 
-                # Download extra sources
-                extra_paths = []
                 for i, es in enumerate(project.data["extra_sources"]):
                     ext = Path(es["filename"]).suffix
                     local_path = temp_dir / f"extra_{i}{ext}"
                     r2.download_file(es["r2_key"], str(local_path))
-                    extra_paths.append(local_path)
+                    extra_paths.append(str(local_path))
 
-                # Audio sync and add to project
-                import asyncio
-
-                sync_service = AudioSyncService()
-                asyncio.run(sync_service.add_extra_sources(
-                    avid_project, source_path, extra_paths,
-                ))
-                logger.info(
-                    "Added %d extra sources. Now %d sources, %d tracks",
-                    len(extra_paths), len(avid_project.source_files), len(avid_project.tracks),
-                )
-
-            # Step 3: Save updated project JSON
-            updated_json = output_dir / local_project_json.name
-            avid_project.save(updated_json)
-
-            # Step 4: Export FCPXML
-            exporter = FCPXMLExporter()
-            stem = Path(project.data["source_filename"]).stem
-            fcpxml_path = output_dir / f"{stem}_subtitle_cut.fcpxml"
-            import asyncio
-            # Evaluation applied → export as final cut (no disabled clips)
-            asyncio.run(exporter.export(
-                avid_project, fcpxml_path,
-                silence_mode="cut",
+            payload = avid.reexport(
+                project_json_path=str(local_project_json),
+                output_dir=str(output_dir),
+                source_path=source_path,
+                evaluation_path=str(evaluation_path) if evaluation_path else None,
+                extra_sources=extra_paths or None,
                 content_mode="cut" if eval_segments else "disabled",
-            ))
-            logger.info("Exported FCPXML: %s", fcpxml_path)
+            )
+            artifacts = payload.get("artifacts") or {}
+            updated_json = Path(artifacts["project_json"])
+            fcpxml_path = Path(artifacts["fcpxml"])
+            srt_path = Path(artifacts["srt"]) if artifacts.get("srt") else None
+            logger.info("Re-exported avid project via CLI: %s", payload)
 
             # Step 5: Upload updated results to R2
             new_r2_keys = dict(r2_keys)
@@ -293,6 +253,11 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
             fcpxml_r2_key = f"results/{project_id}/{fcpxml_path.name}"
             r2.upload_file(str(fcpxml_path), fcpxml_r2_key, "application/xml")
             new_r2_keys["fcpxml"] = fcpxml_r2_key
+
+            if srt_path:
+                srt_r2_key = f"results/{project_id}/{srt_path.name}"
+                r2.upload_file(str(srt_path), srt_r2_key, "text/plain")
+                new_r2_keys["srt"] = srt_r2_key
 
             # Update job with new r2_keys
             db.table("jobs").update({

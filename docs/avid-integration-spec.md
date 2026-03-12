@@ -55,10 +55,9 @@
 
 현재 코드는 아직 아래 문제를 갖고 있다.
 
-- `python -m avid.cli` 를 직접 조립한다
-- 결과 일부를 stdout 파싱과 glob 으로 찾는다
-- `/multicam` 경로는 avid Python 모듈을 직접 import 한다
-- `AVID_CLI_PATH` 가 외부 sibling repo 를 가리킨다
+- submodule pointer 가 아직 저장소에 추가되지 않았다
+- 일부 로컬 환경은 여전히 `AVID_CLI_PATH` legacy fallback 에 의존할 수 있다
+- startup `doctor` 와 adapter 명세 테스트 는 아직 남아 있다
 
 목표는 이 문서와 아래 세부 문서를 기준으로 수렴하는 것이다.
 

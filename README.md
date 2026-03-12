@@ -6,6 +6,7 @@
 문서 우선순위:
 
 - [ARCHITECTURE.md](/home/jonhpark/workspace/eogum/ARCHITECTURE.md): 현재 런타임 구조와 사용자 플로우
+- [WORK_IN_PROGRESS.md](/home/jonhpark/workspace/eogum/WORK_IN_PROGRESS.md): 현재 진행 중인 백엔드 리팩터링 작업
 - [docs/backend-module-map.md](/home/jonhpark/workspace/eogum/docs/backend-module-map.md): 백엔드 모듈 경계
 - [docs/backend-testing-strategy.md](/home/jonhpark/workspace/eogum/docs/backend-testing-strategy.md): 백엔드 테스트 전략
 - [docs/backend-refactoring-roadmap.md](/home/jonhpark/workspace/eogum/docs/backend-refactoring-roadmap.md): 백엔드 리팩터링 순서
@@ -27,6 +28,7 @@ eogum/
 
 문서와 리팩터링 설계는 `third_party/auto-video-edit` 경로를 기준으로 한다.
 현재 실제 submodule pointer 가 아직 추가되기 전이라면, 관련 문서는 목표 구조 문서로 읽으면 된다.
+현재 backend 코드는 submodule 경로를 우선 사용하되, 실제 submodule 이 아직 없으면 legacy sibling repo 경로로만 한시적으로 fallback 할 수 있다.
 
 ## Git 과 Submodule 운영 규칙
 

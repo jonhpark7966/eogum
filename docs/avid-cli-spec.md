@@ -238,14 +238,14 @@ avid-cli doctor --json
 1. 결과물 위치는 manifest JSON 을 우선 읽는다.
 2. stdout 사람용 메시지는 로그 용도로만 사용한다.
 3. `version` 과 `doctor` 는 startup 또는 health 진단에 사용한다.
-4. `reexport` 가 준비되면 backend 의 direct Python import 를 제거한다.
+4. `reexport` 로 `/multicam` direct Python import 경로를 제거한다.
 
 ## 7. 현재 구현과의 차이
 
-현재 `eogum` 은 아직 아래 문제를 가진다.
+현재 남아 있는 작업은 아래다.
 
-- `python -m avid.cli` 형태를 직접 조립한다
-- stdout 파싱과 glob 규칙에 의존한다
-- `/multicam` 에서 avid Python 모듈을 직접 import 한다
+- startup `doctor` 호출 연결
+- adapter 명세 테스트 추가
+- 실제 submodule pointer 추가 및 bootstrap 검증
 
 목표는 이 명세대로 수렴하는 것이다.

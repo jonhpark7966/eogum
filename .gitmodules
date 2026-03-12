@@ -1,0 +1,3 @@
+[submodule "third_party/auto-video-edit"]
+	path = third_party/auto-video-edit
+	url = git@github.com:jonhpark7966/auto-video-edit.git

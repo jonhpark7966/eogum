@@ -1,46 +1,102 @@
-"""Wrapper around avid (auto-video-edit) CLI commands."""
+"""Wrapper around avid-cli commands."""
 
+import json
 import logging
+import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from eogum.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Use avid's own venv python so avid internal subprocess calls
-# (e.g. skills/subtitle-cut/main.py) use the correct interpreter
-_AVID_PYTHON = str(settings.avid_cli_path / ".venv" / "bin" / "python3")
 
-# Shared env for all avid subprocess calls
-_AVID_ENV = {
-    "PATH": f"{settings.avid_cli_path / '.venv/bin'}:{Path.home() / '.local/bin'}:{Path.home() / '.nvm/versions/node/v25.3.0/bin'}:/usr/local/bin:/usr/bin:/bin",
-    "HOME": str(Path.home()),
-    "PYTHONPATH": str(settings.avid_cli_path / "src"),
-    "CHALNA_API_URL": settings.chalna_url,
-}
+def _build_avid_env() -> dict[str, str]:
+    env = os.environ.copy()
+    avid_bin_dir = str(settings.resolved_avid_bin.parent)
+    current_path = env.get("PATH", "")
+    env["PATH"] = f"{avid_bin_dir}:{current_path}" if current_path else avid_bin_dir
+    env["HOME"] = env.get("HOME") or str(Path.home())
+    env["CHALNA_API_URL"] = settings.chalna_url
+    return env
 
 
-def _run_avid(args: list[str], timeout: int = 3600) -> subprocess.CompletedProcess:
+def _run_avid(args: list[str], timeout: int = 3600) -> subprocess.CompletedProcess[str]:
     """Run an avid-cli command."""
-    cmd = [_AVID_PYTHON, "-m", "avid.cli"] + args
-    logger.info("Running avid: %s", " ".join(cmd))
+    cmd = [str(settings.resolved_avid_bin)] + args
+    logger.info("Running avid-cli: %s", " ".join(cmd))
 
     result = subprocess.run(
         cmd,
-        cwd=str(settings.avid_cli_path),
+        cwd=str(settings.resolved_avid_backend_root),
         capture_output=True,
         text=True,
         timeout=timeout,
-        env=_AVID_ENV,
+        env=_build_avid_env(),
     )
 
     if result.returncode != 0:
-        logger.error("avid stdout: %s", result.stdout[-500:] if result.stdout else "")
-        logger.error("avid stderr: %s", result.stderr[-500:] if result.stderr else "")
-        raise RuntimeError(f"avid command failed: {result.stderr[:500]}")
+        logger.error("avid-cli stdout: %s", result.stdout[-500:] if result.stdout else "")
+        logger.error("avid-cli stderr: %s", result.stderr[-500:] if result.stderr else "")
+        detail = (result.stderr or result.stdout or "unknown avid-cli error")[:500]
+        raise RuntimeError(f"avid-cli command failed: {detail}")
 
     return result
+
+
+def _run_avid_json(args: list[str], timeout: int = 3600) -> dict[str, Any]:
+    if "--json" not in args:
+        args = [*args, "--json"]
+
+    result = _run_avid(args, timeout=timeout)
+    stdout = result.stdout.strip()
+
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "avid-cli did not return valid JSON. "
+            f"stdout tail: {stdout[-500:] or '(empty)'}"
+        ) from exc
+
+    if payload.get("status") != "ok":
+        raise RuntimeError(f"avid-cli returned non-ok status: {payload}")
+
+    return payload
+
+
+def _artifact(payload: dict[str, Any], name: str) -> str:
+    artifacts = payload.get("artifacts") or {}
+    value = artifacts.get(name)
+    if not value:
+        raise RuntimeError(f"avid-cli result missing artifact '{name}': {payload}")
+    return str(value)
+
+
+def version() -> dict[str, Any]:
+    """Return avid version metadata."""
+    return _run_avid_json(["version"], timeout=30)
+
+
+def get_version() -> str | None:
+    """Return the best available avid version string for audit logging."""
+    try:
+        payload = version()
+    except Exception:
+        logger.exception("Failed to read avid-cli version")
+        return None
+
+    return (
+        payload.get("avid_version")
+        or payload.get("git_revision")
+        or payload.get("package_version")
+    )
+
+
+def doctor(provider: str = "claude") -> dict[str, Any]:
+    """Run avid environment diagnostics."""
+    return _run_avid_json(["doctor", "--provider", provider], timeout=30)
 
 
 def transcribe(source_path: str, language: str = "ko", output_dir: str | None = None, context: str | None = None) -> str:
@@ -56,37 +112,8 @@ def transcribe(source_path: str, language: str = "ko", output_dir: str | None = 
     if context:
         args += ["--context", context]
 
-    result = _run_avid(args, timeout=7200)
-
-    # Find the generated SRT path from output
-    # avid CLI prints "완료: /path/to/file.srt"
-    for line in reversed(result.stdout.strip().split("\n")):
-        line = line.strip()
-        if "완료" in line and ".srt" in line:
-            path = line.split(": ", 1)[-1].strip()
-            if Path(path).exists():
-                return path
-
-    # Fallback: look for SRT in output dir
-    search_dir = Path(output_dir) if output_dir else Path(source_path).parent
-    src_stem = Path(source_path).stem
-
-    # Try exact name first
-    srt_path = search_dir / f"{src_stem}.srt"
-    if srt_path.exists():
-        return str(srt_path)
-
-    # Try any SRT file in the directory
-    srt_files = list(search_dir.glob("*.srt"))
-    if srt_files:
-        logger.warning("SRT not found at expected path, using: %s", srt_files[0])
-        return str(srt_files[0])
-
-    raise RuntimeError(
-        f"SRT file not found after transcription. "
-        f"Searched: {search_dir}/{src_stem}.srt, "
-        f"stdout: {result.stdout[-300:]}"
-    )
+    payload = _run_avid_json(args, timeout=7200)
+    return _artifact(payload, "srt")
 
 
 def transcript_overview(srt_path: str, output_path: str | None = None) -> str:
@@ -95,27 +122,8 @@ def transcript_overview(srt_path: str, output_path: str | None = None) -> str:
     if output_path:
         args += ["-o", output_path]
 
-    _run_avid(args, timeout=1800)
-
-    # If output_path was specified and exists, return it
-    if output_path and Path(output_path).exists():
-        return output_path
-
-    # Fallback: search for storyline JSON near the SRT
-    srt = Path(srt_path)
-    for pattern in [
-        f"{srt.stem}_storyline.json",
-        f"{srt.stem}.storyline.json",
-        "storyline.json",
-    ]:
-        candidate = srt.parent / pattern
-        if candidate.exists():
-            return str(candidate)
-
-    raise RuntimeError(
-        f"Storyline file not found after transcript-overview. "
-        f"Expected: {output_path or srt.parent / f'{srt.stem}_storyline.json'}"
-    )
+    payload = _run_avid_json(args, timeout=1800)
+    return _artifact(payload, "storyline")
 
 
 def subtitle_cut(
@@ -125,7 +133,7 @@ def subtitle_cut(
     output_dir: str | None = None,
     final: bool = False,
     extra_sources: list[str] | None = None,
-) -> dict:
+) -> dict[str, str]:
     """Run avid subtitle-cut (Pass 2). Returns result paths dict."""
     args = ["subtitle-cut", source_path, "--srt", srt_path, "--provider", "claude"]
     if context_path:
@@ -137,8 +145,8 @@ def subtitle_cut(
     for src in extra_sources or []:
         args += ["--extra-source", src]
 
-    _run_avid(args, timeout=1800)
-    return _collect_results(source_path, output_dir)
+    payload = _run_avid_json(args, timeout=1800)
+    return {key: str(value) for key, value in (payload.get("artifacts") or {}).items()}
 
 
 def podcast_cut(
@@ -148,7 +156,7 @@ def podcast_cut(
     output_dir: str | None = None,
     final: bool = False,
     extra_sources: list[str] | None = None,
-) -> dict:
+) -> dict[str, str]:
     """Run avid podcast-cut (Pass 2). Returns result paths dict."""
     args = ["podcast-cut", source_path, "--provider", "claude"]
     if srt_path:
@@ -162,183 +170,30 @@ def podcast_cut(
     for src in extra_sources or []:
         args += ["--extra-source", src]
 
-    _run_avid(args, timeout=1800)
-    return _collect_results(source_path, output_dir)
+    payload = _run_avid_json(args, timeout=1800)
+    return {key: str(value) for key, value in (payload.get("artifacts") or {}).items()}
 
 
-def apply_evaluation_to_project(project, eval_segments: list) -> int:
-    """Apply human evaluation decisions to project's edit_decisions.
-
-    Replaces AI edit_decisions with human overrides where they exist.
-    Returns the number of changes applied.
-    """
-    import sys
-
-    avid_src = str(settings.avid_cli_path / "src")
-    if avid_src not in sys.path:
-        sys.path.insert(0, avid_src)
-
-    from avid.models.timeline import EditDecision, EditReason, EditType, TimeRange
-
-    # Determine primary video track ID for edit_decisions
-    video_tracks = project.get_video_tracks()
-    primary_video_track_id = video_tracks[0].id if video_tracks else None
-    audio_tracks = project.get_audio_tracks()
-    # Collect audio track IDs that belong to the primary source
-    primary_audio_track_ids = None
-    if video_tracks:
-        primary_source_id = video_tracks[0].source_file_id
-        primary_audio_track_ids = [
-            t.id for t in audio_tracks if t.source_file_id == primary_source_id
-        ]
-
-    # Collect human-reviewed segments with their final action
-    human_overrides = []
-    for seg in eval_segments:
-        human = seg.get("human")
-        if human:
-            human_overrides.append((seg["start_ms"], seg["end_ms"], human["action"]))
-
-    if not human_overrides:
-        logger.info("No human overrides to apply")
-        return 0
-
-    original_count = len(project.edit_decisions)
-
-    # Remove existing edit_decisions that overlap with any human-reviewed segment
-    new_decisions = []
-    for ed in project.edit_decisions:
-        ed_start = ed.range.start_ms
-        ed_end = ed.range.end_ms
-
-        overlaps_human = False
-        for h_start, h_end, _ in human_overrides:
-            if ed_start < h_end and ed_end > h_start:
-                overlaps_human = True
-                break
-
-        if not overlaps_human:
-            new_decisions.append(ed)
-
-    # Add CUT decisions for human "cut" segments
-    cuts_added = 0
-    for h_start, h_end, action in human_overrides:
-        if action == "cut":
-            new_decisions.append(EditDecision(
-                range=TimeRange(start_ms=h_start, end_ms=h_end),
-                edit_type=EditType.CUT,
-                reason=EditReason.MANUAL,
-                confidence=1.0,
-                note="human evaluation override",
-                active_video_track_id=primary_video_track_id,
-                active_audio_track_ids=primary_audio_track_ids,
-            ))
-            cuts_added += 1
-
-    # Sort by start time
-    new_decisions.sort(key=lambda ed: ed.range.start_ms)
-    project.edit_decisions = new_decisions
-
-    changes = abs(original_count - len(new_decisions)) + cuts_added
-    logger.info(
-        "Applied evaluation: %d human overrides, %d original decisions → %d new decisions (%d cuts added)",
-        len(human_overrides), original_count, len(new_decisions), cuts_added,
-    )
-    return changes
-
-
-def multicam_add_sources(
+def reexport(
     project_json_path: str,
-    source_path: str,
-    extra_source_paths: list[str],
     output_dir: str,
-) -> dict:
-    """Add multicam sources to existing avid project and re-export FCPXML.
+    source_path: str | None = None,
+    evaluation_path: str | None = None,
+    extra_sources: list[str] | None = None,
+    content_mode: str = "disabled",
+) -> dict[str, Any]:
+    """Re-export an avid project with optional evaluation overrides and extra sources."""
+    args = [
+        "reexport",
+        "--project-json", project_json_path,
+        "--output-dir", output_dir,
+        "--content-mode", content_mode,
+    ]
+    if source_path:
+        args += ["--source", source_path]
+    if evaluation_path:
+        args += ["--evaluation", evaluation_path]
+    for src in extra_sources or []:
+        args += ["--extra-source", src]
 
-    Does NOT re-run transcribe or subtitle-cut. Only:
-    1. Audio sync extra sources to main source
-    2. Add them to the avid project
-    3. Re-export FCPXML
-
-    Returns dict of result file paths.
-    """
-    import asyncio
-    import sys
-
-    # Add avid src to path for imports
-    avid_src = str(settings.avid_cli_path / "src")
-    if avid_src not in sys.path:
-        sys.path.insert(0, avid_src)
-
-    from avid.models.project import Project
-    from avid.export.fcpxml import FCPXMLExporter
-    from avid.services.audio_sync import AudioSyncService
-
-    # Load existing project
-    project = Project.load(Path(project_json_path))
-    logger.info("Loaded avid project: %d tracks, %d edit_decisions", len(project.tracks), len(project.edit_decisions))
-
-    # Sync and add extra sources
-    sync_service = AudioSyncService()
-    extra_paths = [Path(p) for p in extra_source_paths]
-    asyncio.run(sync_service.add_extra_sources(project, Path(source_path), extra_paths))
-    logger.info("Added %d extra sources", len(extra_source_paths))
-
-    # Save updated project JSON
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    updated_json = out_dir / Path(project_json_path).name
-    project.save(updated_json)
-
-    # Re-export FCPXML
-    exporter = FCPXMLExporter()
-    stem = Path(source_path).stem
-    fcpxml_path = out_dir / f"{stem}_subtitle_cut.fcpxml"
-    asyncio.run(exporter.export(project, fcpxml_path))
-    logger.info("Exported FCPXML: %s", fcpxml_path)
-
-    results = {"project_json": str(updated_json), "fcpxml": str(fcpxml_path)}
-
-    # Copy over SRT if it exists in output_dir
-    for srt in out_dir.glob("*.srt"):
-        results["srt"] = str(srt)
-        break
-
-    return results
-
-
-def _collect_results(source_path: str, output_dir: str | None) -> dict:
-    """Collect result file paths after processing."""
-    src = Path(source_path)
-    base_dir = Path(output_dir) if output_dir else src.parent
-    stem = src.stem
-
-    results = {}
-
-    # FCPXML — may be {stem}.fcpxml or {stem}.final.fcpxml etc.
-    fcpxml_files = list(base_dir.glob(f"{stem}*.fcpxml"))
-    if fcpxml_files:
-        results["fcpxml"] = str(fcpxml_files[0])
-
-    # SRT — may be {stem}.srt or {stem}.final.srt etc.
-    srt_files = list(base_dir.glob(f"{stem}*.srt"))
-    if srt_files:
-        results["srt"] = str(srt_files[0])
-
-    # Report
-    report_files = list(base_dir.glob(f"{stem}*.report.md"))
-    if report_files:
-        results["report"] = str(report_files[0])
-
-    # AVID project JSON
-    avid_json = list(base_dir.glob(f"{stem}*.avid.json"))
-    if avid_json:
-        results["project_json"] = str(avid_json[0])
-
-    # Storyline
-    storyline = base_dir / "storyline.json"
-    if storyline.exists():
-        results["storyline"] = str(storyline)
-
-    logger.info("Collected results from %s: %s", base_dir, list(results.keys()))
-    return results
+    return _run_avid_json(args, timeout=3600)

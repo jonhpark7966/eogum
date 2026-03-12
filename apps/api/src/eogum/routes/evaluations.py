@@ -1,16 +1,13 @@
 """Evaluation routes for segment review and feedback."""
 
+from collections import Counter
 import json
 import logging
-import subprocess
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from eogum.auth import get_user_id
-from eogum.config import settings
-from collections import Counter
-
 from eogum.models.schemas import (
     AiDecision,
     ConfusionMatrix,
@@ -24,6 +21,7 @@ from eogum.models.schemas import (
     SegmentWithDecision,
     VideoUrlResponse,
 )
+from eogum.services import avid
 from eogum.services.database import get_db
 from eogum.services.r2 import download_to_bytes, generate_presigned_stream
 
@@ -204,22 +202,13 @@ def save_evaluation(
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
 
     # Collect git versions
-    avid_version = None
+    avid_version = avid.get_version()
     eogum_version = None
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=str(settings.avid_cli_path),
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            avid_version = result.stdout.strip()
-    except Exception:
-        pass
 
     try:
-        # eogum repo: this file is at apps/api/src/eogum/routes/evaluations.py
-        eogum_repo = Path(__file__).resolve().parent.parent.parent.parent.parent
+        import subprocess
+
+        eogum_repo = Path(__file__).resolve().parents[5]
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             cwd=str(eogum_repo),

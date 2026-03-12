@@ -3,6 +3,12 @@ from pathlib import Path
 from pydantic_settings import BaseSettings
 
 
+def _default_avid_backend_root() -> Path:
+    submodule_root = Path("/home/jonhpark/workspace/eogum/third_party/auto-video-edit/apps/backend")
+    legacy_root = Path("/home/jonhpark/workspace/auto-video-edit/apps/backend")
+    return submodule_root if submodule_root.exists() else legacy_root
+
+
 class Settings(BaseSettings):
     # Supabase
     supabase_url: str
@@ -17,7 +23,9 @@ class Settings(BaseSettings):
     r2_public_url: str = ""
 
     # AVID
-    avid_cli_path: Path = Path("/home/jonhpark/workspace/auto-video-edit/apps/backend")
+    avid_backend_root: Path | None = None
+    avid_bin: Path | None = None
+    avid_cli_path: Path | None = None  # Legacy fallback while local envs migrate.
     avid_temp_dir: Path = Path("/tmp/eogum")
     avid_output_dir: Path = Path("/tmp/eogum/outputs")
 
@@ -33,6 +41,14 @@ class Settings(BaseSettings):
     port: int = 8000
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+
+    @property
+    def resolved_avid_backend_root(self) -> Path:
+        return self.avid_backend_root or self.avid_cli_path or _default_avid_backend_root()
+
+    @property
+    def resolved_avid_bin(self) -> Path:
+        return self.avid_bin or (self.resolved_avid_backend_root / ".venv" / "bin" / "avid-cli")
 
 
 settings = Settings()

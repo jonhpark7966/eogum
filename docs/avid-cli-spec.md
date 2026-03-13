@@ -146,7 +146,15 @@ avid-cli podcast-cut /tmp/source.mp3 --srt /tmp/work/source.srt --context /tmp/w
 
 ### 4.1 `reexport`
 
-이 명령은 현재 `eogum` route 가 Python import 로 직접 처리하는 일을 CLI 로 옮기기 위해 필요하다.
+이 명령은 현재 `eogum` route 가 Python import 로 직접 처리하던 일을 CLI 로 옮기기 위해 필요했다.
+현재는 호환성 유지를 위해 유지하지만, 장기적으로는 deprecated wrapper 로 본다.
+
+분해 방향:
+
+- `apply-evaluation`
+- `rebuild-multicam`
+- `clear-extra-sources`
+- `export-project`
 
 예시:
 
@@ -176,6 +184,137 @@ avid-cli reexport \
   "stats": {
     "applied_evaluation_segments": 18,
     "extra_sources": 2
+  }
+}
+```
+
+상태:
+
+- 현재 구현은 유지
+- 새 통합은 가능하면 이 명령에 새 의존을 추가하지 않음
+- 다음 단계에서 `apply-evaluation -> rebuild-multicam` 또는 `clear-extra-sources` -> `export-project` 조합으로 마이그레이션
+
+### 4.1a `apply-evaluation` (planned)
+
+목적:
+
+- 기존 project JSON 에 사람 평가만 적용
+
+예시:
+
+```bash
+avid-cli apply-evaluation \
+  --project-json /tmp/input/project.avid.json \
+  --evaluation /tmp/evaluation.json \
+  --output-project-json /tmp/output/project.avid.json \
+  --json
+```
+
+성공 시 최소 출력 필드:
+
+```json
+{
+  "command": "apply-evaluation",
+  "status": "ok",
+  "artifacts": {
+    "project_json": "/tmp/output/project.avid.json"
+  },
+  "stats": {
+    "applied_evaluation_segments": 18,
+    "applied_changes": 12
+  }
+}
+```
+
+### 4.1b `rebuild-multicam` (planned)
+
+목적:
+
+- 기존 project JSON 의 extra source 를 재구성
+
+예시:
+
+```bash
+avid-cli rebuild-multicam \
+  --project-json /tmp/input/project.avid.json \
+  --source /tmp/source.mp4 \
+  --extra-source /tmp/extra_0.mp4 \
+  --extra-source /tmp/extra_1.mp4 \
+  --output-project-json /tmp/output/project.avid.json \
+  --json
+```
+
+성공 시 최소 출력 필드:
+
+```json
+{
+  "command": "rebuild-multicam",
+  "status": "ok",
+  "artifacts": {
+    "project_json": "/tmp/output/project.avid.json"
+  },
+  "stats": {
+    "extra_sources": 2,
+    "stripped_extra_sources": 2
+  }
+}
+```
+
+### 4.1c `clear-extra-sources` (planned)
+
+목적:
+
+- 기존 project JSON 에서 extra source 를 명시적으로 제거
+
+예시:
+
+```bash
+avid-cli clear-extra-sources \
+  --project-json /tmp/input/project.avid.json \
+  --output-project-json /tmp/output/project.avid.json \
+  --json
+```
+
+성공 시 최소 출력 필드:
+
+```json
+{
+  "command": "clear-extra-sources",
+  "status": "ok",
+  "artifacts": {
+    "project_json": "/tmp/output/project.avid.json"
+  },
+  "stats": {
+    "stripped_extra_sources": 2
+  }
+}
+```
+
+### 4.1d `export-project` (planned)
+
+목적:
+
+- 준비된 project JSON 을 FCPXML / adjusted SRT 로 export
+
+예시:
+
+```bash
+avid-cli export-project \
+  --project-json /tmp/output/project.avid.json \
+  --output-dir /tmp/output \
+  --content-mode cut \
+  --json
+```
+
+성공 시 최소 출력 필드:
+
+```json
+{
+  "command": "export-project",
+  "status": "ok",
+  "artifacts": {
+    "fcpxml": "/tmp/output/source_subtitle_cut.fcpxml",
+    "srt": "/tmp/output/source_subtitle_cut.srt"
   }
 }
 ```
@@ -229,7 +368,10 @@ avid-cli doctor --json
 | story analysis | `transcript-overview` |
 | lecture edit | `subtitle-cut` |
 | podcast edit | `podcast-cut` |
-| 평가 반영 재-export | `reexport` |
+| 평가 반영 export | `apply-evaluation -> export-project` |
+| 멀티캠 재구성 export | `rebuild-multicam -> export-project` |
+| extra source 제거 export | `clear-extra-sources -> export-project` |
+| 호환성 유지용 구경로 | `reexport` (deprecated) |
 | startup version check | `version` |
 | startup env check | `doctor` |
 
@@ -238,7 +380,8 @@ avid-cli doctor --json
 1. 결과물 위치는 manifest JSON 을 우선 읽는다.
 2. stdout 사람용 메시지는 로그 용도로만 사용한다.
 3. `version` 과 `doctor` 는 startup 또는 health 진단에 사용한다.
-4. `reexport` 로 `/multicam` direct Python import 경로를 제거한다.
+4. 현재는 `reexport` 로 `/multicam` direct Python import 경로를 제거한 상태다.
+5. 다음 단계에서는 `reexport` 의존을 없애고 split commands 로 전환한다.
 
 ## 7. 현재 구현과의 차이
 

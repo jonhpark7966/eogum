@@ -20,6 +20,7 @@ class ExtraSourceItem(BaseModel):
     r2_key: str
     filename: str
     size_bytes: int
+    offset_ms: int | None = None
 
 
 class UpdateExtraSourcesRequest(BaseModel):

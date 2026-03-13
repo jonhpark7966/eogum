@@ -197,3 +197,68 @@ def reexport(
         args += ["--extra-source", src]
 
     return _run_avid_json(args, timeout=3600)
+
+
+def apply_evaluation(
+    project_json_path: str,
+    evaluation_path: str,
+    output_project_json: str,
+) -> dict[str, Any]:
+    args = [
+        "apply-evaluation",
+        "--project-json", project_json_path,
+        "--evaluation", evaluation_path,
+        "--output-project-json", output_project_json,
+    ]
+    return _run_avid_json(args, timeout=300)
+
+
+def export_project(
+    project_json_path: str,
+    output_dir: str,
+    output_path: str | None = None,
+    silence_mode: str = "cut",
+    content_mode: str = "disabled",
+) -> dict[str, Any]:
+    args = [
+        "export-project",
+        "--project-json", project_json_path,
+        "--output-dir", output_dir,
+        "--silence-mode", silence_mode,
+        "--content-mode", content_mode,
+    ]
+    if output_path:
+        args += ["-o", output_path]
+    return _run_avid_json(args, timeout=3600)
+
+
+def rebuild_multicam(
+    project_json_path: str,
+    source_path: str,
+    extra_sources: list[str],
+    output_project_json: str,
+    offsets: list[int] | None = None,
+) -> dict[str, Any]:
+    args = [
+        "rebuild-multicam",
+        "--project-json", project_json_path,
+        "--source", source_path,
+        "--output-project-json", output_project_json,
+    ]
+    for src in extra_sources:
+        args += ["--extra-source", src]
+    for offset in offsets or []:
+        args += ["--offset", str(offset)]
+    return _run_avid_json(args, timeout=3600)
+
+
+def clear_extra_sources(
+    project_json_path: str,
+    output_project_json: str,
+) -> dict[str, Any]:
+    args = [
+        "clear-extra-sources",
+        "--project-json", project_json_path,
+        "--output-project-json", output_project_json,
+    ]
+    return _run_avid_json(args, timeout=300)

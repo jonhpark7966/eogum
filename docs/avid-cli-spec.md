@@ -192,9 +192,10 @@ avid-cli reexport \
 
 - 현재 구현은 유지
 - 새 통합은 가능하면 이 명령에 새 의존을 추가하지 않음
-- 다음 단계에서 `apply-evaluation -> rebuild-multicam` 또는 `clear-extra-sources` -> `export-project` 조합으로 마이그레이션
+- 현재 `eogum` 은 split commands 로 마이그레이션 완료
+- wrapper 는 backward compatibility 용도로만 남긴다
 
-### 4.1a `apply-evaluation` (planned)
+### 4.1a `apply-evaluation`
 
 목적:
 
@@ -226,7 +227,7 @@ avid-cli apply-evaluation \
 }
 ```
 
-### 4.1b `rebuild-multicam` (planned)
+### 4.1b `rebuild-multicam`
 
 목적:
 
@@ -260,7 +261,7 @@ avid-cli rebuild-multicam \
 }
 ```
 
-### 4.1c `clear-extra-sources` (planned)
+### 4.1c `clear-extra-sources`
 
 목적:
 
@@ -290,7 +291,7 @@ avid-cli clear-extra-sources \
 }
 ```
 
-### 4.1d `export-project` (planned)
+### 4.1d `export-project`
 
 목적:
 
@@ -380,8 +381,8 @@ avid-cli doctor --json
 1. 결과물 위치는 manifest JSON 을 우선 읽는다.
 2. stdout 사람용 메시지는 로그 용도로만 사용한다.
 3. `version` 과 `doctor` 는 startup 또는 health 진단에 사용한다.
-4. 현재는 `reexport` 로 `/multicam` direct Python import 경로를 제거한 상태다.
-5. 다음 단계에서는 `reexport` 의존을 없애고 split commands 로 전환한다.
+4. `/projects/{id}/multicam` 재처리는 `apply-evaluation`, `rebuild-multicam`, `clear-extra-sources`, `export-project` 를 단계적으로 호출한다.
+5. `reexport` 는 새 통합에서 사용하지 않는다.
 
 ## 7. 현재 구현과의 차이
 
@@ -389,6 +390,7 @@ avid-cli doctor --json
 
 - startup `doctor` 호출 연결
 - adapter 명세 테스트 추가
-- 실제 submodule pointer 추가 및 bootstrap 검증
+- provider model/effort 전달 연동
+- endpoint 이름 `/multicam` 재정리
 
 목표는 이 명세대로 수렴하는 것이다.

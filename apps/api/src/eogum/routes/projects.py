@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from eogum.auth import get_user_id
@@ -12,6 +15,40 @@ from eogum.services.database import get_db
 from eogum.services.job_runner import enqueue
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+
+
+def _project_json_has_extra_sources(project_json_path: Path) -> bool:
+    data = json.loads(project_json_path.read_text(encoding="utf-8"))
+    return len(data.get("source_files") or []) > 1
+
+
+def _resolve_extra_source_offsets(extra_sources: list[dict]) -> list[int] | None:
+    if not extra_sources:
+        return None
+
+    offsets = [item.get("offset_ms") for item in extra_sources]
+    if not any(offset is not None for offset in offsets):
+        return None
+    if not all(offset is not None for offset in offsets):
+        raise ValueError("manual offset 을 사용할 때는 모든 extra source 에 offset_ms 를 지정해야 합니다")
+    return [int(offset) for offset in offsets]
+
+
+def _plan_reprocess_steps(
+    *,
+    has_evaluation: bool,
+    desired_extra_sources: bool,
+    current_project_has_extra_sources: bool,
+) -> list[str]:
+    steps: list[str] = []
+    if has_evaluation:
+        steps.append("apply-evaluation")
+    if desired_extra_sources:
+        steps.append("rebuild-multicam")
+    elif current_project_has_extra_sources:
+        steps.append("clear-extra-sources")
+    steps.append("export-project")
+    return steps
 
 
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
@@ -129,12 +166,10 @@ def update_extra_sources(
 
 @router.post("/{project_id}/multicam", response_model=ProjectResponse)
 def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
-    """Re-export project outputs via avid-cli with evaluation overrides and optional multicam sources."""
-    import json
+    """Rebuild project outputs via split avid-cli commands."""
     import logging
     import shutil
     import threading
-    from pathlib import Path
 
     from eogum.config import settings
     from eogum.services import avid, r2
@@ -171,6 +206,13 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
     if not project_json_key:
         raise HTTPException(status_code=404, detail="프로젝트 JSON이 없습니다. 전체 재처리가 필요합니다.")
 
+    project_json_bytes = r2.download_to_bytes(project_json_key)
+    try:
+        stored_project_json = json.loads(project_json_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="저장된 프로젝트 JSON을 읽을 수 없습니다") from exc
+    current_project_has_extra_sources = len(stored_project_json.get("source_files") or []) > 1
+
     # Fetch evaluation data (if exists)
     eval_result = (
         db.table("evaluations")
@@ -183,17 +225,21 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
     eval_segments = eval_result.data[0]["segments"] if eval_result.data else None
 
     has_extra_sources = bool(project.data.get("extra_sources"))
+    try:
+        extra_offsets = _resolve_extra_source_offsets(project.data.get("extra_sources") or [])
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    if not eval_segments and not has_extra_sources:
+    if not eval_segments and not has_extra_sources and not current_project_has_extra_sources:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="평가 데이터 또는 추가 소스가 필요합니다",
+            detail="평가 데이터 또는 적용할 extra source 변경이 필요합니다",
         )
 
     # Mark processing
     db.table("projects").update({"status": "processing"}).eq("id", project_id).execute()
 
-    def _reexport_worker():
+    def _reprocess_worker():
         temp_dir = settings.avid_temp_dir / f"multicam_{project_id}"
         try:
             temp_dir.mkdir(parents=True, exist_ok=True)
@@ -201,9 +247,9 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
             output_dir.mkdir(exist_ok=True)
 
             # Download avid project JSON
-            project_json_bytes = r2.download_to_bytes(project_json_key)
-            local_project_json = temp_dir / Path(project_json_key).name
+            local_project_json = temp_dir / "input.project.avid.json"
             local_project_json.write_bytes(project_json_bytes)
+            working_project_json = local_project_json
 
             evaluation_path = None
             if eval_segments:
@@ -227,19 +273,52 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
                     r2.download_file(es["r2_key"], str(local_path))
                     extra_paths.append(str(local_path))
 
-            payload = avid.reexport(
-                project_json_path=str(local_project_json),
+            steps = _plan_reprocess_steps(
+                has_evaluation=bool(eval_segments),
+                desired_extra_sources=has_extra_sources,
+                current_project_has_extra_sources=_project_json_has_extra_sources(working_project_json),
+            )
+
+            if "apply-evaluation" in steps:
+                eval_output = temp_dir / "01_eval_applied.project.avid.json"
+                payload = avid.apply_evaluation(
+                    project_json_path=str(working_project_json),
+                    evaluation_path=str(evaluation_path),
+                    output_project_json=str(eval_output),
+                )
+                working_project_json = Path(payload["artifacts"]["project_json"])
+                logger.info("Applied evaluation via avid-cli: %s", payload)
+
+            if "rebuild-multicam" in steps:
+                multicam_output = temp_dir / "02_multicam.project.avid.json"
+                payload = avid.rebuild_multicam(
+                    project_json_path=str(working_project_json),
+                    source_path=str(source_path),
+                    extra_sources=extra_paths,
+                    output_project_json=str(multicam_output),
+                    offsets=extra_offsets,
+                )
+                working_project_json = Path(payload["artifacts"]["project_json"])
+                logger.info("Rebuilt multicam via avid-cli: %s", payload)
+            elif "clear-extra-sources" in steps:
+                clear_output = temp_dir / "02_cleared.project.avid.json"
+                payload = avid.clear_extra_sources(
+                    project_json_path=str(working_project_json),
+                    output_project_json=str(clear_output),
+                )
+                working_project_json = Path(payload["artifacts"]["project_json"])
+                logger.info("Cleared extra sources via avid-cli: %s", payload)
+
+            payload = avid.export_project(
+                project_json_path=str(working_project_json),
                 output_dir=str(output_dir),
-                source_path=source_path,
-                evaluation_path=str(evaluation_path) if evaluation_path else None,
-                extra_sources=extra_paths or None,
                 content_mode="cut" if eval_segments else "disabled",
             )
             artifacts = payload.get("artifacts") or {}
-            updated_json = Path(artifacts["project_json"])
+            updated_json = working_project_json
             fcpxml_path = Path(artifacts["fcpxml"])
             srt_path = Path(artifacts["srt"]) if artifacts.get("srt") else None
-            logger.info("Re-exported avid project via CLI: %s", payload)
+            logger.info("Exported avid project via split CLI: %s", payload)
 
             # Step 5: Upload updated results to R2
             new_r2_keys = dict(r2_keys)
@@ -268,14 +347,14 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
             logger.info("Re-export completed for project %s", project_id)
 
         except Exception:
-            logger.exception("Re-export failed for project %s", project_id)
+            logger.exception("Project reprocess failed for project %s", project_id)
             # Restore to completed — original results still valid
             db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
 
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    thread = threading.Thread(target=_reexport_worker, daemon=True)
+    thread = threading.Thread(target=_reprocess_worker, daemon=True)
     thread.start()
 
     return db.table("projects").select("*").eq("id", project_id).single().execute().data

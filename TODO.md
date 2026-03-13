@@ -23,18 +23,14 @@
   - provider 이름뿐 아니라 model/effort 도 `avid-cli` 표면으로 전달
   - provider/model/effort 를 audit metadata 와 doctor 결과에 함께 기록
   - `auto-video-edit` 기본 프로필 변경이 있어도 `eogum` 코드 수정 없이 env/config 로 따라갈 수 있게 정리
-- [ ] deprecated `reexport` 사용 제거
-  - `apps/api/src/eogum/services/avid.py` 의 `reexport()` 호출을 호환용으로만 남기고 새 경로로 교체
-  - `apply-evaluation` -> `rebuild-multicam` / `clear-extra-sources` -> `export-project` 순으로 호출하도록 변경
+- [ ] deprecated `reexport` 잔여 정리
+  - `apps/api/src/eogum/services/avid.py` 의 compatibility wrapper `reexport()` 삭제 시점 결정
   - `/projects/{id}/multicam` endpoint 이름/의미 재정리
   - 중간 project JSON 은 기존 `settings.avid_temp_dir` 아래 단계별 파일로 유지
   - preview/report 재생성 정책 결정
-  - manual offset 을 API 에 노출
 - [ ] 리뷰 완료 후 reviewed FCPXML/SRT 자동 생성 (현재 수동 스크립트)
   - 프론트 리뷰 페이지에서 "최종 내보내기" 버튼 추가
   - evaluation → avid.json edit_decisions 머지 → FCPXMLExporter 호출 → R2 업로드
-- [ ] 리뷰 페이지 reason 드롭다운에 avid EditReason enum과 맞지 않는 값 정리
-  - `meta_comment`, `retake_signal` 등 → avid enum에 추가하거나 매핑 테이블 관리
 
 ### Auto Backup
 - [ ] R2 데이터 자동 백업 시스템

@@ -1,8 +1,8 @@
 # 어검이 기대하는 avid CLI 명령 명세
 
-> 최종 갱신: 2026-03-12
+> 최종 갱신: 2026-03-14
 > 범위: `eogum` 백엔드가 호출하는 `avid-cli`
-> 상태: 목표 명세. 일부 명령은 아직 `avid` 쪽에 추가 구현이 필요하다.
+> 상태: 현재 운영 명세. deprecated command 는 별도 표기한다.
 
 ## 1. 목적
 
@@ -142,12 +142,12 @@ avid-cli podcast-cut /tmp/source.mp3 --srt /tmp/work/source.srt --context /tmp/w
 
 성공 시 출력 구조는 `subtitle-cut` 과 동일하다.
 
-## 4. 새로 필요한 명령 명세
+## 4. 현재 운영 명령 명세
 
 ### 4.1 `reexport`
 
-이 명령은 현재 `eogum` route 가 Python import 로 직접 처리하던 일을 CLI 로 옮기기 위해 필요했다.
-현재는 호환성 유지를 위해 유지하지만, 장기적으로는 deprecated wrapper 로 본다.
+이 명령은 기존 단일 재처리 경로 호환을 위해 남아 있다.
+현재 `eogum` 기본 workflow 는 이 명령을 기준으로 삼지 않는다.
 
 분해 방향:
 

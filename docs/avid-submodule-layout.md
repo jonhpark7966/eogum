@@ -1,8 +1,8 @@
-# 어검 avid Submodule 목표 구조
+# 어검 avid Submodule 구조
 
-> 최종 갱신: 2026-03-12
+> 최종 갱신: 2026-03-14
 > 범위: `eogum` 저장소에서 `auto-video-edit` 를 submodule 로 사용하는 방식
-> 상태: 목표 구조 문서. 현재 코드 전체가 아직 이 구조로 옮겨진 것은 아니다.
+> 상태: 현재 운영 기준 문서
 
 ## 1. 목적
 
@@ -41,6 +41,8 @@ submodule 표준 경로:
 `avid` 백엔드 표준 경로:
 
 - `third_party/auto-video-edit/apps/backend`
+
+현재 저장소도 위 경로를 실제로 사용한다.
 
 ## 3. Submodule 추가/초기화 명령
 
@@ -101,9 +103,14 @@ subprocess.run(
 - `avid-cli transcript-overview ...`
 - `avid-cli subtitle-cut ...`
 - `avid-cli podcast-cut ...`
-- `avid-cli reexport ...`
+- `avid-cli review-segments ...`
+- `avid-cli apply-evaluation ...`
+- `avid-cli rebuild-multicam ...`
+- `avid-cli clear-extra-sources ...`
+- `avid-cli export-project ...`
 - `avid-cli version --json`
 - `avid-cli doctor --json`
+- `avid-cli reexport ...` 는 compatibility 전용
 
 금지:
 

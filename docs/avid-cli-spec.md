@@ -151,6 +151,7 @@ avid-cli podcast-cut /tmp/source.mp3 --srt /tmp/work/source.srt --context /tmp/w
 
 분해 방향:
 
+- `review-segments`
 - `apply-evaluation`
 - `rebuild-multicam`
 - `clear-extra-sources`
@@ -195,7 +196,28 @@ avid-cli reexport \
 - 현재 `eogum` 은 split commands 로 마이그레이션 완료
 - wrapper 는 backward compatibility 용도로만 남긴다
 
-### 4.1a `apply-evaluation`
+### 4.1a `review-segments`
+
+목적:
+
+- `avid` 엔진이 직접 review payload 를 생성
+- `eogum` 이 overlap merge 로 AI decision 을 다시 추정하지 않게 함
+
+예시:
+
+```bash
+avid-cli review-segments \
+  --project-json /tmp/input/project.avid.json \
+  --json
+```
+
+핵심 규칙:
+
+- 새 project JSON 은 `join_strategy=source_segment_index`
+- old project JSON 은 필요 시 `join_strategy=legacy_overlap`
+- `segments[]` 결과는 그대로 저장 후 `apply-evaluation` 입력으로 다시 사용할 수 있어야 함
+
+### 4.1b `apply-evaluation`
 
 목적:
 
@@ -222,12 +244,13 @@ avid-cli apply-evaluation \
   },
   "stats": {
     "applied_evaluation_segments": 18,
-    "applied_changes": 12
+    "applied_changes": 12,
+    "join_strategy": "source_segment_index"
   }
 }
 ```
 
-### 4.1b `rebuild-multicam`
+### 4.1c `rebuild-multicam`
 
 목적:
 
@@ -365,10 +388,7 @@ avid-cli doctor --json
 
 | `eogum` 기능 | 호출할 `avid-cli` 명령 |
 |-------------|------------------------|
-| transcription | `transcribe` |
-| story analysis | `transcript-overview` |
-| lecture edit | `subtitle-cut` |
-| podcast edit | `podcast-cut` |
+| 초기 편집 workflow | `transcribe -> transcript-overview -> subtitle-cut/podcast-cut` |
 | 평가 반영 export | `apply-evaluation -> export-project` |
 | 멀티캠 재구성 export | `rebuild-multicam -> export-project` |
 | extra source 제거 export | `clear-extra-sources -> export-project` |
@@ -381,8 +401,9 @@ avid-cli doctor --json
 1. 결과물 위치는 manifest JSON 을 우선 읽는다.
 2. stdout 사람용 메시지는 로그 용도로만 사용한다.
 3. `version` 과 `doctor` 는 startup 또는 health 진단에 사용한다.
-4. `/projects/{id}/multicam` 재처리는 `apply-evaluation`, `rebuild-multicam`, `clear-extra-sources`, `export-project` 를 단계적으로 호출한다.
-5. `reexport` 는 새 통합에서 사용하지 않는다.
+4. 초기 create 처리의 개념적 순서는 `transcribe -> transcript-overview -> subtitle-cut/podcast-cut` 이다.
+5. `/projects/{id}/multicam` 재처리는 `apply-evaluation`, `rebuild-multicam`, `clear-extra-sources`, `export-project` 를 단계적으로 호출한다.
+6. `reexport` 는 새 통합에서 사용하지 않는다.
 
 ## 7. 현재 구현과의 차이
 

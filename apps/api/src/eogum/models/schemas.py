@@ -102,6 +102,9 @@ class AiDecision(BaseModel):
     reason: str
     confidence: float
     note: str | None = None
+    edit_type: str | None = None
+    origin_kind: str | None = None
+    source_segment_index: int | None = None
 
 
 class HumanDecision(BaseModel):
@@ -116,6 +119,7 @@ class SegmentWithDecision(BaseModel):
     end_ms: int
     text: str
     ai: AiDecision | None = None
+    human: HumanDecision | None = None
 
 
 class EvalSegment(BaseModel):
@@ -128,11 +132,17 @@ class EvalSegment(BaseModel):
 
 
 class SegmentsResponse(BaseModel):
+    schema_version: str | None = None
+    review_scope: str | None = None
+    join_strategy: str | None = None
     segments: list[SegmentWithDecision]
     source_duration_ms: int
 
 
 class EvaluationSave(BaseModel):
+    schema_version: str | None = None
+    review_scope: str | None = None
+    join_strategy: str | None = None
     segments: list[EvalSegment]
 
 
@@ -143,6 +153,9 @@ class EvaluationResponse(BaseModel):
     version: str
     avid_version: str | None
     eogum_version: str | None
+    schema_version: str | None = None
+    review_scope: str | None = None
+    join_strategy: str | None = None
     segments: list[EvalSegment]
     created_at: datetime
     updated_at: datetime

@@ -4,10 +4,12 @@ from collections import Counter
 import json
 import logging
 from pathlib import Path
+import tempfile
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from eogum.auth import get_user_id
+from eogum.config import settings
 from eogum.models.schemas import (
     AiDecision,
     ConfusionMatrix,
@@ -28,6 +30,37 @@ from eogum.services.r2 import download_to_bytes, generate_presigned_stream
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["evaluations"])
+
+
+def _evaluation_metadata_from_segments(segments_value) -> tuple[str | None, str | None, str | None, list]:
+    if isinstance(segments_value, dict):
+        return (
+            segments_value.get("schema_version"),
+            segments_value.get("review_scope"),
+            segments_value.get("join_strategy"),
+            segments_value.get("segments") or [],
+        )
+    return None, None, None, segments_value or []
+
+
+def _evaluation_response_from_row(row: dict) -> EvaluationResponse:
+    schema_version, review_scope, join_strategy, segments = _evaluation_metadata_from_segments(
+        row.get("segments")
+    )
+    return EvaluationResponse(
+        id=row["id"],
+        project_id=row["project_id"],
+        evaluator_id=row["evaluator_id"],
+        version=row["version"],
+        avid_version=row.get("avid_version"),
+        eogum_version=row.get("eogum_version"),
+        schema_version=schema_version,
+        review_scope=review_scope,
+        join_strategy=join_strategy,
+        segments=segments,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
 
 
 def _get_completed_job(db, project_id: str, user_id: str):
@@ -61,7 +94,7 @@ def _get_completed_job(db, project_id: str, user_id: str):
 
 @router.get("/segments", response_model=SegmentsResponse)
 def get_segments(project_id: str, user_id: str = Depends(get_user_id)):
-    """Get transcript segments merged with AI edit decisions from avid.json."""
+    """Get engine-native review segments from avid-cli."""
     db = get_db()
     r2_keys = _get_completed_job(db, project_id, user_id)
 
@@ -69,7 +102,6 @@ def get_segments(project_id: str, user_id: str = Depends(get_user_id)):
     if not project_json_key:
         raise HTTPException(status_code=404, detail="프로젝트 JSON을 찾을 수 없습니다")
 
-    # Download and parse avid.json
     raw = download_to_bytes(project_json_key)
     avid_data = json.loads(raw)
 
@@ -77,49 +109,25 @@ def get_segments(project_id: str, user_id: str = Depends(get_user_id)):
     if not transcription or not transcription.get("segments"):
         raise HTTPException(status_code=404, detail="자막 데이터가 없습니다")
 
-    edit_decisions = avid_data.get("edit_decisions", [])
     source_duration_ms = 0
     for sf in avid_data.get("source_files", []):
         info = sf.get("info", {})
         if info.get("duration_ms"):
             source_duration_ms = max(source_duration_ms, info["duration_ms"])
 
-    # Merge segments with edit decisions (overlap-based matching)
-    segments = []
-    for i, seg in enumerate(transcription["segments"]):
-        seg_start = seg["start_ms"]
-        seg_end = seg["end_ms"]
+    settings.avid_temp_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f"review_segments_{project_id}_", dir=str(settings.avid_temp_dir)) as temp_dir:
+        local_project_json = Path(temp_dir) / "input.project.avid.json"
+        local_project_json.write_bytes(raw)
+        payload = avid.review_segments(str(local_project_json))
 
-        ai_decision = None
-        for ed in edit_decisions:
-            ed_range = ed.get("range", {})
-            ed_start = ed_range.get("start_ms", 0)
-            ed_end = ed_range.get("end_ms", 0)
-
-            # Check overlap
-            if ed_start < seg_end and ed_end > seg_start:
-                edit_type = ed.get("edit_type", "")
-                action = "cut" if edit_type in ("cut", "mute") else "keep"
-                ai_decision = AiDecision(
-                    action=action,
-                    reason=ed.get("reason", ""),
-                    confidence=ed.get("confidence", 0.0),
-                    note=ed.get("note"),
-                )
-                break
-
-        if ai_decision is None:
-            ai_decision = AiDecision(action="keep", reason="", confidence=1.0)
-
-        segments.append(SegmentWithDecision(
-            index=i,
-            start_ms=seg_start,
-            end_ms=seg_end,
-            text=seg.get("text", ""),
-            ai=ai_decision,
-        ))
-
-    return SegmentsResponse(segments=segments, source_duration_ms=source_duration_ms)
+    return SegmentsResponse(
+        schema_version=payload.get("schema_version"),
+        review_scope=payload.get("review_scope"),
+        join_strategy=payload.get("join_strategy"),
+        segments=payload.get("segments") or [],
+        source_duration_ms=source_duration_ms,
+    )
 
 
 @router.get("/video-url", response_model=VideoUrlResponse)
@@ -177,7 +185,7 @@ def get_evaluation(project_id: str, user_id: str = Depends(get_user_id)):
     if not result.data:
         raise HTTPException(status_code=404, detail="평가 데이터가 없습니다")
 
-    return result.data[0]
+    return _evaluation_response_from_row(result.data[0])
 
 
 @router.post("/evaluation", response_model=EvaluationResponse)
@@ -220,6 +228,12 @@ def save_evaluation(
         pass
 
     segments_json = [seg.model_dump() for seg in req.segments]
+    stored_segments = {
+        "schema_version": req.schema_version,
+        "review_scope": req.review_scope,
+        "join_strategy": req.join_strategy,
+        "segments": segments_json,
+    }
 
     # Atomic upsert using unique index on (project_id, evaluator_id)
     result = (
@@ -228,7 +242,7 @@ def save_evaluation(
             {
                 "project_id": project_id,
                 "evaluator_id": user_id,
-                "segments": segments_json,
+                "segments": stored_segments,
                 "avid_version": avid_version,
                 "eogum_version": eogum_version,
             },
@@ -237,7 +251,7 @@ def save_evaluation(
         .execute()
     )
 
-    return result.data[0]
+    return _evaluation_response_from_row(result.data[0])
 
 
 @router.get("/eval-report", response_model=EvalReportResponse)
@@ -258,7 +272,7 @@ def get_eval_report(project_id: str, user_id: str = Depends(get_user_id)):
         raise HTTPException(status_code=404, detail="평가 데이터가 없습니다")
 
     evaluation = eval_result.data[0]
-    segments = evaluation["segments"]
+    _, _, _, segments = _evaluation_metadata_from_segments(evaluation["segments"])
 
     # Classify each segment
     tp = tn = fp = fn = 0

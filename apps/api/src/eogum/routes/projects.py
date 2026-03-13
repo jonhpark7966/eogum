@@ -222,7 +222,11 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
         .limit(1)
         .execute()
     )
-    eval_segments = eval_result.data[0]["segments"] if eval_result.data else None
+    evaluation_payload = eval_result.data[0]["segments"] if eval_result.data else None
+    if isinstance(evaluation_payload, dict):
+        eval_segments = evaluation_payload.get("segments") or []
+    else:
+        eval_segments = evaluation_payload
 
     has_extra_sources = bool(project.data.get("extra_sources"))
     try:
@@ -254,8 +258,13 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
             evaluation_path = None
             if eval_segments:
                 evaluation_path = temp_dir / "evaluation.json"
+                serialized_evaluation = (
+                    evaluation_payload
+                    if isinstance(evaluation_payload, dict)
+                    else {"segments": eval_segments}
+                )
                 evaluation_path.write_text(
-                    json.dumps({"segments": eval_segments}, ensure_ascii=False, indent=2),
+                    json.dumps(serialized_evaluation, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
 

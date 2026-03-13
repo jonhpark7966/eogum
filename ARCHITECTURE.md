@@ -1,6 +1,6 @@
 # 어검 (Eogum) 아키텍처
 
-> 최종 갱신: 2026-03-12
+> 최종 갱신: 2026-03-13
 > 기준: 현재 저장소 구현
 
 ## 0. 문서 계층
@@ -54,7 +54,7 @@
 - 소스 입력은 두 가지다.
   - 파일 업로드: 브라우저에서 R2 로 멀티파트 직접 업로드
   - YouTube URL: 백엔드에서 `yt-dlp` 로 다운로드 후 R2 업로드
-- 사람 평가 데이터는 Supabase `evaluations` 테이블에 저장되고, 이후 FCPXML 재-export 에 재사용할 수 있다.
+- 사람 평가 데이터는 Supabase `evaluations` 테이블에 저장되고, 이후 후처리 workflow 에서 cut override 와 최종 FCPXML 재생성에 재사용할 수 있다.
 
 ## 2. 주요 사용자 플로우
 
@@ -104,7 +104,7 @@
 - [youtube.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/routes/youtube.py)
 - [youtube.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/services/youtube.py)
 
-### 2.3 프로세싱 파이프라인
+### 2.3 초기 프로세싱 파이프라인
 
 프로젝트 생성 후 흐름:
 
@@ -132,6 +132,9 @@
 3. `projects.status = failed`
 4. 실패 이메일 전송 시도
 5. 임시 디렉터리 정리
+
+이 단계는 source 입력에서 첫 `project_json`, `fcpxml`, `srt`, `report`, `preview` 를 만드는 초기 workflow 다.
+사람 평가와 멀티캠 재구성은 여기서 끝나지 않고 2.6의 후처리 workflow 로 이어진다.
 
 startup recovery:
 
@@ -194,6 +197,8 @@ startup recovery:
 
 구현 포인트:
 
+- `GET /projects/{id}/segments` 는 저장된 `project_json` 을 local temp 로 내려 `avid-cli review-segments` 를 호출한다.
+- `eogum` 은 review row 를 자체 overlap merge 로 다시 만들지 않고 엔진 payload 를 그대로 사용한다.
 - 백엔드는 `evaluation` 이 없으면 404를 반환한다.
 - 프론트는 이 404를 정상 상태로 처리하고 `null` 로 간주한다.
 - 저장은 `project_id,evaluator_id` unique key 기반 atomic upsert 이다.
@@ -204,31 +209,37 @@ startup recovery:
 - [review/page.tsx](/home/jonhpark/workspace/eogum/apps/web/src/app/projects/[id]/review/page.tsx)
 - [evaluations.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/routes/evaluations.py)
 
-### 2.6 평가 반영 재-export / 멀티캠
+### 2.6 후처리 workflow: 평가 반영 / 멀티캠 / 최종 export
 
 `POST /projects/{id}/multicam` 의 현재 의미는 단순 멀티캠 처리보다 넓다.
+이 라우트는 초기 processing 이후의 후처리 workflow 진입점이다.
 
 실행 조건:
 
 - 프로젝트 상태가 `completed` 또는 `failed`
 - 최신 completed job 이 존재
 - `project_json` 결과물이 존재
-- 평가 데이터 또는 `extra_sources` 중 하나 이상 존재
+- 평가 데이터가 있거나, `extra_sources` 변경이 있거나, 기존 extra source 제거가 필요함
 
 실행 내용:
 
 1. 기존 `project_json` 다운로드
-2. 평가 데이터가 있으면 human decision 을 avid `edit_decisions` 에 반영
-3. 기존 extra source 가 avid project 에 있으면 먼저 제거
-4. `extra_sources` 가 있으면 오디오 싱크 후 추가
-5. 업데이트된 `project_json` 저장
-6. FCPXML 재-export
-7. 최신 completed job 의 `result_r2_keys.project_json` / `fcpxml` 갱신
-8. 프로젝트 상태를 다시 `completed` 로 복구
+2. 평가 데이터가 있으면 avid `apply-evaluation` 으로 human decision 을 `edit_decisions` 에 반영
+3. 새 `extra_sources` 가 있으면 avid `rebuild-multicam` 으로 기존 extra source 를 재구성
+4. 새 `extra_sources` 가 없지만 기존 project 에 extra source 가 있으면 avid `clear-extra-sources` 로 제거
+5. 마지막에 avid `export-project` 로 FCPXML / adjusted SRT 생성
+6. 최신 completed job 의 `result_r2_keys.project_json` / `fcpxml` / `srt` 갱신
+7. 프로젝트 상태를 다시 `completed` 로 복구
 
 실패 동작:
 
 - 원래 completed 결과물이 남아 있다고 가정하고 프로젝트 상태를 `completed` 로 되돌린다.
+
+메모:
+
+- deprecated `avid-cli reexport` 는 하위 호환용으로 남아 있지만, `eogum` 의 주 후처리 경로는 더 이상 이 명령을 기준으로 삼지 않는다.
+- `extra_sources[].offset_ms` 를 모두 지정하면 manual offset 으로 전달하고, 일부만 지정하는 혼합 입력은 거부한다.
+- 현재 후처리 workflow 는 `project_json`, `fcpxml`, `srt` 만 갱신하며 `preview`, `report`, `storyline` 은 다시 만들지 않는다.
 
 관련 파일:
 
@@ -249,7 +260,7 @@ startup recovery:
 
 메모:
 
-- `projects.extra_sources` 는 멀티캠 재-export 용 추가 소스 목록이다.
+- `projects.extra_sources` 는 후처리 workflow 에서 적용할 추가 소스 목록이다. 각 항목은 선택적으로 `offset_ms` 를 포함할 수 있다.
 - 현재 코드는 processing attempt 당 `jobs` 행 1개만 만들며 `type` 에 `subtitle_cut` 또는 `podcast_cut` 이 저장된다.
 
 ## 4. API 엔드포인트 맵
@@ -267,13 +278,13 @@ startup recovery:
 | GET | `/projects/{id}` | 프로젝트 상세 |
 | POST | `/projects/{id}/retry` | 실패 프로젝트 재시도 |
 | PUT | `/projects/{id}/extra-sources` | 멀티캠 추가 소스 등록/수정 |
-| POST | `/projects/{id}/multicam` | 평가 반영 재-export 및 멀티캠 처리 |
+| POST | `/projects/{id}/multicam` | 후처리 workflow 실행: 평가 반영, 멀티캠 재구성, FCPXML 재생성 |
 | DELETE | `/projects/{id}` | 프로젝트 삭제 |
 | GET | `/credits` | 잔액 조회 |
 | GET | `/credits/transactions` | 크레딧 거래 내역 |
 | GET | `/projects/{id}/download/{type}` | 결과물 다운로드 URL |
 | GET | `/projects/{id}/download/extra-source/{idx}` | 추가 소스 다운로드 URL |
-| GET | `/projects/{id}/segments` | 세그먼트 + AI 판단 조회 |
+| GET | `/projects/{id}/segments` | `avid-cli review-segments` 기반 review payload 조회 |
 | GET | `/projects/{id}/video-url` | 리뷰 플레이어용 스트리밍 URL |
 | GET | `/projects/{id}/evaluation` | 기존 평가 조회 |
 | POST | `/projects/{id}/evaluation` | 평가 저장 |
@@ -318,11 +329,17 @@ results/{project_id}/{artifact}
     preview.mp4
 
 /tmp/eogum/multicam_{project_id}/
+  input.project.avid.json
+  evaluation.json
   source.ext
   extra_0.ext
+  extra_1.ext
+  01_eval_applied.project.avid.json
+  02_multicam.project.avid.json
+  02_cleared.project.avid.json
   output/
     *.fcpxml
-    *.avid.json
+    *.srt
 
 /tmp/eogum/yt_{task_id}/
   downloaded-video.mp4
@@ -359,9 +376,9 @@ results/{project_id}/{artifact}
 
 ### 6.6 외부 도구 의존성
 
-- avid CLI 출력과 결과 파일 경로 파싱이 일부 stdout/glob 규칙에 의존한다.
+- avid 연동은 이제 JSON payload 기반이지만, artifact 파일명 규칙과 export 결과물 의미는 여전히 avid 쪽 명세에 의존한다.
 - 편집 리포트 파싱은 markdown 패턴에 의존한다.
-- `ffmpeg`, `ffprobe`, `yt-dlp`, Chalna, avid `.venv` 가 모두 정상이어야 한다.
+- `ffmpeg`, `ffprobe`, `yt-dlp`, Chalna, avid `.venv`, provider CLI 가 모두 정상이어야 한다.
 
 ## 7. 참고 파일
 

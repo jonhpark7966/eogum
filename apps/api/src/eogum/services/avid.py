@@ -213,6 +213,16 @@ def apply_evaluation(
     return _run_avid_json(args, timeout=300)
 
 
+def review_segments(
+    project_json_path: str,
+) -> dict[str, Any]:
+    args = [
+        "review-segments",
+        "--project-json", project_json_path,
+    ]
+    return _run_avid_json(args, timeout=300)
+
+
 def export_project(
     project_json_path: str,
     output_dir: str,

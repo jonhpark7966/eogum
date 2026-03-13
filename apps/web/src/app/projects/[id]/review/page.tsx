@@ -7,6 +7,7 @@ import {
   api,
   type EvalSegment,
   type EvalReportResponse,
+  type EvaluationSavePayload,
   type SegmentWithDecision,
 } from "@/lib/api";
 import { useParams, useRouter } from "next/navigation";
@@ -22,9 +23,23 @@ const CUT_REASONS = [
   { value: "retake_signal", label: "재촬영 신호" },
   { value: "meta_comment", label: "메타 발언" },
   { value: "tangent", label: "탈선" },
+  { value: "boring", label: "지루함" },
+  { value: "repetitive", label: "반복" },
+  { value: "long_pause", label: "긴 침묵" },
+  { value: "crosstalk", label: "겹침" },
+  { value: "irrelevant", label: "무관함" },
+  { value: "dragging", label: "늘어짐" },
 ];
 
 const KEEP_REASONS = [
+  { value: "funny", label: "웃김" },
+  { value: "witty", label: "재치" },
+  { value: "chemistry", label: "케미" },
+  { value: "reaction", label: "리액션" },
+  { value: "callback", label: "콜백" },
+  { value: "climax", label: "클라이맥스" },
+  { value: "engaging", label: "몰입감" },
+  { value: "emotional", label: "감정선" },
   { value: "best_take", label: "최적 테이크" },
   { value: "unique", label: "유일한 내용" },
   { value: "essential", label: "필수 내용" },
@@ -38,6 +53,11 @@ function formatTime(ms: number): string {
   const s = totalSec % 60;
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
+
+type ReviewMetadata = Pick<
+  EvaluationSavePayload,
+  "schema_version" | "review_scope" | "join_strategy"
+>;
 
 // ── Component ──
 
@@ -56,6 +76,11 @@ export default function ReviewPage() {
   const [videoUrl, setVideoUrl] = useState("");
   const [durationMs, setDurationMs] = useState(0);
   const [segments, setSegments] = useState<EvalSegment[]>([]);
+  const [reviewMetadata, setReviewMetadata] = useState<ReviewMetadata>({
+    schema_version: null,
+    review_scope: null,
+    join_strategy: null,
+  });
   const [currentIndex, setCurrentIndex] = useState(-1);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -109,6 +134,11 @@ export default function ReviewPage() {
         };
       });
 
+      setReviewMetadata({
+        schema_version: evalRes?.schema_version ?? segRes.schema_version ?? null,
+        review_scope: evalRes?.review_scope ?? segRes.review_scope ?? null,
+        join_strategy: evalRes?.join_strategy ?? segRes.join_strategy ?? null,
+      });
       setSegments(merged);
     } catch (err) {
       setError(err instanceof Error ? err.message : "데이터 로딩 실패");
@@ -217,7 +247,10 @@ export default function ReviewPage() {
         data: { session },
       } = await supabase.auth.getSession();
       if (!session) { setSaving(false); return; }
-      await api.saveEvaluation(session.access_token, projectId, segments);
+      await api.saveEvaluation(session.access_token, projectId, {
+        ...reviewMetadata,
+        segments,
+      });
       setDirty(false);
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : "저장 실패");
@@ -307,6 +340,9 @@ export default function ReviewPage() {
             >
               {saving ? "저장 중..." : "저장"}
             </button>
+            <span className="text-[11px] text-gray-500">
+              {reviewMetadata.schema_version ?? "review-unknown"} / {reviewMetadata.join_strategy ?? "join-unknown"}
+            </span>
           </div>
         </div>
       </header>

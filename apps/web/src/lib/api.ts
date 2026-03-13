@@ -28,6 +28,7 @@ export interface ExtraSource {
   r2_key: string;
   filename: string;
   size_bytes: number;
+  offset_ms?: number | null;
 }
 
 export interface Project {
@@ -108,6 +109,9 @@ export interface AiDecision {
   reason: string;
   confidence: number;
   note: string | null;
+  edit_type?: string | null;
+  origin_kind?: string | null;
+  source_segment_index?: number | null;
 }
 
 export interface HumanDecision {
@@ -122,6 +126,7 @@ export interface SegmentWithDecision {
   end_ms: number;
   text: string;
   ai: AiDecision | null;
+  human?: HumanDecision | null;
 }
 
 export interface EvalSegment {
@@ -134,6 +139,9 @@ export interface EvalSegment {
 }
 
 export interface SegmentsResponse {
+  schema_version: string | null;
+  review_scope: string | null;
+  join_strategy: string | null;
   segments: SegmentWithDecision[];
   source_duration_ms: number;
 }
@@ -145,9 +153,19 @@ export interface EvaluationResponse {
   version: string;
   avid_version: string | null;
   eogum_version: string | null;
+  schema_version: string | null;
+  review_scope: string | null;
+  join_strategy: string | null;
   segments: EvalSegment[];
   created_at: string;
   updated_at: string;
+}
+
+export interface EvaluationSavePayload {
+  schema_version?: string | null;
+  review_scope?: string | null;
+  join_strategy?: string | null;
+  segments: EvalSegment[];
 }
 
 export interface VideoUrlResponse {
@@ -333,10 +351,10 @@ export const api = {
     }
   },
 
-  saveEvaluation: (token: string, projectId: string, segments: EvalSegment[]) =>
+  saveEvaluation: (token: string, projectId: string, payload: EvaluationSavePayload) =>
     apiFetch<EvaluationResponse>(`/projects/${projectId}/evaluation`, token, {
       method: "POST",
-      body: JSON.stringify({ segments }),
+      body: JSON.stringify(payload),
     }),
 
   getEvalReport: (token: string, projectId: string) =>

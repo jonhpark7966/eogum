@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     avid_cli_path: Path | None = None  # Legacy fallback while local envs migrate.
     avid_temp_dir: Path = Path("/tmp/eogum")
     avid_output_dir: Path = Path("/tmp/eogum/outputs")
+    avid_provider: str = "codex"
+    avid_provider_model: str | None = "gpt-5.4"
+    avid_provider_effort: str | None = "medium"
 
     # Chalna
     chalna_url: str = "http://localhost:7861"

@@ -12,6 +12,19 @@ from eogum.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _apply_provider_args(args: list[str]) -> list[str]:
+    provider = settings.avid_provider
+    model = settings.avid_provider_model
+    effort = settings.avid_provider_effort
+
+    updated = [*args, "--provider", provider]
+    if model:
+        updated += ["--provider-model", model]
+    if effort:
+        updated += ["--provider-effort", effort]
+    return updated
+
+
 def _build_avid_env() -> dict[str, str]:
     env = os.environ.copy()
     avid_bin_dir = str(settings.resolved_avid_bin.parent)
@@ -94,9 +107,19 @@ def get_version() -> str | None:
     )
 
 
-def doctor(provider: str = "claude") -> dict[str, Any]:
+def doctor(provider: str | None = None, probe_providers: bool = False) -> dict[str, Any]:
     """Run avid environment diagnostics."""
-    return _run_avid_json(["doctor", "--provider", provider], timeout=30)
+    args = ["doctor"]
+    selected_provider = provider or settings.avid_provider
+    if selected_provider:
+        args += ["--provider", selected_provider]
+    if probe_providers:
+        args.append("--probe-providers")
+        if settings.avid_provider_model:
+            args += ["--provider-model", settings.avid_provider_model]
+        if settings.avid_provider_effort:
+            args += ["--provider-effort", settings.avid_provider_effort]
+    return _run_avid_json(args, timeout=30)
 
 
 def transcribe(source_path: str, language: str = "ko", output_dir: str | None = None, context: str | None = None) -> str:
@@ -118,7 +141,7 @@ def transcribe(source_path: str, language: str = "ko", output_dir: str | None = 
 
 def transcript_overview(srt_path: str, output_path: str | None = None) -> str:
     """Run avid transcript-overview (Pass 1). Returns path to storyline.json."""
-    args = ["transcript-overview", srt_path, "--provider", "claude"]
+    args = _apply_provider_args(["transcript-overview", srt_path])
     if output_path:
         args += ["-o", output_path]
 
@@ -135,7 +158,7 @@ def subtitle_cut(
     extra_sources: list[str] | None = None,
 ) -> dict[str, str]:
     """Run avid subtitle-cut (Pass 2). Returns result paths dict."""
-    args = ["subtitle-cut", source_path, "--srt", srt_path, "--provider", "claude"]
+    args = _apply_provider_args(["subtitle-cut", source_path, "--srt", srt_path])
     if context_path:
         args += ["--context", context_path]
     if output_dir:
@@ -158,7 +181,7 @@ def podcast_cut(
     extra_sources: list[str] | None = None,
 ) -> dict[str, str]:
     """Run avid podcast-cut (Pass 2). Returns result paths dict."""
-    args = ["podcast-cut", source_path, "--provider", "claude"]
+    args = _apply_provider_args(["podcast-cut", source_path])
     if srt_path:
         args += ["--srt", srt_path]
     if context_path:

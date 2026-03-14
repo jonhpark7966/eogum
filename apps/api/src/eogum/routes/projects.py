@@ -347,6 +347,15 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
                 r2.upload_file(str(srt_path), srt_r2_key, "text/plain")
                 new_r2_keys["srt"] = srt_r2_key
 
+            sync_diagnostics_path = artifacts.get("sync_diagnostics")
+            if sync_diagnostics_path:
+                sync_path = Path(sync_diagnostics_path)
+                sync_r2_key = f"results/{project_id}/{sync_path.name}"
+                r2.upload_file(str(sync_path), sync_r2_key, "application/json")
+                new_r2_keys["sync_diagnostics"] = sync_r2_key
+            elif "sync_diagnostics" in new_r2_keys:
+                new_r2_keys.pop("sync_diagnostics", None)
+
             # Update job with new r2_keys
             db.table("jobs").update({
                 "result_r2_keys": new_r2_keys,

@@ -239,6 +239,7 @@ def _guess_content_type(key: str) -> str:
         "report": "text/markdown",
         "project_json": "application/json",
         "storyline": "application/json",
+        "sync_diagnostics": "application/json",
         "preview": "video/mp4",
     }
     return types.get(key, "application/octet-stream")

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 # ── Upload ──
@@ -97,7 +97,11 @@ class EditReportResponse(BaseModel):
 
 
 # ── Segments & Evaluation ──
-class AiDecision(BaseModel):
+class EnginePayloadModel(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class AiDecision(EnginePayloadModel):
     action: str  # "keep" | "cut"
     reason: str
     confidence: float
@@ -107,13 +111,13 @@ class AiDecision(BaseModel):
     source_segment_index: int | None = None
 
 
-class HumanDecision(BaseModel):
+class HumanDecision(EnginePayloadModel):
     action: str  # "keep" | "cut"
     reason: str
     note: str = ""
 
 
-class SegmentWithDecision(BaseModel):
+class ReviewSegment(EnginePayloadModel):
     index: int
     start_ms: int
     end_ms: int
@@ -122,40 +126,46 @@ class SegmentWithDecision(BaseModel):
     human: HumanDecision | None = None
 
 
-class EvalSegment(BaseModel):
-    index: int
-    start_ms: int
-    end_ms: int
-    text: str
-    ai: AiDecision | None = None
-    human: HumanDecision | None = None
+class SegmentWithDecision(ReviewSegment):
+    pass
 
 
-class SegmentsResponse(BaseModel):
+class EvalSegment(ReviewSegment):
+    pass
+
+
+class ReviewPayload(EnginePayloadModel):
     schema_version: str | None = None
     review_scope: str | None = None
     join_strategy: str | None = None
-    segments: list[SegmentWithDecision]
+    command: str | None = None
+    status: str | None = None
+    package_version: str | None = None
+    git_revision: str | None = None
+    stats: dict | None = None
+    project_json: str | None = None
+    source_duration_ms: int | None = None
+    segments: list[ReviewSegment]
+
+
+class SegmentsResponse(ReviewPayload):
+    schema_version: str | None = None
+    review_scope: str | None = None
+    join_strategy: str | None = None
     source_duration_ms: int
 
 
-class EvaluationSave(BaseModel):
-    schema_version: str | None = None
-    review_scope: str | None = None
-    join_strategy: str | None = None
+class EvaluationSave(ReviewPayload):
     segments: list[EvalSegment]
 
 
-class EvaluationResponse(BaseModel):
+class EvaluationResponse(ReviewPayload):
     id: str
     project_id: str
     evaluator_id: str
     version: str
     avid_version: str | None
     eogum_version: str | None
-    schema_version: str | None = None
-    review_scope: str | None = None
-    join_strategy: str | None = None
     segments: list[EvalSegment]
     created_at: datetime
     updated_at: datetime

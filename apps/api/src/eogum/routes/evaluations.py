@@ -11,7 +11,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from eogum.auth import get_user_id
 from eogum.config import settings
 from eogum.models.schemas import (
-    AiDecision,
     ConfusionMatrix,
     DisagreementDetail,
     EvalMetrics,
@@ -20,7 +19,6 @@ from eogum.models.schemas import (
     EvaluationSave,
     ReasonBreakdown,
     SegmentsResponse,
-    SegmentWithDecision,
     VideoUrlResponse,
 )
 from eogum.services import avid
@@ -32,21 +30,21 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/projects/{project_id}", tags=["evaluations"])
 
 
-def _evaluation_metadata_from_segments(segments_value) -> tuple[str | None, str | None, str | None, list]:
+def _normalize_evaluation_payload(segments_value) -> dict:
     if isinstance(segments_value, dict):
-        return (
-            segments_value.get("schema_version"),
-            segments_value.get("review_scope"),
-            segments_value.get("join_strategy"),
-            segments_value.get("segments") or [],
-        )
-    return None, None, None, segments_value or []
+        payload = dict(segments_value)
+        payload["segments"] = payload.get("segments") or []
+        return payload
+    return {"segments": segments_value or []}
 
 
 def _evaluation_response_from_row(row: dict) -> EvaluationResponse:
-    schema_version, review_scope, join_strategy, segments = _evaluation_metadata_from_segments(
-        row.get("segments")
-    )
+    payload = _normalize_evaluation_payload(row.get("segments"))
+    extra_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"schema_version", "review_scope", "join_strategy", "segments"}
+    }
     return EvaluationResponse(
         id=row["id"],
         project_id=row["project_id"],
@@ -54,12 +52,13 @@ def _evaluation_response_from_row(row: dict) -> EvaluationResponse:
         version=row["version"],
         avid_version=row.get("avid_version"),
         eogum_version=row.get("eogum_version"),
-        schema_version=schema_version,
-        review_scope=review_scope,
-        join_strategy=join_strategy,
-        segments=segments,
+        schema_version=payload.get("schema_version"),
+        review_scope=payload.get("review_scope"),
+        join_strategy=payload.get("join_strategy"),
+        segments=payload.get("segments") or [],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        **extra_payload,
     )
 
 
@@ -121,13 +120,8 @@ def get_segments(project_id: str, user_id: str = Depends(get_user_id)):
         local_project_json.write_bytes(raw)
         payload = avid.review_segments(str(local_project_json))
 
-    return SegmentsResponse(
-        schema_version=payload.get("schema_version"),
-        review_scope=payload.get("review_scope"),
-        join_strategy=payload.get("join_strategy"),
-        segments=payload.get("segments") or [],
-        source_duration_ms=source_duration_ms,
-    )
+    payload["source_duration_ms"] = source_duration_ms
+    return payload
 
 
 @router.get("/video-url", response_model=VideoUrlResponse)
@@ -227,13 +221,7 @@ def save_evaluation(
     except Exception:
         pass
 
-    segments_json = [seg.model_dump() for seg in req.segments]
-    stored_segments = {
-        "schema_version": req.schema_version,
-        "review_scope": req.review_scope,
-        "join_strategy": req.join_strategy,
-        "segments": segments_json,
-    }
+    stored_segments = req.model_dump()
 
     # Atomic upsert using unique index on (project_id, evaluator_id)
     result = (
@@ -272,7 +260,8 @@ def get_eval_report(project_id: str, user_id: str = Depends(get_user_id)):
         raise HTTPException(status_code=404, detail="평가 데이터가 없습니다")
 
     evaluation = eval_result.data[0]
-    _, _, _, segments = _evaluation_metadata_from_segments(evaluation["segments"])
+    payload = _normalize_evaluation_payload(evaluation["segments"])
+    segments = payload.get("segments") or []
 
     # Classify each segment
     tp = tn = fp = fn = 0
@@ -287,7 +276,7 @@ def get_eval_report(project_id: str, user_id: str = Depends(get_user_id)):
     disagreements: list[DisagreementDetail] = []
 
     for seg in segments:
-        ai = seg.get("ai", {})
+        ai = seg.get("ai") or {}
         human = seg.get("human")
         ai_action = ai.get("action", "keep")
         ai_reason = ai.get("reason", "")

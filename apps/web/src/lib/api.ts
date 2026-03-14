@@ -105,6 +105,7 @@ export interface DownloadResponse {
 
 // ── Evaluation ──
 export interface AiDecision {
+  [key: string]: unknown;
   action: string;
   reason: string;
   confidence: number;
@@ -115,12 +116,14 @@ export interface AiDecision {
 }
 
 export interface HumanDecision {
+  [key: string]: unknown;
   action: string;
   reason: string;
   note: string;
 }
 
 export interface SegmentWithDecision {
+  [key: string]: unknown;
   index: number;
   start_ms: number;
   end_ms: number;
@@ -130,6 +133,7 @@ export interface SegmentWithDecision {
 }
 
 export interface EvalSegment {
+  [key: string]: unknown;
   index: number;
   start_ms: number;
   end_ms: number;
@@ -139,14 +143,23 @@ export interface EvalSegment {
 }
 
 export interface SegmentsResponse {
+  [key: string]: unknown;
   schema_version: string | null;
   review_scope: string | null;
   join_strategy: string | null;
+  command?: string | null;
+  status?: string | null;
+  avid_version?: string | null;
+  package_version?: string | null;
+  git_revision?: string | null;
+  stats?: Record<string, unknown> | null;
+  project_json?: string | null;
   segments: SegmentWithDecision[];
   source_duration_ms: number;
 }
 
 export interface EvaluationResponse {
+  [key: string]: unknown;
   id: string;
   project_id: string;
   evaluator_id: string;
@@ -156,15 +169,30 @@ export interface EvaluationResponse {
   schema_version: string | null;
   review_scope: string | null;
   join_strategy: string | null;
+  command?: string | null;
+  status?: string | null;
+  package_version?: string | null;
+  git_revision?: string | null;
+  stats?: Record<string, unknown> | null;
+  project_json?: string | null;
+  source_duration_ms?: number | null;
   segments: EvalSegment[];
   created_at: string;
   updated_at: string;
 }
 
 export interface EvaluationSavePayload {
+  [key: string]: unknown;
   schema_version?: string | null;
   review_scope?: string | null;
   join_strategy?: string | null;
+  command?: string | null;
+  status?: string | null;
+  package_version?: string | null;
+  git_revision?: string | null;
+  stats?: Record<string, unknown> | null;
+  project_json?: string | null;
+  source_duration_ms?: number | null;
   segments: EvalSegment[];
 }
 

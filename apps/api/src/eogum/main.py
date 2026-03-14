@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     # Recover stuck projects on startup
     from eogum.services.database import get_db
-    from eogum.services.job_runner import enqueue
+    from eogum.services.job_runner import enqueue, enqueue_reprocess
 
     db = get_db()
     stuck = (
@@ -27,7 +27,27 @@ async def lifespan(app: FastAPI):
     )
     for p in stuck.data:
         logger.info("Recovering stuck project: %s (was %s)", p["id"], p["status"])
-        # Only delete incomplete jobs (not completed ones)
+        latest_incomplete = (
+            db.table("jobs")
+            .select("id, type, status")
+            .eq("project_id", p["id"])
+            .in_("status", ["running", "pending"])
+            .order("created_at", desc=True)
+            .limit(1)
+            .maybe_single()
+            .execute()
+        )
+        if latest_incomplete.data and latest_incomplete.data["type"] == "reprocess_multicam":
+            db.table("jobs").update({
+                "status": "pending",
+                "progress": 0,
+                "error_message": None,
+            }).eq("id", latest_incomplete.data["id"]).execute()
+            db.table("projects").update({"status": "processing"}).eq("id", p["id"]).execute()
+            enqueue_reprocess(p["id"], latest_incomplete.data["id"])
+            continue
+
+        # Only delete incomplete initial jobs (not completed ones)
         db.table("jobs").delete().eq("project_id", p["id"]).in_("status", ["running", "pending"]).execute()
         db.table("edit_reports").delete().eq("project_id", p["id"]).execute()
         db.table("projects").update({"status": "queued"}).eq("id", p["id"]).execute()

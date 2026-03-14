@@ -11,6 +11,8 @@
 - [backend-module-map.md](/home/jonhpark/workspace/eogum/docs/backend-module-map.md): 백엔드 모듈 경계와 의존성 규칙
 - [backend-testing-strategy.md](/home/jonhpark/workspace/eogum/docs/backend-testing-strategy.md): 백엔드 테스트 계층과 우선순위
 - [backend-refactoring-roadmap.md](/home/jonhpark/workspace/eogum/docs/backend-refactoring-roadmap.md): 백엔드 리팩터링 순서
+- [eogum-api-runtime.md](/home/jonhpark/workspace/eogum/docs/eogum-api-runtime.md): 프론트/백 경계와 API 런타임 구조
+- [eogum-api-reference.md](/home/jonhpark/workspace/eogum/docs/eogum-api-reference.md): 현재 API 표면과 프론트 소비 경로
 - [avid-integration-spec.md](/home/jonhpark/workspace/eogum/docs/avid-integration-spec.md): `avid` 연동 상위 명세
 - [avid-submodule-layout.md](/home/jonhpark/workspace/eogum/docs/avid-submodule-layout.md): `avid` submodule 목표 경로와 backend 참조 규칙
 - [avid-cli-spec.md](/home/jonhpark/workspace/eogum/docs/avid-cli-spec.md): `avid-cli` 명령 명세

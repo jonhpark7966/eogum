@@ -248,6 +248,12 @@ sudo systemctl enable eogum-api
 sudo systemctl start eogum-api
 ```
 
+주의:
+
+- 로컬 개발 중 `python -m eogum.main` 또는 `uvicorn ...` 으로 이미 `:8000` 을 쓰고 있으면 `eogum-api.service` 는 bind 실패로 crash-loop 한다.
+- 이 머신에서는 실제로 수동 실행 API 와 systemd 유닛이 동시에 `:8000` 을 잡으려 하면서 충돌한 적이 있다.
+- 개발 중에는 수동 실행 하나만 쓰고, 운영 전환 시에는 수동 프로세스를 내린 뒤 systemd 만 사용한다.
+
 ## 7. 이메일 설정
 
 현재 코드는 Resend 가 없으면 이메일 발송을 건너뛴다. 운영 환경에서는 아래를 설정한다.

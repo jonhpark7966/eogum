@@ -5,6 +5,8 @@
 
 문서 우선순위:
 
+- [docs/eogum-api-runtime.md](/home/jonhpark/workspace/eogum/docs/eogum-api-runtime.md): 프론트/백 분리와 API 런타임 구조
+- [docs/eogum-api-reference.md](/home/jonhpark/workspace/eogum/docs/eogum-api-reference.md): 현재 API 표면과 프론트 소비 경로
 - [ARCHITECTURE.md](/home/jonhpark/workspace/eogum/ARCHITECTURE.md): 현재 런타임 구조와 사용자 플로우
 - [WORK_IN_PROGRESS.md](/home/jonhpark/workspace/eogum/WORK_IN_PROGRESS.md): 현재 진행 중인 백엔드 리팩터링 작업
 - [docs/backend-module-map.md](/home/jonhpark/workspace/eogum/docs/backend-module-map.md): 백엔드 모듈 경계

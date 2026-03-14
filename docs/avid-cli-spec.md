@@ -124,7 +124,8 @@ avid-cli subtitle-cut /tmp/source.mp4 --srt /tmp/work/source.srt --context /tmp/
     "project_json": "/tmp/work/output/source.subtitle.avid.json",
     "fcpxml": "/tmp/work/output/source_subtitle_cut.fcpxml",
     "srt": "/tmp/work/output/source_subtitle_cut.srt",
-    "report": "/tmp/work/output/source.report.md"
+    "report": "/tmp/work/output/source.report.md",
+    "sync_diagnostics": "/tmp/work/output/source.sync_diagnostics.json"
   },
   "stats": {
     "edit_decisions": 42
@@ -141,6 +142,7 @@ avid-cli podcast-cut /tmp/source.mp3 --srt /tmp/work/source.srt --context /tmp/w
 ```
 
 성공 시 출력 구조는 `subtitle-cut` 과 동일하다.
+`--extra-source` 를 사용하지 않으면 `sync_diagnostics` 는 생략될 수 있다.
 
 ## 4. 현재 운영 명령 명세
 
@@ -275,7 +277,8 @@ avid-cli rebuild-multicam \
   "command": "rebuild-multicam",
   "status": "ok",
   "artifacts": {
-    "project_json": "/tmp/output/project.avid.json"
+    "project_json": "/tmp/output/project.avid.json",
+    "sync_diagnostics": "/tmp/output/project.sync_diagnostics.json"
   },
   "stats": {
     "extra_sources": 2,
@@ -283,6 +286,12 @@ avid-cli rebuild-multicam \
   }
 }
 ```
+
+추가 규칙:
+
+- 자동 싱크를 수행하면 `sync_diagnostics.json` 을 함께 남긴다.
+- diagnostics 에는 `MFCC`, `PCM`, 선택 offset, 후보 offset 목록, 경고가 포함된다.
+- `MFCC` 와 `PCM` 이 크게 달라도 현재 명세는 자동 실패가 아니라 warning + 선택 결과 기록이다.
 
 ### 4.1c `clear-extra-sources`
 

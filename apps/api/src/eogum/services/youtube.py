@@ -40,7 +40,7 @@ def get_video_info(url: str) -> dict:
     """Fetch YouTube video metadata without downloading."""
     result = subprocess.run(
         [
-            "yt-dlp",
+            str(settings.resolved_yt_dlp_bin),
             "--dump-json",
             "--no-download",
             "-f", "bestvideo+bestaudio/best",
@@ -106,7 +106,7 @@ def _download_worker(task: DownloadTask) -> None:
         # Download with progress
         proc = subprocess.Popen(
             [
-                "yt-dlp",
+                str(settings.resolved_yt_dlp_bin),
                 "-f", "bestvideo+bestaudio/best",
                 "--merge-output-format", "mp4",
                 "--newline",  # Progress on new lines for parsing

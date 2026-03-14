@@ -1,4 +1,5 @@
 from pathlib import Path
+import shutil
 
 from pydantic_settings import BaseSettings
 
@@ -7,6 +8,20 @@ def _default_avid_backend_root() -> Path:
     submodule_root = Path("/home/jonhpark/workspace/eogum/third_party/auto-video-edit/apps/backend")
     legacy_root = Path("/home/jonhpark/workspace/auto-video-edit/apps/backend")
     return submodule_root if submodule_root.exists() else legacy_root
+
+
+def _default_yt_dlp_bin() -> Path:
+    candidates = [
+        Path("/home/jonhpark/.local/bin/yt-dlp"),
+        Path("/usr/local/bin/yt-dlp"),
+        Path("/usr/bin/yt-dlp"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    resolved = shutil.which("yt-dlp")
+    return Path(resolved) if resolved else Path("yt-dlp")
 
 
 class Settings(BaseSettings):
@@ -35,6 +50,9 @@ class Settings(BaseSettings):
     # Chalna
     chalna_url: str = "http://localhost:7861"
 
+    # Tools
+    yt_dlp_bin: Path | None = None
+
     # Email
     resend_api_key: str = ""
     email_from: str = "noreply@sudoremove.com"
@@ -52,6 +70,10 @@ class Settings(BaseSettings):
     @property
     def resolved_avid_bin(self) -> Path:
         return self.avid_bin or (self.resolved_avid_backend_root / ".venv" / "bin" / "avid-cli")
+
+    @property
+    def resolved_yt_dlp_bin(self) -> Path:
+        return self.yt_dlp_bin or _default_yt_dlp_bin()
 
 
 settings = Settings()

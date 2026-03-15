@@ -55,40 +55,74 @@ def _worker_loop() -> None:
         _running = False
 
 
+def _mark_initial_project_failure(db, project_id: str, *, job_id: str | None, error_message: str) -> None:
+    """Best-effort cleanup for failures before normal job failure handling starts."""
+    resolved_job_id = job_id
+    if not resolved_job_id:
+        latest_incomplete = (
+            db.table("jobs")
+            .select("id")
+            .eq("project_id", project_id)
+            .in_("status", ["running", "pending"])
+            .order("created_at", desc=True)
+            .limit(1)
+            .maybe_single()
+            .execute()
+        )
+        if latest_incomplete.data:
+            resolved_job_id = latest_incomplete.data["id"]
+
+    if resolved_job_id:
+        db.table("jobs").update({
+            "status": "failed",
+            "error_message": error_message[:1000],
+            "completed_at": "now()",
+        }).eq("id", resolved_job_id).execute()
+
+    db.table("projects").update({"status": "failed"}).eq("id", project_id).execute()
+
+
 def _process_project(project_id: str) -> None:
     db = get_db()
-
-    # Load project
-    project = db.table("projects").select("*").eq("id", project_id).single().execute().data
-    user_id = project["user_id"]
-    duration = project["source_duration_seconds"]
-
-    # Get user email
-    user = db.table("profiles").select("id, display_name").eq("id", user_id).single().execute().data
-    auth_user = db.auth.admin.get_user_by_id(user_id)
-    user_email = auth_user.user.email
-
-    # Update project status
-    db.table("projects").update({"status": "processing"}).eq("id", project_id).execute()
-
-    # Create job record
-    job = db.table("jobs").insert({
-        "project_id": project_id,
-        "user_id": user_id,
-        "type": project["cut_type"],
-        "status": "running",
-    }).execute().data[0]
-    job_id = job["id"]
-
-    # Ensure temp dirs
     temp_dir = settings.avid_temp_dir / project_id
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    output_dir = temp_dir / "output"
-    output_dir.mkdir(exist_ok=True)
+    project = None
+    user_id = None
+    user_email = None
+    duration = 0
+    job_id = None
+    credits_held = False
 
     try:
+        # Load project
+        project = db.table("projects").select("*").eq("id", project_id).single().execute().data
+        user_id = project["user_id"]
+        duration = project["source_duration_seconds"]
+
+        # Get user email
+        user = db.table("profiles").select("id, display_name").eq("id", user_id).single().execute().data
+        auth_user = db.auth.admin.get_user_by_id(user_id)
+        user_email = auth_user.user.email
+
+        # Update project status
+        db.table("projects").update({"status": "processing"}).eq("id", project_id).execute()
+
+        # Create job record
+        job = db.table("jobs").insert({
+            "project_id": project_id,
+            "user_id": user_id,
+            "type": project["cut_type"],
+            "status": "running",
+        }).execute().data[0]
+        job_id = job["id"]
+
+        # Ensure temp dirs
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = temp_dir / "output"
+        output_dir.mkdir(exist_ok=True)
+
         # 1. Hold credits
         credit.hold_credits(user_id, duration, job_id)
+        credits_held = True
 
         # 2. Download source from R2
         source_ext = Path(project["source_filename"]).suffix
@@ -180,22 +214,20 @@ def _process_project(project_id: str) -> None:
     except Exception as e:
         logger.exception("Project %s failed", project_id)
 
-        # Release held credits
         try:
-            credit.release_hold(user_id, duration, job_id)
+            if credits_held and user_id:
+                credit.release_hold(user_id, duration, job_id)
         except Exception:
             logger.exception("Failed to release credit hold for project %s", project_id)
 
-        # Mark failed
-        db.table("jobs").update({
-            "status": "failed",
-            "error_message": str(e)[:1000],
-            "completed_at": "now()",
-        }).eq("id", job_id).execute()
-        db.table("projects").update({"status": "failed"}).eq("id", project_id).execute()
+        try:
+            _mark_initial_project_failure(db, project_id, job_id=job_id, error_message=str(e))
+        except Exception:
+            logger.exception("Failed to mark project %s as failed after processing error", project_id)
 
         try:
-            email.send_failure_email(user_email, project["name"], project_id, str(e)[:200])
+            if user_email and project:
+                email.send_failure_email(user_email, project["name"], project_id, str(e)[:200])
         except Exception:
             logger.exception("Failed to send failure email for project %s", project_id)
 

@@ -195,10 +195,19 @@ cd /path/to/eogum/third_party/auto-video-edit/apps/backend
 source .venv/bin/activate
 avid-cli --help
 avid-cli version --json
-avid-cli doctor --provider claude --json
+avid-cli doctor --provider codex --json
 ```
 
-`transcript-overview`, `subtitle-cut`, `podcast-cut` 단계는 현재 `--provider claude` 를 사용한다.
+`transcript-overview`, `subtitle-cut`, `podcast-cut` 단계는 현재
+`AVID_PROVIDER`, `AVID_PROVIDER_MODEL`, `AVID_PROVIDER_EFFORT` 설정을 따른다.
+기본 예시는 `codex / gpt-5.4 / medium` 이다.
+
+중요:
+
+- systemd 는 로그인 셸의 `PATH` 를 자동으로 가져오지 않는다.
+- `claude`, `codex`, `yt-dlp` 가 `~/.local/bin` 이나 `~/.nvm/.../bin` 아래에 설치돼 있으면
+  별도 drop-in 으로 서비스 `PATH` 를 확장해야 한다.
+- 예시는 [apps/api/eogum-api.path.conf.example](/home/jonhpark/workspace/eogum/apps/api/eogum-api.path.conf.example) 참고.
 
 ### API 설치 및 실행
 
@@ -238,6 +247,36 @@ EnvironmentFile=/home/jonhpark/workspace/eogum/apps/api/.env
 
 [Install]
 WantedBy=multi-user.target
+```
+
+provider CLI 와 user-local binary 가 서비스에서 보이게 하려면 별도 drop-in 을 추가한다.
+
+`/etc/systemd/system/eogum-api.service.d/path.conf`:
+
+```ini
+[Service]
+Environment="PATH=/home/jonhpark/.local/bin:/home/jonhpark/.nvm/versions/node/v25.3.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin"
+```
+
+적용:
+
+```bash
+sudo mkdir -p /etc/systemd/system/eogum-api.service.d
+sudo cp /home/jonhpark/workspace/eogum/apps/api/eogum-api.path.conf.example \
+  /etc/systemd/system/eogum-api.service.d/path.conf
+sudo systemctl daemon-reload
+sudo systemctl restart eogum-api.service
+```
+
+검증:
+
+```bash
+systemctl show eogum-api.service -p Environment
+cd /home/jonhpark/workspace/eogum/apps/api
+.venv/bin/python - <<'PY'
+from eogum.services import avid
+print(avid.doctor(probe_providers=True))
+PY
 ```
 
 적용:

@@ -10,6 +10,8 @@ ExecStart=/home/jonhpark/workspace/eogum/apps/api/.venv/bin/uvicorn eogum.main:a
 Restart=always
 RestartSec=5
 EnvironmentFile=/home/jonhpark/workspace/eogum/apps/api/.env
+# Provider CLIs installed in user-local paths should be added via a systemd drop-in.
+# See eogum-api.path.conf.example for a migration-safe example.
 
 [Install]
 WantedBy=multi-user.target

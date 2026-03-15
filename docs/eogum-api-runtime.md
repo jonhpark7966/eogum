@@ -104,22 +104,15 @@ FastAPI 앱 엔트리는 [apps/api/src/eogum/main.py](/home/jonhpark/workspace/e
 
 - `:3000` 에 Next.js 프론트가 떠 있음
 - `:7861` 에 Chalna API 가 떠 있음
-- `:8000` 에 `python -m eogum.main` 로 보이는 API 프로세스가 이미 떠 있음
-- 동시에 `eogum-api.service` systemd 유닛도 `enabled`
-
-하지만 systemd 유닛은 현재 정상 서빙 중이 아니라 crash-loop 상태다.
-원인은 `:8000` 포트가 이미 수동 실행 프로세스에 의해 점유되어 있기 때문이다.
-
-즉 지금 상태는 아래 둘이 충돌하고 있다.
-
-1. 수동 실행 API
-2. systemd `eogum-api.service`
+- `:8000` 에 `eogum-api.service` 가 정상 서빙 중
+- `/docs`, `/openapi.json`, `/api/v1/health` 응답 정상
 
 운영 규칙:
 
 - 로컬 개발 중에는 수동 실행 하나만 사용
 - systemd 운영으로 전환할 때는 수동 실행 프로세스를 먼저 내리고 systemd 만 사용
 - 둘을 동시에 켜지 않는다
+- provider CLI 가 로그인 셸 경로에만 설치돼 있으면 systemd drop-in 으로 `PATH` 를 확장해야 한다
 
 ## 4. systemd 구성
 
@@ -138,6 +131,54 @@ FastAPI 앱 엔트리는 [apps/api/src/eogum/main.py](/home/jonhpark/workspace/e
 - `EnvironmentFile=/home/jonhpark/workspace/eogum/apps/api/.env`
 
 즉 systemd 기준으로도 `eogum API` 는 별도 reverse proxy 없이 `:8000` 에 직접 뜨는 구조다.
+
+### 4.1 PATH drop-in
+
+systemd 는 로그인 셸 초기화(`.bashrc`, `nvm`, `~/.local/bin`)를 자동으로 읽지 않는다.
+그래서 아래처럼 사용자 로컬 경로에 설치된 바이너리는 수동 셸에서는 보여도
+서비스에서는 보이지 않을 수 있다.
+
+- `claude`
+- `codex`
+- `yt-dlp`
+
+현재 운영 머신에서는 아래 drop-in 으로 이를 해결했다.
+
+- 실제 drop-in: `/etc/systemd/system/eogum-api.service.d/path.conf`
+- 저장소 예시: [apps/api/eogum-api.path.conf.example](/home/jonhpark/workspace/eogum/apps/api/eogum-api.path.conf.example)
+
+예시:
+
+```ini
+[Service]
+Environment="PATH=/home/jonhpark/.local/bin:/home/jonhpark/.nvm/versions/node/v25.3.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin"
+```
+
+적용:
+
+```bash
+sudo mkdir -p /etc/systemd/system/eogum-api.service.d
+sudo cp /home/jonhpark/workspace/eogum/apps/api/eogum-api.path.conf.example \
+  /etc/systemd/system/eogum-api.service.d/path.conf
+sudo systemctl daemon-reload
+sudo systemctl restart eogum-api.service
+```
+
+검증:
+
+```bash
+systemctl show eogum-api.service -p Environment
+```
+
+그 다음 API venv 에서 provider probe 를 돌린다.
+
+```bash
+cd /home/jonhpark/workspace/eogum/apps/api
+.venv/bin/python - <<'PY'
+from eogum.services import avid
+print(avid.doctor(probe_providers=True))
+PY
+```
 
 ## 5. 외부 노출 방식
 
@@ -182,15 +223,14 @@ FastAPI 기본 특성상 아래는 자동으로 제공된다.
 
 ## 7. 지금 정리해야 할 운영 이슈
 
-### 7.1 systemd vs 수동 실행 충돌
+### 7.1 systemd 와 수동 실행 혼용 금지
 
-현재 가장 먼저 해결해야 할 운영 이슈다.
+한 시점에는 하나만 사용한다.
 
-- 수동 `python -m eogum.main` 이 이미 `:8000` 사용
-- `eogum-api.service` 도 같은 포트로 계속 재시작
-- 결과적으로 systemd 는 실패 중
+- 수동 `python -m eogum.main`
+- 또는 `eogum-api.service`
 
-이건 코드 문제가 아니라 실행 방식 정리 문제다.
+둘을 동시에 올리면 `:8000` 포트 충돌로 systemd 가 재시작 루프에 들어간다.
 
 ### 7.2 프론트와 백엔드 환경 변수 분리
 

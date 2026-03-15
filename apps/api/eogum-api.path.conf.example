@@ -1,0 +1,2 @@
+[Service]
+Environment="PATH=/home/jonhpark/.local/bin:/home/jonhpark/.nvm/versions/node/v25.3.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin"

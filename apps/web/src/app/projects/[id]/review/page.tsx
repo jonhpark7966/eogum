@@ -168,7 +168,7 @@ export default function ReviewPage() {
       let found = -1;
       for (let i = 0; i < segments.length; i++) {
         if (currentMs >= segments[i].start_ms && currentMs < segments[i].end_ms) {
-          found = i;
+          found = segments[i].index;
           break;
         }
       }

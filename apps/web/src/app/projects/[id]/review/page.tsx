@@ -3,6 +3,7 @@
 export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
+import { ProjectUploadStatus } from "@/app/_providers/upload-provider";
 import {
   api,
   type EvalSegment,
@@ -356,6 +357,8 @@ export default function ReviewPage() {
           </div>
         </div>
       )}
+
+      <ProjectUploadStatus projectId={projectId} className="mx-auto my-2 max-w-6xl" />
 
       {/* Video Player (sticky) */}
       {videoUrl ? (

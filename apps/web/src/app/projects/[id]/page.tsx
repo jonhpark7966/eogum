@@ -3,7 +3,8 @@
 export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
-import { api, uploadFile, type ProjectDetail, type ExtraSource } from "@/lib/api";
+import { ProjectUploadStatus, useUploads } from "@/app/_providers/upload-provider";
+import { api, type ProjectDetail } from "@/lib/api";
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -65,15 +66,17 @@ export default function ProjectDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [retrying, setRetrying] = useState(false);
+  const { enqueueExtraSources, jobsFor } = useUploads();
 
   // Multicam state
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
-  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
-  const [uploading, setUploading] = useState(false);
   const [multicamProcessing, setMulticamProcessing] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const loadedUploadJobIdsRef = useRef<Set<string>>(new Set());
 
   const projectId = params.id as string;
+  const uploadJobs = jobsFor(projectId);
+  const uploading = uploadJobs.some((job) => job.status === "queued" || job.status === "uploading");
 
   const loadProject = useCallback(async () => {
     const { data: { session } } = await supabase.auth.getSession();
@@ -96,6 +99,18 @@ export default function ProjectDetailPage() {
     }, 5000);
     return () => clearInterval(interval);
   }, [loadProject, project?.status]);
+
+  useEffect(() => {
+    const newlyDoneJobs = uploadJobs.filter(
+      (job) => job.status === "done" && !loadedUploadJobIdsRef.current.has(job.id)
+    );
+    if (newlyDoneJobs.length === 0) return;
+
+    for (const job of newlyDoneJobs) {
+      loadedUploadJobIdsRef.current.add(job.id);
+    }
+    loadProject();
+  }, [loadProject, uploadJobs]);
 
   const handleRetry = async () => {
     const { data: { session } } = await supabase.auth.getSession();
@@ -146,32 +161,8 @@ export default function ProjectDetailPage() {
   const handleUploadExtraSources = async () => {
     const { data: { session } } = await supabase.auth.getSession();
     if (!session || !project || pendingFiles.length === 0) return;
-    setUploading(true);
-    setUploadProgress(0);
-    try {
-      const newSources: ExtraSource[] = [];
-      const totalSize = pendingFiles.reduce((sum, f) => sum + f.size, 0);
-      let prevUploaded = 0;
-      for (let i = 0; i < pendingFiles.length; i++) {
-        const file = pendingFiles[i];
-        const baseUploaded = prevUploaded;
-        const r2Key = await uploadFile(session.access_token, file, (loaded) => {
-          setUploadProgress(Math.round(((baseUploaded + loaded) / totalSize) * 100));
-        });
-        prevUploaded += file.size;
-        newSources.push({ r2_key: r2Key, filename: file.name, size_bytes: file.size });
-      }
-      const allSources = [...project.extra_sources, ...newSources];
-      await api.updateExtraSources(session.access_token, projectId, allSources);
-      setPendingFiles([]);
-      setUploadProgress(100);
-      await loadProject();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "업로드에 실패했습니다");
-    } finally {
-      setUploading(false);
-      setUploadProgress(null);
-    }
+    enqueueExtraSources(projectId, pendingFiles, session.access_token);
+    setPendingFiles([]);
   };
 
   const handleMulticamReprocess = async () => {
@@ -428,6 +419,8 @@ export default function ProjectDetailPage() {
               오디오 크로스 코릴레이션으로 자동 싱크. 추가 크레딧이 차감됩니다.
             </p>
 
+            <ProjectUploadStatus projectId={projectId} className="mb-4" />
+
             {/* Registered sources */}
             {project.extra_sources.length > 0 && (
               <div className="mb-4 space-y-2">
@@ -475,19 +468,6 @@ export default function ProjectDetailPage() {
                     </div>
                   </div>
                 ))}
-              </div>
-            )}
-
-            {/* Upload progress */}
-            {uploadProgress !== null && (
-              <div className="mb-4">
-                <div className="relative h-2 bg-white/[0.05] rounded-full overflow-hidden">
-                  <div
-                    className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-cyan-500 to-violet-500 transition-all duration-300"
-                    style={{ width: `${uploadProgress}%` }}
-                  />
-                </div>
-                <p className="text-xs text-gray-500 mt-1.5">{uploadProgress}% 업로드 중...</p>
               </div>
             )}
 

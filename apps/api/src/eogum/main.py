@@ -6,10 +6,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from eogum.config import settings
+from eogum.monitoring import init_sentry
 from eogum.routes import credits, downloads, evaluations, health, projects, upload, youtube
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+init_sentry()
 
 
 @asynccontextmanager

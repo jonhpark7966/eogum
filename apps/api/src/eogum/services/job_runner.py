@@ -6,6 +6,8 @@ import threading
 from collections import deque
 from pathlib import Path
 
+import sentry_sdk
+
 from eogum.config import settings
 from eogum.services import avid, credit, email, r2
 from eogum.services.database import get_db
@@ -49,8 +51,15 @@ def _worker_loop() -> None:
                 _reprocess_project(project_id, item["job_id"])
             else:
                 _process_project(project_id)
-        except Exception:
+        except Exception as exc:
             logger.exception("Fatal error processing project %s", project_id)
+            with sentry_sdk.new_scope() as scope:
+                scope.set_tag("service", "eogum-api")
+                scope.set_tag("project_id", project_id)
+                scope.set_tag("job_kind", item["kind"])
+                if item.get("job_id"):
+                    scope.set_tag("job_id", item["job_id"])
+                sentry_sdk.capture_exception(exc)
     with _lock:
         _running = False
 
@@ -213,6 +222,24 @@ def _process_project(project_id: str) -> None:
 
     except Exception as e:
         logger.exception("Project %s failed", project_id)
+        with sentry_sdk.new_scope() as scope:
+            scope.set_tag("service", "eogum-api")
+            scope.set_tag("project_id", project_id)
+            if job_id:
+                scope.set_tag("job_id", job_id)
+            if user_id:
+                scope.set_user({"id": user_id})
+            if project:
+                scope.set_context(
+                    "project",
+                    {
+                        "cut_type": project.get("cut_type"),
+                        "language": project.get("language"),
+                        "source_duration_seconds": project.get("source_duration_seconds"),
+                        "has_extra_sources": bool(project.get("extra_sources")),
+                    },
+                )
+            sentry_sdk.capture_exception(e)
 
         try:
             if credits_held and user_id:

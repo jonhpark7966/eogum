@@ -407,6 +407,51 @@ export const api = {
 
 // ── Multipart Upload Utility ──
 const UPLOAD_CONCURRENCY = 3;
+const PART_UPLOAD_MAX_ATTEMPTS = 3;
+const PART_UPLOAD_INITIAL_RETRY_DELAY_MS = 1000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function shouldRetryPartUpload(error: unknown): boolean {
+  if (!(error instanceof Error)) return true;
+  if (!error.message.startsWith("HTTP ")) return true;
+
+  const status = Number(error.message.split(" ")[1]);
+  if (!Number.isFinite(status)) return true;
+
+  return status === 408 || status === 429 || status >= 500;
+}
+
+async function uploadPartWithRetry(partNumber: number, uploadUrl: string, chunk: Blob): Promise<Response> {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= PART_UPLOAD_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const resp = await fetch(uploadUrl, {
+        method: "PUT",
+        body: chunk,
+      });
+
+      if (resp.ok) return resp;
+
+      throw new Error(`HTTP ${resp.status}`);
+    } catch (error) {
+      lastError = error;
+
+      if (attempt === PART_UPLOAD_MAX_ATTEMPTS || !shouldRetryPartUpload(error)) {
+        break;
+      }
+
+      const delayMs = PART_UPLOAD_INITIAL_RETRY_DELAY_MS * 2 ** (attempt - 1);
+      await sleep(delayMs);
+    }
+  }
+
+  const detail = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new Error(`Part ${partNumber} 업로드 실패: ${detail}`);
+}
 
 export async function uploadFile(
   token: string,
@@ -433,11 +478,7 @@ export async function uploadFile(
         const end = Math.min(start + part_size, file.size);
         const chunk = file.slice(start, end);
 
-        const resp = await fetch(part.upload_url, {
-          method: "PUT",
-          body: chunk,
-        });
-        if (!resp.ok) throw new Error(`Part ${part.part_number} 업로드 실패: ${resp.status}`);
+        const resp = await uploadPartWithRetry(part.part_number, part.upload_url, chunk);
 
         const etag = resp.headers.get("ETag") || "";
         totalUploaded += end - start;

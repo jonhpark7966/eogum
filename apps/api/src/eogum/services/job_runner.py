@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 _queue: deque[dict[str, str | None]] = deque()
 _running = False
 _lock = threading.Lock()
+_reprocess_cancel_events: dict[str, threading.Event] = {}
+
+
+class ReprocessCancelled(RuntimeError):
+    """Raised when a multicam reprocess job is cancelled."""
 
 
 def enqueue(project_id: str) -> None:
@@ -27,8 +32,27 @@ def enqueue(project_id: str) -> None:
 
 def enqueue_reprocess(project_id: str, job_id: str) -> None:
     """Add reprocess task to queue."""
+    _reprocess_cancel_events[job_id] = threading.Event()
     _queue.append({"kind": "reprocess", "project_id": project_id, "job_id": job_id})
     _maybe_start_worker()
+
+
+def cancel_reprocess(project_id: str, job_id: str) -> bool:
+    """Cancel a pending or running reprocess task."""
+    cancelled = False
+    with _lock:
+        for item in list(_queue):
+            if item["kind"] == "reprocess" and item["project_id"] == project_id and item["job_id"] == job_id:
+                _queue.remove(item)
+                cancelled = True
+                break
+
+    event = _reprocess_cancel_events.get(job_id)
+    if event is not None:
+        event.set()
+        cancelled = True
+
+    return cancelled
 
 
 def _maybe_start_worker() -> None:
@@ -305,18 +329,29 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
         raise RuntimeError("reprocess job_id is required")
 
     db = get_db()
+    cancel_event = _reprocess_cancel_events.setdefault(job_id, threading.Event())
+
+    def _raise_if_cancelled() -> None:
+        if cancel_event.is_set():
+            raise ReprocessCancelled("멀티캠 적용이 취소되었습니다")
+
+    def _download_callback(_: int) -> None:
+        _raise_if_cancelled()
+
     project = db.table("projects").select("*").eq("id", project_id).single().execute().data
     user_id = project["user_id"]
 
-    db.table("projects").update({"status": "processing"}).eq("id", project_id).execute()
-    db.table("jobs").update({
-        "status": "running",
-        "progress": 5,
-        "error_message": None,
-    }).eq("id", job_id).execute()
-
     temp_dir = settings.avid_temp_dir / f"multicam_{project_id}"
     try:
+        _raise_if_cancelled()
+        db.table("projects").update({"status": "processing"}).eq("id", project_id).execute()
+        db.table("jobs").update({
+            "status": "running",
+            "progress": 5,
+            "error_message": None,
+        }).eq("id", job_id).execute()
+
+        _raise_if_cancelled()
         temp_dir.mkdir(parents=True, exist_ok=True)
         output_dir = temp_dir / "output"
         output_dir.mkdir(exist_ok=True)
@@ -339,7 +374,9 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
         if not project_json_key:
             raise RuntimeError("프로젝트 JSON이 없습니다. 전체 재처리가 필요합니다.")
 
+        _raise_if_cancelled()
         project_json_bytes = r2.download_to_bytes(project_json_key)
+        _raise_if_cancelled()
         local_project_json = temp_dir / "input.project.avid.json"
         local_project_json.write_bytes(project_json_bytes)
         working_project_json = local_project_json
@@ -385,13 +422,15 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
         if has_extra_sources:
             source_ext = Path(project["source_filename"]).suffix
             local_source_path = temp_dir / f"source{source_ext}"
-            r2.download_file(project["source_r2_key"], str(local_source_path))
+            r2.download_file(project["source_r2_key"], str(local_source_path), callback=_download_callback)
+            _raise_if_cancelled()
             source_path = str(local_source_path)
 
             for i, es in enumerate(project["extra_sources"]):
                 ext = Path(es["filename"]).suffix
                 local_path = temp_dir / f"extra_{i}{ext}"
-                r2.download_file(es["r2_key"], str(local_path))
+                r2.download_file(es["r2_key"], str(local_path), callback=_download_callback)
+                _raise_if_cancelled()
                 extra_paths.append(str(local_path))
 
         steps = _plan_reprocess_steps(
@@ -403,16 +442,19 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
         db.table("jobs").update({"progress": 25}).eq("id", job_id).execute()
 
         if "apply-evaluation" in steps:
+            _raise_if_cancelled()
             eval_output = temp_dir / "01_eval_applied.project.avid.json"
             payload = avid.apply_evaluation(
                 project_json_path=str(working_project_json),
                 evaluation_path=str(evaluation_path),
                 output_project_json=str(eval_output),
+                cancel_event=cancel_event,
             )
             working_project_json = Path(payload["artifacts"]["project_json"])
             logger.info("Applied evaluation via avid-cli: %s", payload)
 
         if "rebuild-multicam" in steps:
+            _raise_if_cancelled()
             multicam_output = temp_dir / "02_multicam.project.avid.json"
             payload = avid.rebuild_multicam(
                 project_json_path=str(working_project_json),
@@ -420,24 +462,29 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
                 extra_sources=extra_paths,
                 output_project_json=str(multicam_output),
                 offsets=extra_offsets,
+                cancel_event=cancel_event,
             )
             working_project_json = Path(payload["artifacts"]["project_json"])
             logger.info("Rebuilt multicam via avid-cli: %s", payload)
         elif "clear-extra-sources" in steps:
+            _raise_if_cancelled()
             clear_output = temp_dir / "02_cleared.project.avid.json"
             payload = avid.clear_extra_sources(
                 project_json_path=str(working_project_json),
                 output_project_json=str(clear_output),
+                cancel_event=cancel_event,
             )
             working_project_json = Path(payload["artifacts"]["project_json"])
             logger.info("Cleared extra sources via avid-cli: %s", payload)
 
         db.table("jobs").update({"progress": 70}).eq("id", job_id).execute()
 
+        _raise_if_cancelled()
         payload = avid.export_project(
             project_json_path=str(working_project_json),
             output_dir=str(output_dir),
             content_mode="cut" if eval_segments else "disabled",
+            cancel_event=cancel_event,
         )
         artifacts = payload.get("artifacts") or {}
         updated_json = working_project_json
@@ -476,6 +523,14 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
         }).eq("id", job_id).execute()
         db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
         logger.info("Reprocess completed for project %s", project_id)
+    except (ReprocessCancelled, avid.AvidCommandCancelled) as exc:
+        logger.info("Project reprocess cancelled for project %s", project_id)
+        db.table("jobs").update({
+            "status": "canceled",
+            "error_message": str(exc)[:1000],
+            "completed_at": "now()",
+        }).eq("id", job_id).execute()
+        db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
     except Exception as exc:
         logger.exception("Project reprocess failed for project %s", project_id)
         db.table("jobs").update({
@@ -486,6 +541,7 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
         db.table("projects").update({"status": "reprocess_failed"}).eq("id", project_id).execute()
         raise
     finally:
+        _reprocess_cancel_events.pop(job_id, None)
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 

@@ -346,6 +346,9 @@ export const api = {
   multicamReprocess: (token: string, id: string) =>
     apiFetch<Project>(`/projects/${id}/multicam`, token, { method: "POST" }),
 
+  cancelMulticamReprocess: (token: string, id: string) =>
+    apiFetch<Project>(`/projects/${id}/multicam/cancel`, token, { method: "POST" }),
+
   // Credits
   getCredits: (token: string) => apiFetch<CreditBalance>("/credits", token),
 

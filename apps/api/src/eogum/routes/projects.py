@@ -11,7 +11,7 @@ from eogum.models.schemas import (
 )
 from eogum.services.credit import get_balance
 from eogum.services.database import get_db
-from eogum.services.job_runner import enqueue, enqueue_reprocess
+from eogum.services.job_runner import cancel_reprocess, enqueue, enqueue_reprocess
 from eogum.services.r2 import download_to_bytes
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -216,6 +216,44 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
         "progress": 0,
     }).execute().data[0]
     enqueue_reprocess(project_id, queued_job["id"])
+
+    return db.table("projects").select("*").eq("id", project_id).single().execute().data
+
+
+@router.post("/{project_id}/multicam/cancel", response_model=ProjectResponse)
+def cancel_multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
+    """Cancel a pending or running multicam reprocess job."""
+    db = get_db()
+
+    project = db.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).single().execute()
+    if not project.data:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+
+    reprocess_job = (
+        db.table("jobs")
+        .select("id, status")
+        .eq("project_id", project_id)
+        .eq("type", "reprocess_multicam")
+        .in_("status", ["pending", "running"])
+        .order("created_at", desc=True)
+        .limit(1)
+        .maybe_single()
+        .execute()
+    )
+    if not reprocess_job.data:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="취소할 멀티캠 적용 작업이 없습니다",
+        )
+
+    job_id = reprocess_job.data["id"]
+    cancel_reprocess(project_id, job_id)
+    db.table("jobs").update({
+        "status": "canceled",
+        "error_message": "멀티캠 적용이 취소되었습니다",
+        "completed_at": "now()",
+    }).eq("id", job_id).execute()
+    db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
 
     return db.table("projects").select("*").eq("id", project_id).single().execute().data
 

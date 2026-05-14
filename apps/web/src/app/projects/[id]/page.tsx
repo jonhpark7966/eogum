@@ -35,6 +35,7 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; icon: string
 const JOB_TYPE_LABELS: Record<string, string> = {
   subtitle_cut: "편집 처리",
   podcast_cut: "편집 처리",
+  reprocess_multicam: "멀티캠 적용",
 };
 
 /* ── Section wrapper ── */
@@ -71,6 +72,7 @@ export default function ProjectDetailPage() {
   // Multicam state
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [multicamProcessing, setMulticamProcessing] = useState(false);
+  const [cancelingMulticam, setCancelingMulticam] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const loadedUploadJobIdsRef = useRef<Set<string>>(new Set());
 
@@ -177,6 +179,20 @@ export default function ProjectDetailPage() {
     } finally { setMulticamProcessing(false); }
   };
 
+  const handleCancelMulticamReprocess = async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    setCancelingMulticam(true);
+    try {
+      await api.cancelMulticamReprocess(session.access_token, projectId);
+      await loadProject();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "멀티캠 적용 취소에 실패했습니다");
+    } finally {
+      setCancelingMulticam(false);
+    }
+  };
+
   /* ── Loading ── */
   if (loading) {
     return (
@@ -205,6 +221,9 @@ export default function ProjectDetailPage() {
   const isCompleted = project.status === "completed";
   const isFailed = project.status === "failed";
   const cutTypeLabel = project.cut_type === "subtitle_cut" ? "강의/설명" : "팟캐스트";
+  const activeReprocessJob = project.jobs.find(
+    (job) => job.type === "reprocess_multicam" && (job.status === "pending" || job.status === "running")
+  );
 
   return (
     <div className="min-h-screen bg-[#030712] text-white dot-grid">
@@ -303,6 +322,23 @@ export default function ProjectDetailPage() {
                   </div>
                 </div>
               ))}
+              {activeReprocessJob && (
+                <div className="flex items-center justify-between gap-4 rounded-xl border border-red-500/10 bg-red-500/[0.04] px-4 py-3">
+                  <div>
+                    <p className="text-sm font-medium text-red-200">멀티캠 적용 작업 실행 중</p>
+                    <p className="mt-0.5 text-xs text-gray-500">
+                      취소하면 다운로드와 오디오 싱크 작업을 중단하고 기존 완료 결과로 돌아갑니다.
+                    </p>
+                  </div>
+                  <button
+                    onClick={handleCancelMulticamReprocess}
+                    disabled={cancelingMulticam}
+                    className="shrink-0 rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-2 text-sm font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
+                  >
+                    {cancelingMulticam ? "취소 중..." : "멀티캠 적용 취소"}
+                  </button>
+                </div>
+              )}
             </div>
           </Section>
         )}
@@ -501,7 +537,7 @@ export default function ProjectDetailPage() {
                   {uploading ? "업로드 중..." : "업로드"}
                 </button>
               )}
-              {project.extra_sources.length > 0 && !uploading && (
+              {project.extra_sources.length > 0 && !uploading && !activeReprocessJob && (
                 <button
                   onClick={handleMulticamReprocess}
                   disabled={multicamProcessing}
@@ -509,6 +545,15 @@ export default function ProjectDetailPage() {
                 >
                   <div className="absolute inset-0 bg-gradient-to-r from-cyan-500 to-violet-500" />
                   <span className="relative text-white">{multicamProcessing ? "적용 중..." : "멀티캠 적용"}</span>
+                </button>
+              )}
+              {activeReprocessJob && (
+                <button
+                  onClick={handleCancelMulticamReprocess}
+                  disabled={cancelingMulticam}
+                  className="px-4 py-2 text-sm font-medium bg-red-500/10 text-red-300 border border-red-500/20 rounded-lg hover:bg-red-500/20 transition-all disabled:opacity-50"
+                >
+                  {cancelingMulticam ? "취소 중..." : "멀티캠 적용 취소"}
                 </button>
               )}
             </div>

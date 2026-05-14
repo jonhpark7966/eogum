@@ -1,4 +1,5 @@
 import uuid
+from collections.abc import Callable
 
 import boto3
 from botocore.config import Config
@@ -121,10 +122,11 @@ def download_to_bytes(r2_key: str) -> bytes:
     return response["Body"].read()
 
 
-def download_file(r2_key: str, local_path: str) -> str:
+def download_file(r2_key: str, local_path: str, callback: Callable[[int], None] | None = None) -> str:
     """Download file from R2 to local path."""
     client = get_r2_client()
-    client.download_file(settings.r2_bucket_name, r2_key, local_path)
+    kwargs = {"Callback": callback} if callback else {}
+    client.download_file(settings.r2_bucket_name, r2_key, local_path, **kwargs)
     return local_path
 
 

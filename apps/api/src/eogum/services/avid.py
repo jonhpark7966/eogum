@@ -4,12 +4,18 @@ import json
 import logging
 import os
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
 from eogum.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class AvidCommandCancelled(RuntimeError):
+    """Raised when an avid-cli command is cancelled."""
 
 
 def _apply_provider_args(args: list[str]) -> list[str]:
@@ -35,19 +41,46 @@ def _build_avid_env() -> dict[str, str]:
     return env
 
 
-def _run_avid(args: list[str], timeout: int = 3600) -> subprocess.CompletedProcess[str]:
+def _run_avid(
+    args: list[str],
+    timeout: int = 3600,
+    cancel_event: threading.Event | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Run an avid-cli command."""
     cmd = [str(settings.resolved_avid_bin)] + args
     logger.info("Running avid-cli: %s", " ".join(cmd))
 
-    result = subprocess.run(
+    started_at = time.monotonic()
+    process = subprocess.Popen(
         cmd,
         cwd=str(settings.resolved_avid_backend_root),
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
         env=_build_avid_env(),
     )
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=0.5)
+            break
+        except subprocess.TimeoutExpired:
+            if cancel_event and cancel_event.is_set():
+                process.terminate()
+                try:
+                    stdout, stderr = process.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                raise AvidCommandCancelled(
+                    f"avid-cli command cancelled: stdout={stdout[-500:] if stdout else ''} "
+                    f"stderr={stderr[-500:] if stderr else ''}"
+                )
+            if time.monotonic() - started_at > timeout:
+                process.kill()
+                stdout, stderr = process.communicate()
+                raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+
+    result = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
     if result.returncode != 0:
         logger.error("avid-cli stdout: %s", result.stdout[-500:] if result.stdout else "")
@@ -58,11 +91,15 @@ def _run_avid(args: list[str], timeout: int = 3600) -> subprocess.CompletedProce
     return result
 
 
-def _run_avid_json(args: list[str], timeout: int = 3600) -> dict[str, Any]:
+def _run_avid_json(
+    args: list[str],
+    timeout: int = 3600,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
     if "--json" not in args:
         args = [*args, "--json"]
 
-    result = _run_avid(args, timeout=timeout)
+    result = _run_avid(args, timeout=timeout, cancel_event=cancel_event)
     stdout = result.stdout.strip()
 
     try:
@@ -226,6 +263,7 @@ def apply_evaluation(
     project_json_path: str,
     evaluation_path: str,
     output_project_json: str,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     args = [
         "apply-evaluation",
@@ -233,7 +271,7 @@ def apply_evaluation(
         "--evaluation", evaluation_path,
         "--output-project-json", output_project_json,
     ]
-    return _run_avid_json(args, timeout=300)
+    return _run_avid_json(args, timeout=300, cancel_event=cancel_event)
 
 
 def review_segments(
@@ -252,6 +290,7 @@ def export_project(
     output_path: str | None = None,
     silence_mode: str = "cut",
     content_mode: str = "disabled",
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     args = [
         "export-project",
@@ -262,7 +301,7 @@ def export_project(
     ]
     if output_path:
         args += ["-o", output_path]
-    return _run_avid_json(args, timeout=3600)
+    return _run_avid_json(args, timeout=3600, cancel_event=cancel_event)
 
 
 def rebuild_multicam(
@@ -271,6 +310,7 @@ def rebuild_multicam(
     extra_sources: list[str],
     output_project_json: str,
     offsets: list[int] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     args = [
         "rebuild-multicam",
@@ -282,16 +322,17 @@ def rebuild_multicam(
         args += ["--extra-source", src]
     for offset in offsets or []:
         args += ["--offset", str(offset)]
-    return _run_avid_json(args, timeout=3600)
+    return _run_avid_json(args, timeout=3600, cancel_event=cancel_event)
 
 
 def clear_extra_sources(
     project_json_path: str,
     output_project_json: str,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     args = [
         "clear-extra-sources",
         "--project-json", project_json_path,
         "--output-project-json", output_project_json,
     ]
-    return _run_avid_json(args, timeout=300)
+    return _run_avid_json(args, timeout=300, cancel_event=cancel_event)

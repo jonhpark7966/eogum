@@ -153,7 +153,6 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
         .in_("status", ["pending", "running"])
         .order("created_at", desc=True)
         .limit(1)
-        .maybe_single()
         .execute()
     )
     if existing_reprocess.data:

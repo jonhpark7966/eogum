@@ -1,13 +1,47 @@
+# Dependencies
 node_modules/
-.next/
-.env
-.env.local
-!.env.example
-!.env.local.example
-__pycache__/
-*.pyc
 .venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node / Next.js
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+
+# Build outputs
 dist/
 build/
+coverage/
+
+# Local environment
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Local tool state
+.claude/
 codex-review-logs/
+reviews/
+supabase/.temp/
+
+# Local scratch / generated media
+tmp/
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

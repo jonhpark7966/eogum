@@ -61,6 +61,12 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
+    # Sentry
+    sentry_dsn: str = ""
+    sentry_environment: str = "local"
+    sentry_release: str = ""
+    sentry_traces_sample_rate: float = 0.05
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
     @property

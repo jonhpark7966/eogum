@@ -12,7 +12,12 @@ from eogum.routes import credits, downloads, evaluations, health, projects, uplo
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-init_sentry()
+init_sentry(
+    dsn=settings.sentry_dsn,
+    environment=settings.sentry_environment,
+    release=settings.sentry_release,
+    traces_sample_rate=settings.sentry_traces_sample_rate,
+)
 
 
 @asynccontextmanager

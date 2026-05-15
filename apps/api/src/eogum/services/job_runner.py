@@ -55,27 +55,6 @@ def cancel_reprocess(project_id: str, job_id: str) -> bool:
     return cancelled
 
 
-def mark_reprocess_cancelled(db, job_id: str) -> None:
-    """Mark a reprocess job as cancelled, with a fallback for DBs pending migration."""
-    payload = {
-        "error_message": "멀티캠 적용이 취소되었습니다",
-        "completed_at": "now()",
-    }
-    try:
-        db.table("jobs").update({
-            **payload,
-            "status": "canceled",
-        }).eq("id", job_id).execute()
-    except Exception as exc:
-        if "jobs_status_check" not in str(exc):
-            raise
-        logger.warning("jobs_status_check does not allow canceled yet; falling back to failed for job %s", job_id)
-        db.table("jobs").update({
-            **payload,
-            "status": "failed",
-        }).eq("id", job_id).execute()
-
-
 def _maybe_start_worker() -> None:
     global _running
     with _lock:
@@ -546,7 +525,11 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
         logger.info("Reprocess completed for project %s", project_id)
     except (ReprocessCancelled, avid.AvidCommandCancelled) as exc:
         logger.info("Project reprocess cancelled for project %s", project_id)
-        mark_reprocess_cancelled(db, job_id)
+        db.table("jobs").update({
+            "status": "canceled",
+            "error_message": str(exc)[:1000],
+            "completed_at": "now()",
+        }).eq("id", job_id).execute()
         db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
     except Exception as exc:
         logger.exception("Project reprocess failed for project %s", project_id)

@@ -51,7 +51,21 @@ def create_project(req: ProjectCreate, user_id: str = Depends(get_user_id)):
 def list_projects(user_id: str = Depends(get_user_id)):
     db = get_db()
     result = db.table("projects").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
-    return result.data
+    projects = result.data
+    if not projects:
+        return projects
+
+    project_ids = [project["id"] for project in projects]
+    jobs = db.table("jobs").select("*").in_("project_id", project_ids).order("created_at").execute()
+
+    jobs_by_project: dict[str, list[dict]] = {project_id: [] for project_id in project_ids}
+    for job in jobs.data:
+        jobs_by_project.setdefault(job["project_id"], []).append(job)
+
+    for project in projects:
+        project["jobs"] = jobs_by_project.get(project["id"], [])
+
+    return projects
 
 
 @router.get("/{project_id}", response_model=ProjectDetailResponse)

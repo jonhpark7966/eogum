@@ -40,6 +40,7 @@ export interface Project {
   source_filename: string | null;
   source_duration_seconds: number | null;
   extra_sources: ExtraSource[];
+  jobs?: Job[];
   created_at: string;
   updated_at: string;
 }

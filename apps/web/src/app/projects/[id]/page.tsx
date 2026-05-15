@@ -4,7 +4,7 @@ export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
 import { ProjectUploadStatus, useUploads } from "@/app/_providers/upload-provider";
-import { api, type ProjectDetail } from "@/lib/api";
+import { api, type Job, type ProjectDetail } from "@/lib/api";
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -116,6 +116,67 @@ const JOB_TYPE_LABELS: Record<string, string> = {
   podcast_cut: "편집 처리",
   reprocess_multicam: "멀티캠 적용",
 };
+
+type ProcessingStep = {
+  index: number;
+  title: string;
+  detail: string;
+  done: boolean;
+  current: boolean;
+};
+
+type ProcessingProgressInfo = {
+  title: string;
+  detail: string;
+  steps: ProcessingStep[];
+};
+
+function getProcessingProgressInfo(job: Job): ProcessingProgressInfo {
+  const progress = Math.max(0, Math.min(100, job.progress || 0));
+
+  if (job.type === "reprocess_multicam") {
+    const definitions = [
+      { threshold: 0, title: "작업 대기", detail: "멀티캠 적용 작업을 시작할 준비 중입니다." },
+      { threshold: 5, title: "소스 다운로드", detail: "기존 프로젝트와 멀티캠 소스를 로컬 작업 공간으로 가져오는 중입니다." },
+      { threshold: 25, title: "멀티캠 싱크", detail: "오디오 싱크를 맞추고 멀티캠 타임라인을 다시 구성하는 중입니다." },
+      { threshold: 70, title: "결과 내보내기", detail: "새 프로젝트 파일과 결과물을 생성하는 중입니다." },
+      { threshold: 85, title: "결과 저장", detail: "생성된 결과물을 R2에 저장하고 프로젝트를 갱신하는 중입니다." },
+    ];
+    return buildProcessingProgressInfo(progress, definitions);
+  }
+
+  const definitions = [
+    { threshold: 0, title: "작업 대기", detail: "처리 작업을 시작할 준비 중입니다." },
+    { threshold: 5, title: "원본 다운로드", detail: "업로드된 원본 영상을 R2에서 로컬 작업 공간으로 가져오는 중입니다." },
+    { threshold: 10, title: "음성 전사", detail: "Chalna API로 음성을 텍스트로 변환하고 있습니다." },
+    { threshold: 30, title: "전사 요약", detail: "전사 내용을 바탕으로 전체 흐름과 문맥을 정리하는 중입니다." },
+    { threshold: 50, title: "컷 분석", detail: "편집 타입에 맞춰 자를 구간과 유지할 구간을 분석하는 중입니다." },
+    { threshold: 75, title: "미리보기 생성", detail: "리뷰에 사용할 저용량 미리보기와 결과 파일을 만드는 중입니다." },
+    { threshold: 85, title: "결과 저장", detail: "생성된 결과물을 R2에 업로드하고 리포트를 저장하는 중입니다." },
+  ];
+  return buildProcessingProgressInfo(progress, definitions);
+}
+
+function buildProcessingProgressInfo(
+  progress: number,
+  definitions: { threshold: number; title: string; detail: string }[],
+): ProcessingProgressInfo {
+  let activeIndex = 0;
+  for (let i = 0; i < definitions.length; i += 1) {
+    if (progress >= definitions[i].threshold) activeIndex = i;
+  }
+
+  return {
+    title: definitions[activeIndex].title,
+    detail: definitions[activeIndex].detail,
+    steps: definitions.map((step, index) => ({
+      ...step,
+      index: index + 1,
+      done: index < activeIndex,
+      current: index === activeIndex,
+    })),
+  };
+}
 
 /* ── Section wrapper ── */
 function Section({ title, icon, children, className = "" }: {
@@ -402,26 +463,73 @@ export default function ProjectDetailPage() {
             icon={<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M12 2v4" /><path d="M12 18v4" /><path d="M4.93 4.93l2.83 2.83" /><path d="M16.24 16.24l2.83 2.83" /><path d="M2 12h4" /><path d="M18 12h4" /><path d="M4.93 19.07l2.83-2.83" /><path d="M16.24 7.76l2.83-2.83" /></svg>}
           >
             <div className="space-y-4">
-              {activeJobs.map((job) => (
-                <div key={job.id}>
-                  <div className="flex justify-between text-sm mb-2">
-                    <span className="text-gray-300">{JOB_TYPE_LABELS[job.type] ?? job.type}</span>
-                    <span className="text-gray-500">{job.progress}%</span>
+              {activeJobs.length === 0 && (
+                <div className="rounded-xl border border-white/[0.06] bg-black/20 px-4 py-3">
+                  <div className="mb-2 flex items-center justify-between text-sm">
+                    <span className="font-medium text-gray-300">작업 대기 중</span>
+                    <span className="text-gray-500">0%</span>
                   </div>
-                  <div className="relative h-2 bg-white/[0.05] rounded-full overflow-hidden">
-                    {job.status === "failed" ? (
-                      <div className="absolute inset-y-0 left-0 rounded-full bg-red-500/60" style={{ width: `${job.progress}%` }} />
-                    ) : job.progress < 100 ? (
-                      <>
-                        <div className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-cyan-500/60 to-violet-500/60 transition-all duration-1000" style={{ width: `${job.progress}%` }} />
-                        <div className="absolute inset-y-0 w-1/4 bg-gradient-to-r from-transparent via-white/20 to-transparent rounded-full animate-[shimmer_2s_ease-in-out_infinite]" />
-                      </>
-                    ) : (
-                      <div className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-cyan-500 to-violet-500 w-full" />
-                    )}
+                  <div className="h-2 overflow-hidden rounded-full bg-white/[0.05]">
+                    <div className="h-full w-0 rounded-full bg-gradient-to-r from-cyan-500/60 to-violet-500/60" />
                   </div>
+                  <p className="mt-3 text-xs text-gray-500">
+                    처리 작업이 큐에 등록되었고 곧 시작됩니다.
+                  </p>
                 </div>
-              ))}
+              )}
+
+              {activeJobs.map((job) => {
+                const progressInfo = getProcessingProgressInfo(job);
+                return (
+                  <div key={job.id} className="rounded-xl border border-white/[0.06] bg-black/20 px-4 py-4">
+                    <div className="mb-3 flex items-start justify-between gap-4">
+                      <div>
+                        <p className="text-sm font-medium text-gray-200">{JOB_TYPE_LABELS[job.type] ?? job.type}</p>
+                        <p className="mt-1 text-xs text-gray-500">
+                          {progressInfo.title} - {progressInfo.detail}
+                        </p>
+                      </div>
+                      <span className="shrink-0 font-mono text-sm text-gray-400">{job.progress}%</span>
+                    </div>
+
+                    <div className="relative h-2 overflow-hidden rounded-full bg-white/[0.05]">
+                      {job.status === "failed" ? (
+                        <div className="absolute inset-y-0 left-0 rounded-full bg-red-500/60" style={{ width: `${job.progress}%` }} />
+                      ) : job.progress < 100 ? (
+                        <>
+                          <div className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-cyan-500/60 to-violet-500/60 transition-all duration-1000" style={{ width: `${job.progress}%` }} />
+                          <div className="absolute inset-y-0 w-1/4 rounded-full bg-gradient-to-r from-transparent via-white/20 to-transparent animate-[shimmer_2s_ease-in-out_infinite]" />
+                        </>
+                      ) : (
+                        <div className="absolute inset-y-0 left-0 w-full rounded-full bg-gradient-to-r from-cyan-500 to-violet-500" />
+                      )}
+                    </div>
+
+                    <div className="mt-4 rounded-lg border border-gray-800 bg-black/30 p-3">
+                      <div className="mb-2 flex items-center justify-between">
+                        <p className="text-xs font-medium text-gray-300">진행 로그</p>
+                        <p className="text-xs text-gray-500">{progressInfo.steps.length} steps</p>
+                      </div>
+                      <div className="space-y-1 font-mono text-xs leading-relaxed">
+                        {progressInfo.steps.map((step) => (
+                          <p
+                            key={step.index}
+                            className={
+                              step.current
+                                ? "text-cyan-300"
+                                : step.done
+                                  ? "text-gray-500"
+                                  : "text-gray-700"
+                            }
+                          >
+                            [{step.index}/{progressInfo.steps.length}] {step.done ? "완료" : step.current ? "진행 중" : "대기"} - {step.title}
+                          </p>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
               {activeReprocessJob && (
                 <div className="flex items-center justify-between gap-4 rounded-xl border border-red-500/10 bg-red-500/[0.04] px-4 py-3">
                   <div>

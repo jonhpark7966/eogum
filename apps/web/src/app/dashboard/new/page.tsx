@@ -3,7 +3,7 @@
 export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
-import { api, uploadFile, YouTubeInfoResponse } from "@/lib/api";
+import { api, uploadFile, type UploadProgressDetail, YouTubeInfoResponse } from "@/lib/api";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -23,6 +23,7 @@ export default function NewProjectPage() {
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
+  const [uploadLogs, setUploadLogs] = useState<string[]>([]);
   const [error, setError] = useState("");
 
   // File upload state
@@ -38,6 +39,9 @@ export default function NewProjectPage() {
     const selected = e.target.files?.[0];
     if (!selected) return;
     setFile(selected);
+    setUploadProgress(0);
+    setProgressLabel("");
+    setUploadLogs([]);
     if (!name) {
       setName(selected.name.replace(/\.[^.]+$/, ""));
     }
@@ -70,6 +74,52 @@ export default function NewProjectPage() {
     if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
     return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
   };
+
+  const appendUploadLog = useCallback((message: string) => {
+    const timestamp = new Date().toLocaleTimeString("ko-KR", { hour12: false });
+    setUploadLogs((prev) => [...prev, `${timestamp} ${message}`].slice(-80));
+  }, []);
+
+  const handleUploadProgressDetail = useCallback((loaded: number, total: number, detail?: UploadProgressDetail) => {
+    setUploadProgress(5 + Math.round((loaded / total) * 85));
+    if (!detail) return;
+
+    if (detail.phase === "initiated") {
+      appendUploadLog(`[3/5] 업로드 세션 생성 완료 - ${detail.totalParts}개 part, part 크기 ${formatBytes(detail.partSize)}`);
+      return;
+    }
+
+    if (detail.phase === "part_attempt") {
+      appendUploadLog(
+        `[4/5][${detail.partNumber}/${detail.totalParts}] part 업로드 시작` +
+          (detail.attempt > 1 ? ` - 재시도 ${detail.attempt}/${detail.maxAttempts}` : "")
+      );
+      return;
+    }
+
+    if (detail.phase === "part_retry") {
+      appendUploadLog(
+        `[4/5][${detail.partNumber}/${detail.totalParts}] 실패: ${detail.error}. ${detail.delayMs / 1000}초 후 재시도`
+      );
+      return;
+    }
+
+    if (detail.phase === "part_complete") {
+      appendUploadLog(
+        `[4/5][${detail.completedParts}/${detail.totalParts}] part ${detail.partNumber} 완료 - ${formatBytes(loaded)} / ${formatBytes(total)}`
+      );
+      return;
+    }
+
+    if (detail.phase === "completing") {
+      appendUploadLog(`[4/5] ${detail.totalParts}개 part 업로드 완료, R2 multipart 완료 요청 중`);
+      return;
+    }
+
+    if (detail.phase === "completed") {
+      appendUploadLog("[4/5] R2 업로드 완료");
+    }
+  }, [appendUploadLog]);
 
   // Fetch YouTube info when URL changes
   const fetchYoutubeInfo = async () => {
@@ -178,22 +228,28 @@ export default function NewProjectPage() {
 
     setError("");
     setUploading(true);
+    setUploadProgress(0);
     setProgressLabel("업로드 중...");
+    setUploadLogs([]);
+    appendUploadLog(`[1/5] 세션 확인 중 - ${file.name} (${formatBytes(file.size)})`);
 
     try {
       const { data: { session } } = await supabase.auth.getSession();
       if (!session) throw new Error("로그인이 필요합니다");
       const token = session.access_token;
+      appendUploadLog("[1/5] 세션 확인 완료");
 
+      appendUploadLog("[2/5] 영상 메타데이터 분석 중");
       const duration = await getVideoDuration(file);
+      appendUploadLog(`[2/5] 영상 메타데이터 분석 완료 - 길이 ${formatDuration(duration)}`);
 
       setUploadProgress(5);
-      const r2Key = await uploadFile(token, file, (loaded, total) => {
-        setUploadProgress(5 + Math.round((loaded / total) * 85));
-      });
+      appendUploadLog("[3/5] R2 multipart 업로드 세션 생성 중");
+      const r2Key = await uploadFile(token, file, handleUploadProgressDetail);
 
       setUploadProgress(95);
       setProgressLabel("프로젝트 생성 중...");
+      appendUploadLog("[5/5] 프로젝트 생성 요청 중");
 
       const projectSettings: Record<string, unknown> = {};
       if (context.trim()) {
@@ -211,9 +267,12 @@ export default function NewProjectPage() {
       });
 
       setUploadProgress(100);
+      appendUploadLog("[5/5] 프로젝트 생성 완료, 프로젝트 화면으로 이동합니다");
       router.push(`/projects/${project.id}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "오류가 발생했습니다");
+      const message = err instanceof Error ? err.message : "오류가 발생했습니다";
+      appendUploadLog(`[오류] ${message}`);
+      setError(message);
       setUploading(false);
       setUploadProgress(0);
       setProgressLabel("");
@@ -444,11 +503,35 @@ export default function NewProjectPage() {
           </button>
 
           {uploading && (
-            <div className="w-full bg-gray-800 rounded-full h-2">
-              <div
-                className="bg-white h-2 rounded-full transition-all duration-300"
-                style={{ width: `${uploadProgress}%` }}
-              />
+            <div className="space-y-3">
+              <div>
+                <div className="flex items-center justify-between text-xs text-gray-400 mb-2">
+                  <span>{progressLabel || "진행 중..."}</span>
+                  <span>{uploadProgress}%</span>
+                </div>
+                <div className="w-full bg-gray-800 rounded-full h-2">
+                  <div
+                    className="bg-white h-2 rounded-full transition-all duration-300"
+                    style={{ width: `${uploadProgress}%` }}
+                  />
+                </div>
+              </div>
+
+              {sourceMode === "file" && uploadLogs.length > 0 && (
+                <div className="rounded-lg border border-gray-800 bg-black/40 p-3">
+                  <div className="mb-2 flex items-center justify-between">
+                    <p className="text-xs font-medium text-gray-300">업로드 로그</p>
+                    <p className="text-xs text-gray-500">{uploadLogs.length} lines</p>
+                  </div>
+                  <div className="max-h-48 space-y-1 overflow-y-auto font-mono text-xs leading-relaxed text-gray-400">
+                    {uploadLogs.map((line, index) => (
+                      <p key={`${line}-${index}`} className="whitespace-pre-wrap break-words">
+                        {line}
+                      </p>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </form>

@@ -413,6 +413,14 @@ const UPLOAD_CONCURRENCY = 3;
 const PART_UPLOAD_MAX_ATTEMPTS = 3;
 const PART_UPLOAD_INITIAL_RETRY_DELAY_MS = 1000;
 
+export type UploadProgressDetail =
+  | { phase: "initiated"; totalParts: number; partSize: number }
+  | { phase: "part_attempt"; partNumber: number; totalParts: number; attempt: number; maxAttempts: number }
+  | { phase: "part_retry"; partNumber: number; totalParts: number; attempt: number; maxAttempts: number; delayMs: number; error: string }
+  | { phase: "part_complete"; partNumber: number; totalParts: number; completedParts: number }
+  | { phase: "completing"; totalParts: number }
+  | { phase: "completed"; totalParts: number };
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -427,10 +435,26 @@ function shouldRetryPartUpload(error: unknown): boolean {
   return status === 408 || status === 429 || status >= 500;
 }
 
-async function uploadPartWithRetry(partNumber: number, uploadUrl: string, chunk: Blob): Promise<Response> {
+async function uploadPartWithRetry(
+  partNumber: number,
+  uploadUrl: string,
+  chunk: Blob,
+  totalParts: number,
+  onProgress?: (loaded: number, total: number, detail?: UploadProgressDetail) => void,
+  currentLoaded = 0,
+  totalSize = 0
+): Promise<Response> {
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= PART_UPLOAD_MAX_ATTEMPTS; attempt += 1) {
+    onProgress?.(currentLoaded, totalSize, {
+      phase: "part_attempt",
+      partNumber,
+      totalParts,
+      attempt,
+      maxAttempts: PART_UPLOAD_MAX_ATTEMPTS,
+    });
+
     try {
       const resp = await fetch(uploadUrl, {
         method: "PUT",
@@ -448,6 +472,16 @@ async function uploadPartWithRetry(partNumber: number, uploadUrl: string, chunk:
       }
 
       const delayMs = PART_UPLOAD_INITIAL_RETRY_DELAY_MS * 2 ** (attempt - 1);
+      const detail = error instanceof Error ? error.message : String(error);
+      onProgress?.(currentLoaded, totalSize, {
+        phase: "part_retry",
+        partNumber,
+        totalParts,
+        attempt,
+        maxAttempts: PART_UPLOAD_MAX_ATTEMPTS,
+        delayMs,
+        error: detail,
+      });
       await sleep(delayMs);
     }
   }
@@ -459,7 +493,7 @@ async function uploadPartWithRetry(partNumber: number, uploadUrl: string, chunk:
 export async function uploadFile(
   token: string,
   file: File,
-  onProgress?: (loaded: number, total: number) => void
+  onProgress?: (loaded: number, total: number, detail?: UploadProgressDetail) => void
 ): Promise<string> {
   const contentType = file.type || "video/mp4";
 
@@ -472,6 +506,8 @@ export async function uploadFile(
   const { part_urls, part_size, upload_id, r2_key } = initResp;
   const completedParts: { part_number: number; etag: string }[] = [];
   let totalUploaded = 0;
+  let completedPartCount = 0;
+  onProgress?.(0, file.size, { phase: "initiated", totalParts: part_urls.length, partSize: part_size });
 
   for (let i = 0; i < part_urls.length; i += UPLOAD_CONCURRENCY) {
     const batch = part_urls.slice(i, i + UPLOAD_CONCURRENCY);
@@ -481,11 +517,25 @@ export async function uploadFile(
         const end = Math.min(start + part_size, file.size);
         const chunk = file.slice(start, end);
 
-        const resp = await uploadPartWithRetry(part.part_number, part.upload_url, chunk);
+        const resp = await uploadPartWithRetry(
+          part.part_number,
+          part.upload_url,
+          chunk,
+          part_urls.length,
+          onProgress,
+          totalUploaded,
+          file.size
+        );
 
         const etag = resp.headers.get("ETag") || "";
         totalUploaded += end - start;
-        onProgress?.(totalUploaded, file.size);
+        completedPartCount += 1;
+        onProgress?.(totalUploaded, file.size, {
+          phase: "part_complete",
+          partNumber: part.part_number,
+          totalParts: part_urls.length,
+          completedParts: completedPartCount,
+        });
         return { part_number: part.part_number, etag };
       })
     );
@@ -493,6 +543,8 @@ export async function uploadFile(
   }
 
   completedParts.sort((a, b) => a.part_number - b.part_number);
+  onProgress?.(totalUploaded, file.size, { phase: "completing", totalParts: part_urls.length });
   await api.completeMultipart(token, { r2_key, upload_id, parts: completedParts });
+  onProgress?.(file.size, file.size, { phase: "completed", totalParts: part_urls.length });
   return r2_key;
 }

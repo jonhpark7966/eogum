@@ -7,7 +7,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from eogum.config import settings
 
@@ -45,6 +45,7 @@ def _run_avid(
     args: list[str],
     timeout: int = 3600,
     cancel_event: threading.Event | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run an avid-cli command."""
     cmd = [str(settings.resolved_avid_bin)] + args
@@ -59,26 +60,52 @@ def _run_avid(
         text=True,
         env=_build_avid_env(),
     )
-    while True:
-        try:
-            stdout, stderr = process.communicate(timeout=0.5)
-            break
-        except subprocess.TimeoutExpired:
-            if cancel_event and cancel_event.is_set():
-                process.terminate()
-                try:
-                    stdout, stderr = process.communicate(timeout=10)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    stdout, stderr = process.communicate()
-                raise AvidCommandCancelled(
-                    f"avid-cli command cancelled: stdout={stdout[-500:] if stdout else ''} "
-                    f"stderr={stderr[-500:] if stderr else ''}"
-                )
-            if time.monotonic() - started_at > timeout:
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    def _read_stream(stream, chunks: list[str]) -> None:
+        if not stream:
+            return
+        for line in stream:
+            chunks.append(line)
+            if on_output:
+                on_output(line.rstrip())
+
+    stdout_thread = threading.Thread(target=_read_stream, args=(process.stdout, stdout_chunks), daemon=True)
+    stderr_thread = threading.Thread(target=_read_stream, args=(process.stderr, stderr_chunks), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+
+    while process.poll() is None:
+        if cancel_event and cancel_event.is_set():
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
                 process.kill()
-                stdout, stderr = process.communicate()
-                raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+                process.wait()
+            stdout_thread.join(timeout=1)
+            stderr_thread.join(timeout=1)
+            stdout = "".join(stdout_chunks)
+            stderr = "".join(stderr_chunks)
+            raise AvidCommandCancelled(
+                f"avid-cli command cancelled: stdout={stdout[-500:] if stdout else ''} "
+                f"stderr={stderr[-500:] if stderr else ''}"
+            )
+        if time.monotonic() - started_at > timeout:
+            process.kill()
+            process.wait()
+            stdout_thread.join(timeout=1)
+            stderr_thread.join(timeout=1)
+            stdout = "".join(stdout_chunks)
+            stderr = "".join(stderr_chunks)
+            raise subprocess.TimeoutExpired(cmd, timeout, output=stdout, stderr=stderr)
+        time.sleep(0.5)
+
+    stdout_thread.join(timeout=1)
+    stderr_thread.join(timeout=1)
+    stdout = "".join(stdout_chunks)
+    stderr = "".join(stderr_chunks)
 
     result = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
@@ -95,11 +122,12 @@ def _run_avid_json(
     args: list[str],
     timeout: int = 3600,
     cancel_event: threading.Event | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     if "--json" not in args:
         args = [*args, "--json"]
 
-    result = _run_avid(args, timeout=timeout, cancel_event=cancel_event)
+    result = _run_avid(args, timeout=timeout, cancel_event=cancel_event, on_output=on_output)
     stdout = result.stdout.strip()
 
     try:
@@ -159,7 +187,13 @@ def doctor(provider: str | None = None, probe_providers: bool = False) -> dict[s
     return _run_avid_json(args, timeout=30)
 
 
-def transcribe(source_path: str, language: str = "ko", output_dir: str | None = None, context: str | None = None) -> str:
+def transcribe(
+    source_path: str,
+    language: str = "ko",
+    output_dir: str | None = None,
+    context: str | None = None,
+    on_output: Callable[[str], None] | None = None,
+) -> str:
     """Run avid transcribe. Returns path to generated SRT file."""
     args = [
         "transcribe", source_path,
@@ -172,7 +206,7 @@ def transcribe(source_path: str, language: str = "ko", output_dir: str | None = 
     if context:
         args += ["--context", context]
 
-    payload = _run_avid_json(args, timeout=7200)
+    payload = _run_avid_json(args, timeout=7200, on_output=on_output)
     return _artifact(payload, "srt")
 
 

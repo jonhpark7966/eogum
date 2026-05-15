@@ -2,7 +2,9 @@
 
 import json
 import logging
+import re
 import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -13,6 +15,7 @@ from eogum.services import avid, credit, email, r2
 from eogum.services.database import get_db
 
 logger = logging.getLogger(__name__)
+AVID_PROGRESS_RE = re.compile(r"(\d{1,3})%")
 
 _queue: deque[dict[str, str | None]] = deque()
 _running = False
@@ -124,6 +127,8 @@ def _process_project(project_id: str) -> None:
     duration = 0
     job_id = None
     credits_held = False
+    last_transcribe_progress = 10
+    last_transcribe_update_at = 0.0
 
     try:
         # Load project
@@ -176,7 +181,30 @@ def _process_project(project_id: str) -> None:
 
         # 3. Transcribe
         transcription_context = (project.get("settings") or {}).get("transcription_context")
-        srt_path = avid.transcribe(source_path, language=project["language"], output_dir=str(temp_dir), context=transcription_context)
+
+        def _handle_transcribe_output(line: str) -> None:
+            nonlocal last_transcribe_progress, last_transcribe_update_at
+            match = AVID_PROGRESS_RE.search(line)
+            if not match:
+                return
+
+            raw_progress = min(100, max(0, int(match.group(1))))
+            mapped_progress = min(29, 10 + round(raw_progress * 0.19))
+            now = time.monotonic()
+            if mapped_progress <= last_transcribe_progress and now - last_transcribe_update_at < 10:
+                return
+
+            last_transcribe_progress = mapped_progress
+            last_transcribe_update_at = now
+            _update_progress(db, job_id, mapped_progress)
+
+        srt_path = avid.transcribe(
+            source_path,
+            language=project["language"],
+            output_dir=str(temp_dir),
+            context=transcription_context,
+            on_output=_handle_transcribe_output,
+        )
         _update_progress(db, job_id, 30)
 
         # 4. Transcript overview (Pass 1)

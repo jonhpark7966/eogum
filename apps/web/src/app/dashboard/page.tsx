@@ -6,7 +6,7 @@ import { createClient } from "@/lib/supabase/client";
 import { api, type CreditBalance, type Project } from "@/lib/api";
 import type { MouseEvent } from "react";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Image from "next/image";
 
 function formatDuration(seconds: number): string {
@@ -14,6 +14,36 @@ function formatDuration(seconds: number): string {
   const m = Math.floor((seconds % 3600) / 60);
   if (h > 0) return `${h}시간 ${m}분`;
   return `${m}분`;
+}
+
+function getProjectDateKey(project: Project): string {
+  const createdAt = new Date(project.created_at);
+  const year = createdAt.getFullYear();
+  const month = String(createdAt.getMonth() + 1).padStart(2, "0");
+  const day = String(createdAt.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function formatProjectDateLabel(dateKey: string): string {
+  const [, month, day] = dateKey.split("-");
+  return `${Number(month)}월 ${Number(day)}일`;
+}
+
+function getProjectDateGroups(projects: Project[]): { key: string; label: string; projects: Project[] }[] {
+  const groups = new Map<string, Project[]>();
+
+  for (const project of projects) {
+    const key = getProjectDateKey(project);
+    groups.set(key, [...(groups.get(key) ?? []), project]);
+  }
+
+  return Array.from(groups.entries())
+    .sort(([a], [b]) => b.localeCompare(a))
+    .map(([key, groupProjects]) => ({
+      key,
+      label: formatProjectDateLabel(key),
+      projects: groupProjects,
+    }));
 }
 
 const STATUS_CONFIG: Record<string, { label: string; color: string; icon: string; bg: string }> = {
@@ -210,6 +240,7 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [retryingId, setRetryingId] = useState<string | null>(null);
+  const [selectedDateKey, setSelectedDateKey] = useState<string | null>(null);
 
   const handleRetry = async (e: MouseEvent, projectId: string) => {
     e.stopPropagation();
@@ -256,6 +287,9 @@ export default function DashboardPage() {
     const interval = setInterval(loadData, 10000);
     return () => clearInterval(interval);
   }, [loadData]);
+
+  const projectDateGroups = useMemo(() => getProjectDateGroups(projects), [projects]);
+  const selectedDateGroup = projectDateGroups.find((group) => group.key === selectedDateKey) ?? projectDateGroups[0] ?? null;
 
   const handleLogout = async () => {
     await supabase.auth.signOut();
@@ -337,16 +371,37 @@ export default function DashboardPage() {
         {projects.length === 0 ? (
           <EmptyState onNew={() => router.push("/dashboard/new")} />
         ) : (
-          <div className="space-y-3">
-            {projects.map((project) => (
-              <ProjectCard
-                key={project.id}
-                project={project}
-                onRetry={(e) => handleRetry(e, project.id)}
-                retrying={retryingId === project.id}
-                onClick={() => router.push(`/projects/${project.id}`)}
-              />
-            ))}
+          <div>
+            <div className="mb-5 flex gap-2 overflow-x-auto pb-1">
+              {projectDateGroups.map((group) => {
+                const isSelected = group.key === selectedDateGroup?.key;
+                return (
+                  <button
+                    key={group.key}
+                    type="button"
+                    onClick={() => setSelectedDateKey(group.key)}
+                    className={`shrink-0 rounded-full border px-4 py-2 text-sm font-medium transition-colors ${
+                      isSelected
+                        ? "border-cyan-500/30 bg-cyan-500/10 text-cyan-300"
+                        : "border-white/[0.06] bg-white/[0.02] text-gray-400 hover:border-white/[0.12] hover:bg-white/[0.05] hover:text-gray-200"
+                    }`}
+                  >
+                    {group.label}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="space-y-3">
+              {(selectedDateGroup?.projects ?? []).map((project) => (
+                <ProjectCard
+                  key={project.id}
+                  project={project}
+                  onRetry={(e) => handleRetry(e, project.id)}
+                  retrying={retryingId === project.id}
+                  onClick={() => router.push(`/projects/${project.id}`)}
+                />
+              ))}
+            </div>
           </div>
         )}
       </main>

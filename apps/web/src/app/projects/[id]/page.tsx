@@ -11,6 +11,25 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import Image from "next/image";
 
+interface ReportSummaryRow {
+  label: string;
+  count: string;
+  duration: string;
+  isTotal: boolean;
+}
+
+interface ReportDetailSection {
+  title: string;
+  count: number;
+  markdown: string;
+}
+
+interface ParsedEditReportMarkdown {
+  intro: string;
+  summaryRows: ReportSummaryRow[];
+  detailSections: ReportDetailSection[];
+}
+
 function formatDuration(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -25,18 +44,64 @@ function formatSize(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function splitEditReportMarkdown(markdown: string): { summary: string; details: string } {
+function stripMarkdownEmphasis(value: string): string {
+  return value.replace(/\*\*/g, "").trim();
+}
+
+function parseEditReportMarkdown(markdown: string): ParsedEditReportMarkdown {
   const lines = markdown.split("\n");
   const detailStartIndex = lines.findIndex((line) => /^## (?!요약\b).+ \(\d+개\)\s*$/.test(line));
+  const summaryLines = detailStartIndex === -1 ? lines : lines.slice(0, detailStartIndex);
+  const summaryTitleIndex = summaryLines.findIndex((line) => line.trim() === "## 요약");
+  const intro = summaryTitleIndex === -1 ? summaryLines.join("\n").trimEnd() : summaryLines.slice(0, summaryTitleIndex).join("\n").trimEnd();
+  const summaryRows = summaryLines
+    .slice(summaryTitleIndex === -1 ? 0 : summaryTitleIndex + 1)
+    .map((line) => line.match(/^\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|$/))
+    .filter((match): match is RegExpMatchArray => Boolean(match))
+    .map((match) => ({
+      label: stripMarkdownEmphasis(match[1]),
+      count: stripMarkdownEmphasis(match[2]),
+      duration: stripMarkdownEmphasis(match[3]),
+      isTotal: stripMarkdownEmphasis(match[1]) === "합계",
+    }))
+    .filter((row) => row.label !== "유형" && !/^-+$/.test(row.label));
 
   if (detailStartIndex === -1) {
-    return { summary: markdown, details: "" };
+    return { intro, summaryRows, detailSections: [] };
   }
 
-  return {
-    summary: lines.slice(0, detailStartIndex).join("\n").trimEnd(),
-    details: lines.slice(detailStartIndex).join("\n").trimStart(),
-  };
+  const detailSections: ReportDetailSection[] = [];
+  let currentTitle = "";
+  let currentCount = 0;
+  let currentLines: string[] = [];
+
+  for (const line of lines.slice(detailStartIndex)) {
+    const sectionMatch = line.match(/^## (.+) \((\d+)개\)\s*$/);
+    if (sectionMatch) {
+      if (currentLines.length > 0) {
+        detailSections.push({
+          title: currentTitle,
+          count: currentCount,
+          markdown: currentLines.join("\n").trim(),
+        });
+      }
+      currentTitle = sectionMatch[1];
+      currentCount = Number(sectionMatch[2]);
+      currentLines = [line];
+      continue;
+    }
+    currentLines.push(line);
+  }
+
+  if (currentLines.length > 0) {
+    detailSections.push({
+      title: currentTitle,
+      count: currentCount,
+      markdown: currentLines.join("\n").trim(),
+    });
+  }
+
+  return { intro, summaryRows, detailSections };
 }
 
 const STATUS_CONFIG: Record<string, { label: string; color: string; icon: string; bg: string }> = {
@@ -81,6 +146,7 @@ export default function ProjectDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [retrying, setRetrying] = useState(false);
+  const [selectedReportReason, setSelectedReportReason] = useState("무음");
   const { enqueueExtraSources, jobsFor } = useUploads();
 
   // Multicam state
@@ -88,6 +154,7 @@ export default function ProjectDetailPage() {
   const [multicamProcessing, setMulticamProcessing] = useState(false);
   const [cancelingMulticam, setCancelingMulticam] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const reportDetailsRef = useRef<HTMLDivElement>(null);
   const loadedUploadJobIdsRef = useRef<Set<string>>(new Set());
 
   const projectId = params.id as string;
@@ -127,6 +194,10 @@ export default function ProjectDetailPage() {
     }
     loadProject();
   }, [loadProject, uploadJobs]);
+
+  useEffect(() => {
+    reportDetailsRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+  }, [selectedReportReason]);
 
   const handleRetry = async () => {
     const { data: { session } } = await supabase.auth.getSession();
@@ -239,7 +310,20 @@ export default function ProjectDetailPage() {
   const activeReprocessJob = project.jobs.find(
     (job) => job.type === "reprocess_multicam" && (job.status === "pending" || job.status === "running")
   );
-  const reportMarkdown = project.report ? splitEditReportMarkdown(project.report.report_markdown) : null;
+  const reportMarkdown = project.report ? parseEditReportMarkdown(project.report.report_markdown) : null;
+  const selectableReportRows = reportMarkdown?.summaryRows.filter((row) => !row.isTotal) ?? [];
+  const selectedReportSection =
+    reportMarkdown?.detailSections.find((section) => section.title === selectedReportReason) ??
+    reportMarkdown?.detailSections.find((section) => section.title === "무음") ??
+    reportMarkdown?.detailSections[0] ??
+    null;
+  const handleSelectReportReason = (reason: string) => {
+    setSelectedReportReason(reason);
+    window.requestAnimationFrame(() => {
+      reportDetailsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      reportDetailsRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  };
 
   return (
     <div className="min-h-screen bg-[#030712] text-white dot-grid">
@@ -609,13 +693,7 @@ export default function ProjectDetailPage() {
 
             {/* Markdown */}
             <div className="prose prose-invert prose-sm max-w-none
-              [&_table]:w-full [&_table]:border-collapse
-              [&_th]:bg-white/[0.04] [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:text-xs [&_th]:font-medium [&_th]:text-gray-400 [&_th]:border-b [&_th]:border-white/[0.06]
-              [&_td]:px-3 [&_td]:py-2 [&_td]:text-sm [&_td]:border-b [&_td]:border-white/[0.04]
-              [&_tr:hover]:bg-white/[0.02]
               [&_h1]:text-lg [&_h1]:font-bold [&_h1]:mb-3 [&_h1]:mt-6
-              [&_h2]:text-base [&_h2]:font-semibold [&_h2]:mb-2 [&_h2]:mt-5
-              [&_h3]:text-sm [&_h3]:font-semibold [&_h3]:mb-2 [&_h3]:mt-4
               [&_p]:text-gray-400 [&_p]:text-sm [&_p]:leading-relaxed
               [&_strong]:text-gray-200
               [&_code]:bg-white/[0.04] [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-xs
@@ -623,11 +701,55 @@ export default function ProjectDetailPage() {
               [&_ol]:text-sm [&_ol]:text-gray-400
             ">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {reportMarkdown?.summary ?? project.report.report_markdown}
+                {reportMarkdown?.intro ?? project.report.report_markdown}
               </ReactMarkdown>
             </div>
-            {reportMarkdown?.details && (
-              <div className="mt-6 max-h-[560px] overflow-y-auto overscroll-contain rounded-xl border border-white/[0.06] bg-white/[0.015] px-4 py-1 pr-3">
+            {reportMarkdown && reportMarkdown.summaryRows.length > 0 && (
+              <div className="mt-5">
+                <h2 className="mb-2 text-base font-semibold">요약</h2>
+                <div className="overflow-hidden rounded-xl border border-white/[0.06]">
+                  <table className="w-full border-collapse text-sm">
+                    <thead className="bg-white/[0.04] text-left text-xs font-medium text-gray-400">
+                      <tr>
+                        <th className="border-b border-white/[0.06] px-3 py-2">유형</th>
+                        <th className="border-b border-white/[0.06] px-3 py-2">개수</th>
+                        <th className="border-b border-white/[0.06] px-3 py-2">총 시간</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {reportMarkdown.summaryRows.map((row) => {
+                        const isSelected = selectedReportSection?.title === row.label;
+                        return (
+                          <tr key={row.label} className={row.isTotal ? "bg-white/[0.025] font-semibold text-gray-200" : "hover:bg-white/[0.02]"}>
+                            <td className="border-b border-white/[0.04] px-3 py-2">
+                              {row.isTotal ? (
+                                <span>{row.label}</span>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => handleSelectReportReason(row.label)}
+                                  className={`rounded-md px-2 py-1 text-left font-medium transition-colors ${
+                                    isSelected
+                                      ? "bg-cyan-500/10 text-cyan-300"
+                                      : "text-gray-300 hover:bg-white/[0.05] hover:text-white"
+                                  }`}
+                                >
+                                  {row.label}
+                                </button>
+                              )}
+                            </td>
+                            <td className="border-b border-white/[0.04] px-3 py-2 text-gray-400">{row.count}</td>
+                            <td className="border-b border-white/[0.04] px-3 py-2 text-gray-400">{row.duration}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+            {selectedReportSection && selectableReportRows.length > 0 && (
+              <div ref={reportDetailsRef} className="mt-6 max-h-[560px] overflow-y-auto overscroll-contain rounded-xl border border-white/[0.06] bg-white/[0.015] px-4 py-1 pr-3">
                 <div className="prose prose-invert prose-sm max-w-none
                   [&_h2]:sticky [&_h2]:top-0 [&_h2]:z-10 [&_h2]:-mx-4 [&_h2]:mt-0 [&_h2]:mb-3 [&_h2]:border-b [&_h2]:border-white/[0.06] [&_h2]:bg-[#080d17] [&_h2]:px-4 [&_h2]:py-3 [&_h2]:text-base [&_h2]:font-semibold
                   [&_h3]:text-sm [&_h3]:font-semibold [&_h3]:mb-2 [&_h3]:mt-4
@@ -636,7 +758,7 @@ export default function ProjectDetailPage() {
                   [&_ul]:text-sm [&_ul]:text-gray-400
                 ">
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                    {reportMarkdown.details}
+                    {selectedReportSection.markdown}
                   </ReactMarkdown>
                 </div>
               </div>

@@ -1,4 +1,5 @@
 import json
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
@@ -15,6 +16,7 @@ from eogum.services.job_runner import cancel_reprocess, enqueue, enqueue_reproce
 from eogum.services.r2 import download_to_bytes
 
 router = APIRouter(prefix="/projects", tags=["projects"])
+logger = logging.getLogger(__name__)
 
 
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
@@ -55,15 +57,31 @@ def list_projects(user_id: str = Depends(get_user_id)):
     if not projects:
         return projects
 
-    project_ids = [project["id"] for project in projects]
-    jobs = db.table("jobs").select("*").in_("project_id", project_ids).order("created_at").execute()
+    active_jobs_by_project: dict[str, dict] = {}
+    active_project_ids = [
+        project["id"]
+        for project in projects
+        if project["status"] in ("queued", "processing")
+    ]
 
-    jobs_by_project: dict[str, list[dict]] = {project_id: [] for project_id in project_ids}
-    for job in jobs.data:
-        jobs_by_project.setdefault(job["project_id"], []).append(job)
+    if active_project_ids:
+        try:
+            jobs = (
+                db.table("jobs")
+                .select("id,project_id,type,status,progress,error_message,started_at,completed_at,created_at")
+                .in_("project_id", active_project_ids)
+                .in_("status", ["pending", "running"])
+                .order("created_at", desc=True)
+                .execute()
+            )
+
+            for job in jobs.data:
+                active_jobs_by_project.setdefault(job["project_id"], job)
+        except Exception:
+            logger.exception("Failed to load active project jobs for dashboard list")
 
     for project in projects:
-        project["jobs"] = jobs_by_project.get(project["id"], [])
+        project["active_job"] = active_jobs_by_project.get(project["id"])
 
     return projects
 

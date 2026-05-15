@@ -121,7 +121,7 @@ function ProjectCard({
   const isProcessing = project.status === "processing" || project.status === "queued";
   const isFailed = project.status === "failed";
   const isCompleted = project.status === "completed";
-  const activeJobs = (project.jobs ?? []).filter((job) => job.status === "pending" || job.status === "running");
+  const activeJob = project.active_job;
   const cutTypeLabel = project.cut_type === "subtitle_cut" ? "강의/설명" : "팟캐스트";
   const cutTypeIcon = project.cut_type === "subtitle_cut" ? (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-gray-500">
@@ -190,7 +190,7 @@ function ProjectCard({
         {/* Processing status */}
         {isProcessing && (
           <div className="mt-4 space-y-3">
-            {activeJobs.length === 0 && (
+            {!activeJob && (
               <div>
                 <div className="relative h-2 overflow-hidden rounded-full bg-white/[0.05]">
                   <div className="h-full w-0 rounded-full bg-gradient-to-r from-cyan-500/60 to-violet-500/60" />
@@ -198,25 +198,20 @@ function ProjectCard({
               </div>
             )}
 
-            {activeJobs.map((job) => {
-              const progress = Math.max(0, Math.min(100, job.progress || 0));
-              return (
-                <div key={job.id}>
-                  <div className="relative h-2 overflow-hidden rounded-full bg-white/[0.05]">
-                    {job.status === "failed" ? (
-                      <div className="absolute inset-y-0 left-0 rounded-full bg-red-500/60" style={{ width: `${progress}%` }} />
-                    ) : progress < 100 ? (
-                      <>
-                        <div className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-cyan-500/60 to-violet-500/60 transition-all duration-1000" style={{ width: `${progress}%` }} />
-                        <div className="absolute inset-y-0 w-1/4 rounded-full bg-gradient-to-r from-transparent via-white/20 to-transparent animate-[shimmer_2s_ease-in-out_infinite]" />
-                      </>
-                    ) : (
-                      <div className="absolute inset-y-0 left-0 w-full rounded-full bg-gradient-to-r from-cyan-500 to-violet-500" />
-                    )}
-                  </div>
+            {activeJob && (
+              <div>
+                <div className="relative h-2 overflow-hidden rounded-full bg-white/[0.05]">
+                  {activeJob.progress < 100 ? (
+                    <>
+                      <div className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-cyan-500/60 to-violet-500/60 transition-all duration-1000" style={{ width: `${activeJob.progress}%` }} />
+                      <div className="absolute inset-y-0 w-1/4 rounded-full bg-gradient-to-r from-transparent via-white/20 to-transparent animate-[shimmer_2s_ease-in-out_infinite]" />
+                    </>
+                  ) : (
+                    <div className="absolute inset-y-0 left-0 w-full rounded-full bg-gradient-to-r from-cyan-500 to-violet-500" />
+                  )}
                 </div>
-              );
-            })}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -297,20 +292,7 @@ export default function DashboardPage() {
         api.listProjects(token),
         api.getCredits(token),
       ]);
-      const activeProjects = projectList.filter((project) => project.status === "processing" || project.status === "queued");
-      const activeProjectDetails = await Promise.allSettled(
-        activeProjects.map((project) => api.getProject(token, project.id)),
-      );
-      const jobsByProject = new Map(
-        activeProjectDetails
-          .filter((result) => result.status === "fulfilled")
-          .map((result) => [result.value.id, result.value.jobs] as const),
-      );
-
-      setProjects(projectList.map((project) => ({
-        ...project,
-        jobs: jobsByProject.get(project.id) ?? project.jobs,
-      })));
+      setProjects(projectList);
       setCredits(creditBalance);
       setError(null);
     } catch (e) {

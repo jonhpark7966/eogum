@@ -48,7 +48,7 @@ class ProjectResponse(BaseModel):
     source_filename: str | None
     source_duration_seconds: int | None
     extra_sources: list[dict] = []
-    jobs: list["JobResponse"] = []
+    active_job: "JobResponse | None" = None
     created_at: datetime
     updated_at: datetime
 

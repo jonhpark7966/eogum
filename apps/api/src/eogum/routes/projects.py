@@ -11,7 +11,7 @@ from eogum.models.schemas import (
 )
 from eogum.services.credit import get_balance
 from eogum.services.database import get_db
-from eogum.services.job_runner import cancel_reprocess, enqueue, enqueue_reprocess
+from eogum.services.job_runner import cancel_reprocess, enqueue, enqueue_reprocess, mark_reprocess_cancelled
 from eogum.services.r2 import download_to_bytes
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -248,11 +248,7 @@ def cancel_multicam_reprocess(project_id: str, user_id: str = Depends(get_user_i
 
     job_id = reprocess_job.data["id"]
     cancel_reprocess(project_id, job_id)
-    db.table("jobs").update({
-        "status": "canceled",
-        "error_message": "멀티캠 적용이 취소되었습니다",
-        "completed_at": "now()",
-    }).eq("id", job_id).execute()
+    mark_reprocess_cancelled(db, job_id)
     db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
 
     return db.table("projects").select("*").eq("id", project_id).single().execute().data

@@ -20,7 +20,6 @@ export default function NewProjectPage() {
   const [cutType, setCutType] = useState("subtitle_cut");
   const [language, setLanguage] = useState("ko");
   const [context, setContext] = useState("");
-  const [contextLoading, setContextLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
@@ -140,31 +139,6 @@ export default function NewProjectPage() {
       setError(err instanceof Error ? err.message : "YouTube 정보를 가져올 수 없습니다");
     } finally {
       setYtLoading(false);
-    }
-  };
-
-  const handleLoadContext = async () => {
-    setError("");
-    setContextLoading(true);
-
-    try {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session) throw new Error("로그인이 필요합니다");
-
-      const result = await api.getTranscriptionContext(session.access_token);
-      const loadedContext = result.context.trim();
-      if (!loadedContext) throw new Error("불러올 컨텍스트가 없습니다");
-
-      setContext((prev) => {
-        const current = prev.trim();
-        if (!current) return loadedContext;
-        if (current.includes(loadedContext)) return current;
-        return `${current}\n\n${loadedContext}`;
-      });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "컨텍스트를 불러올 수 없습니다");
-    } finally {
-      setContextLoading(false);
     }
   };
 
@@ -499,19 +473,9 @@ export default function NewProjectPage() {
 
           {/* Context */}
           <div>
-            <div className="mb-2 flex items-center justify-between gap-3">
-              <label className="text-sm font-medium">
-                컨텍스트 <span className="text-gray-500 font-normal">(선택)</span>
-              </label>
-              <button
-                type="button"
-                onClick={handleLoadContext}
-                disabled={contextLoading || uploading}
-                className="rounded-md border border-gray-700 bg-gray-900 px-2.5 py-1 text-xs font-medium text-gray-300 transition hover:border-gray-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {contextLoading ? "불러오는 중..." : "불러오기"}
-              </button>
-            </div>
+            <label className="block text-sm font-medium mb-2">
+              컨텍스트 <span className="text-gray-500 font-normal">(선택)</span>
+            </label>
             <textarea
               value={context}
               onChange={(e) => setContext(e.target.value)}

@@ -1,11 +1,9 @@
 import json
 import logging
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from eogum.auth import get_user_id
-from eogum.config import settings
 from eogum.models.schemas import (
     ProjectCreate,
     ProjectDetailResponse,
@@ -86,24 +84,6 @@ def list_projects(user_id: str = Depends(get_user_id)):
         project["active_job"] = active_jobs_by_project.get(project["id"])
 
     return projects
-
-
-@router.get("/transcription-context")
-def get_transcription_context(_user_id: str = Depends(get_user_id)):
-    """Load curated transcription context from Chalna assets on demand."""
-    try:
-        with httpx.Client(timeout=10.0) as client:
-            response = client.get(f"{settings.chalna_url.rstrip('/')}/context/transcription")
-            response.raise_for_status()
-            payload = response.json()
-    except Exception as exc:
-        logger.exception("Failed to load transcription context from Chalna")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="전사 컨텍스트를 불러올 수 없습니다",
-        ) from exc
-
-    return {"context": str(payload.get("context") or "")}
 
 
 @router.get("/{project_id}", response_model=ProjectDetailResponse)

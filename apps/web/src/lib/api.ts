@@ -104,10 +104,6 @@ export interface DownloadResponse {
   filename: string;
 }
 
-export interface TranscriptionContextResponse {
-  context: string;
-}
-
 // ── Evaluation ──
 export interface AiDecision {
   [key: string]: unknown;
@@ -314,9 +310,6 @@ export const api = {
 
   // Projects
   listProjects: (token: string) => apiFetch<Project[]>("/projects", token),
-
-  getTranscriptionContext: (token: string) =>
-    apiFetch<TranscriptionContextResponse>("/projects/transcription-context", token),
 
   getProject: (token: string, id: string) =>
     apiFetch<ProjectDetail>(`/projects/${id}`, token),

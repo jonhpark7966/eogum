@@ -406,7 +406,20 @@ export default function DashboardPage() {
         api.listProjects(token),
         api.getCredits(token),
       ]);
-      setProjects(projectList);
+      const activeProjects = projectList.filter((project) => project.status === "processing" || project.status === "queued");
+      const activeProjectDetails = await Promise.allSettled(
+        activeProjects.map((project) => api.getProject(token, project.id)),
+      );
+      const jobsByProject = new Map(
+        activeProjectDetails
+          .filter((result) => result.status === "fulfilled")
+          .map((result) => [result.value.id, result.value.jobs] as const),
+      );
+
+      setProjects(projectList.map((project) => ({
+        ...project,
+        jobs: jobsByProject.get(project.id) ?? project.jobs,
+      })));
       setCredits(creditBalance);
       setError(null);
     } catch (e) {

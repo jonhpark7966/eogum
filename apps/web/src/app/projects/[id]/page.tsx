@@ -25,6 +25,20 @@ function formatSize(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function splitEditReportMarkdown(markdown: string): { summary: string; details: string } {
+  const lines = markdown.split("\n");
+  const detailStartIndex = lines.findIndex((line) => /^## (?!요약\b).+ \(\d+개\)\s*$/.test(line));
+
+  if (detailStartIndex === -1) {
+    return { summary: markdown, details: "" };
+  }
+
+  return {
+    summary: lines.slice(0, detailStartIndex).join("\n").trimEnd(),
+    details: lines.slice(detailStartIndex).join("\n").trimStart(),
+  };
+}
+
 const STATUS_CONFIG: Record<string, { label: string; color: string; icon: string; bg: string }> = {
   queued:     { label: "대기 중",   color: "text-amber-400",   icon: "◷", bg: "bg-amber-400/10" },
   processing: { label: "처리 중",   color: "text-cyan-400",    icon: "⟳", bg: "bg-cyan-400/10" },
@@ -225,6 +239,7 @@ export default function ProjectDetailPage() {
   const activeReprocessJob = project.jobs.find(
     (job) => job.type === "reprocess_multicam" && (job.status === "pending" || job.status === "running")
   );
+  const reportMarkdown = project.report ? splitEditReportMarkdown(project.report.report_markdown) : null;
 
   return (
     <div className="min-h-screen bg-[#030712] text-white dot-grid">
@@ -608,9 +623,24 @@ export default function ProjectDetailPage() {
               [&_ol]:text-sm [&_ol]:text-gray-400
             ">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {project.report.report_markdown}
+                {reportMarkdown?.summary ?? project.report.report_markdown}
               </ReactMarkdown>
             </div>
+            {reportMarkdown?.details && (
+              <div className="mt-6 max-h-[560px] overflow-y-auto overscroll-contain rounded-xl border border-white/[0.06] bg-white/[0.015] px-4 py-1 pr-3">
+                <div className="prose prose-invert prose-sm max-w-none
+                  [&_h2]:sticky [&_h2]:top-0 [&_h2]:z-10 [&_h2]:-mx-4 [&_h2]:mt-0 [&_h2]:mb-3 [&_h2]:border-b [&_h2]:border-white/[0.06] [&_h2]:bg-[#080d17] [&_h2]:px-4 [&_h2]:py-3 [&_h2]:text-base [&_h2]:font-semibold
+                  [&_h3]:text-sm [&_h3]:font-semibold [&_h3]:mb-2 [&_h3]:mt-4
+                  [&_p]:text-gray-400 [&_p]:text-sm [&_p]:leading-relaxed
+                  [&_strong]:text-gray-200
+                  [&_ul]:text-sm [&_ul]:text-gray-400
+                ">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {reportMarkdown.details}
+                  </ReactMarkdown>
+                </div>
+              </div>
+            )}
           </Section>
         )}
       </main>

@@ -95,11 +95,16 @@ def get_project(project_id: str, user_id: str = Depends(get_user_id)):
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
 
     jobs = db.table("jobs").select("*").eq("project_id", project_id).order("created_at").execute()
-    report = db.table("edit_reports").select("*").eq("project_id", project_id).limit(1).execute()
+    try:
+        report = db.table("edit_reports").select("*").eq("project_id", project_id).limit(1).execute()
+        report_data = report.data[0] if report.data else None
+    except Exception:
+        logger.exception("Failed to load edit report for project %s", project_id)
+        report_data = None
 
     data = project.data
     data["jobs"] = jobs.data
-    data["report"] = report.data[0] if report.data else None
+    data["report"] = report_data
     return data
 
 

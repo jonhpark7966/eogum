@@ -749,9 +749,9 @@ export default function ProjectDetailPage() {
               </div>
             )}
             {selectedReportSection && selectableReportRows.length > 0 && (
-              <div ref={reportDetailsRef} className="mt-6 max-h-[560px] overflow-y-auto overscroll-contain rounded-xl border border-white/[0.06] bg-white/[0.015] px-4 py-1 pr-3">
+              <div ref={reportDetailsRef} className="mt-6 max-h-[560px] overflow-y-auto overscroll-contain rounded-xl border border-white/[0.06] bg-[#080d17] px-4 pb-1 pt-0 pr-3">
                 <div className="prose prose-invert prose-sm max-w-none
-                  [&_h2]:sticky [&_h2]:top-0 [&_h2]:z-10 [&_h2]:-mx-4 [&_h2]:mt-0 [&_h2]:mb-3 [&_h2]:border-b [&_h2]:border-white/[0.06] [&_h2]:bg-[#080d17] [&_h2]:px-4 [&_h2]:py-3 [&_h2]:text-base [&_h2]:font-semibold
+                  [&_h2]:sticky [&_h2]:top-0 [&_h2]:z-20 [&_h2]:-mx-4 [&_h2]:mt-0 [&_h2]:mb-3 [&_h2]:border-b [&_h2]:border-white/[0.06] [&_h2]:bg-[#080d17] [&_h2]:px-4 [&_h2]:py-3 [&_h2]:text-base [&_h2]:font-semibold [&_h2]:shadow-[0_10px_18px_rgba(8,13,23,0.95)]
                   [&_h3]:text-sm [&_h3]:font-semibold [&_h3]:mb-2 [&_h3]:mt-4
                   [&_p]:text-gray-400 [&_p]:text-sm [&_p]:leading-relaxed
                   [&_strong]:text-gray-200

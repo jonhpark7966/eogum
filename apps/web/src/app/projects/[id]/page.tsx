@@ -221,6 +221,7 @@ export default function ProjectDetailPage() {
   const isCompleted = project.status === "completed";
   const isFailed = project.status === "failed";
   const cutTypeLabel = project.cut_type === "subtitle_cut" ? "강의/설명" : "팟캐스트";
+  const activeJobs = project.jobs.filter((job) => job.status === "pending" || job.status === "running");
   const activeReprocessJob = project.jobs.find(
     (job) => job.type === "reprocess_multicam" && (job.status === "pending" || job.status === "running")
   );
@@ -302,7 +303,7 @@ export default function ProjectDetailPage() {
             icon={<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M12 2v4" /><path d="M12 18v4" /><path d="M4.93 4.93l2.83 2.83" /><path d="M16.24 16.24l2.83 2.83" /><path d="M2 12h4" /><path d="M18 12h4" /><path d="M4.93 19.07l2.83-2.83" /><path d="M16.24 7.76l2.83-2.83" /></svg>}
           >
             <div className="space-y-4">
-              {project.jobs.map((job) => (
+              {activeJobs.map((job) => (
                 <div key={job.id}>
                   <div className="flex justify-between text-sm mb-2">
                     <span className="text-gray-300">{JOB_TYPE_LABELS[job.type] ?? job.type}</span>

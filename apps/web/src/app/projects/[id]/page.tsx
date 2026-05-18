@@ -44,6 +44,18 @@ function formatSize(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("ko-KR", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function stripMarkdownEmphasis(value: string): string {
   return value.replace(/\*\*/g, "").trim();
 }
@@ -371,6 +383,9 @@ export default function ProjectDetailPage() {
   const activeReprocessJob = project.jobs.find(
     (job) => job.type === "reprocess_multicam" && (job.status === "pending" || job.status === "running")
   );
+  const multicamStatus = project.multicam_status ?? { applied: false, applied_at: null, source_count: 0 };
+  const multicamApplied = Boolean(multicamStatus.applied);
+  const multicamAppliedAt = multicamStatus.applied_at ? formatDateTime(multicamStatus.applied_at) : null;
   const reportMarkdown = project.report ? parseEditReportMarkdown(project.report.report_markdown) : null;
   const selectableReportRows = reportMarkdown?.summaryRows.filter((row) => !row.isTotal) ?? [];
   const selectedReportSection =
@@ -436,6 +451,14 @@ export default function ProjectDetailPage() {
                   )}
                   <span>{project.language === "ko" ? "한국어" : project.language === "en" ? "English" : project.language}</span>
                   <span>{new Date(project.created_at).toLocaleDateString("ko-KR")}</span>
+                  {multicamApplied && (
+                    <span className="inline-flex items-center gap-1.5 text-emerald-400">
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                        <path d="M20 6 9 17l-5-5" />
+                      </svg>
+                      멀티캠 적용됨
+                    </span>
+                  )}
                 </div>
               </div>
               <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium ${statusConfig.color} ${statusConfig.bg}`}>
@@ -663,6 +686,54 @@ export default function ProjectDetailPage() {
               오디오 크로스 코릴레이션으로 자동 싱크. 추가 크레딧이 차감됩니다.
             </p>
 
+            {project.extra_sources.length > 0 && (
+              <div className={`mb-4 rounded-xl border px-4 py-3 ${
+                multicamApplied
+                  ? "border-emerald-500/20 bg-emerald-500/[0.05]"
+                  : activeReprocessJob
+                    ? "border-cyan-500/20 bg-cyan-500/[0.05]"
+                    : "border-amber-500/20 bg-amber-500/[0.05]"
+              }`}>
+                <div className="flex items-start gap-3">
+                  <div className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg ${
+                    multicamApplied
+                      ? "bg-emerald-500/10 text-emerald-300"
+                      : activeReprocessJob
+                        ? "bg-cyan-500/10 text-cyan-300"
+                        : "bg-amber-500/10 text-amber-300"
+                  }`}>
+                    {multicamApplied ? (
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+                        <path d="M20 6 9 17l-5-5" />
+                      </svg>
+                    ) : activeReprocessJob ? (
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" className="animate-spin">
+                        <path d="M12 2v4" /><path d="M12 18v4" /><path d="M4.93 4.93l2.83 2.83" /><path d="M16.24 16.24l2.83 2.83" /><path d="M2 12h4" /><path d="M18 12h4" /><path d="M4.93 19.07l2.83-2.83" /><path d="M16.24 7.76l2.83-2.83" />
+                      </svg>
+                    ) : (
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
+                        <circle cx="12" cy="12" r="10" /><line x1="12" y1="7" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
+                      </svg>
+                    )}
+                  </div>
+                  <div>
+                    <p className={`text-sm font-medium ${
+                      multicamApplied ? "text-emerald-200" : activeReprocessJob ? "text-cyan-200" : "text-amber-200"
+                    }`}>
+                      {multicamApplied ? "멀티캠 적용 완료" : activeReprocessJob ? "멀티캠 적용 중" : "멀티캠 반영 전"}
+                    </p>
+                    <p className="mt-1 text-xs leading-relaxed text-gray-500">
+                      {multicamApplied
+                        ? `${multicamStatus.source_count}개 소스가 현재 결과물에 반영되었습니다${multicamAppliedAt ? ` · ${multicamAppliedAt}` : ""}.`
+                        : activeReprocessJob
+                          ? `${project.extra_sources.length}개 소스를 결과물에 반영하는 중입니다.`
+                          : `${project.extra_sources.length}개 소스가 업로드되었지만 현재 결과물에는 아직 반영되지 않았습니다.`}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <ProjectUploadStatus projectId={projectId} className="mb-4" />
 
             {/* Registered sources */}
@@ -752,7 +823,9 @@ export default function ProjectDetailPage() {
                   className="group relative px-5 py-2 text-sm font-medium rounded-lg overflow-hidden transition-all duration-300 hover:shadow-[0_0_20px_rgba(6,182,212,0.2)] disabled:opacity-50"
                 >
                   <div className="absolute inset-0 bg-gradient-to-r from-cyan-500 to-violet-500" />
-                  <span className="relative text-white">{multicamProcessing ? "적용 중..." : "멀티캠 적용"}</span>
+                  <span className="relative text-white">
+                    {multicamProcessing ? "적용 중..." : multicamApplied ? "멀티캠 재적용" : "멀티캠 적용"}
+                  </span>
                 </button>
               )}
               {activeReprocessJob && (

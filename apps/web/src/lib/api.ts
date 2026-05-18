@@ -31,8 +31,16 @@ export interface ExtraSource {
   offset_ms?: number | null;
 }
 
+export interface MulticamStatus {
+  applied: boolean;
+  applied_at: string | null;
+  source_count: number;
+}
+
 export interface Project {
   id: string;
+  user_id: string;
+  user_display_name: string | null;
   name: string;
   status: string;
   cut_type: string;
@@ -40,6 +48,7 @@ export interface Project {
   source_filename: string | null;
   source_duration_seconds: number | null;
   extra_sources: ExtraSource[];
+  multicam_status: MulticamStatus;
   active_job?: Job | null;
   created_at: string;
   updated_at: string;
@@ -129,6 +138,7 @@ export interface SegmentWithDecision {
   start_ms: number;
   end_ms: number;
   text: string;
+  speaker?: string | null;
   ai: AiDecision | null;
   human?: HumanDecision | null;
 }
@@ -139,6 +149,7 @@ export interface EvalSegment {
   start_ms: number;
   end_ms: number;
   text: string;
+  speaker?: string | null;
   ai: AiDecision | null;
   human: HumanDecision | null;
 }

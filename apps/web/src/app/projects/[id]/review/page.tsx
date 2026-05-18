@@ -55,6 +55,14 @@ function formatTime(ms: number): string {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
+function formatSegmentTime(ms: number): string {
+  const totalSec = Math.floor(ms / 1000);
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  const millis = Math.floor(ms % 1000);
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
+}
+
 type ReviewMetadata = Pick<
   EvaluationSavePayload,
   "schema_version" | "review_scope" | "join_strategy"
@@ -130,6 +138,7 @@ export default function ReviewPage() {
           start_ms: seg.start_ms,
           end_ms: seg.end_ms,
           text: seg.text,
+          speaker: seg.speaker ?? saved?.speaker ?? null,
           ai: seg.ai,
           human: saved?.human ?? null,
         };
@@ -530,7 +539,7 @@ export default function ReviewPage() {
                     <div className="flex items-center gap-2 mb-1">
                       <span className="text-xs text-gray-500">#{d.index}</span>
                       <span className="text-xs font-mono text-gray-400">
-                        {formatTime(d.start_ms)}→{formatTime(d.end_ms)}
+                        {formatSegmentTime(d.start_ms)}→{formatSegmentTime(d.end_ms)}
                       </span>
                       <span className={`text-xs px-1.5 py-0.5 rounded ${d.ai_action === "cut" ? "bg-red-900/50 text-red-300" : "bg-green-900/50 text-green-300"}`}>
                         AI: {d.ai_action} {d.ai_reason && `(${d.ai_reason})`}
@@ -559,6 +568,7 @@ export default function ReviewPage() {
           {segments.map((seg) => {
             const isCurrent = seg.index === currentIndex;
             const aiAction = seg.ai?.action ?? "keep";
+            const speakerLabel = seg.speaker?.trim();
             const disagree =
               seg.human !== null &&
               seg.ai !== null &&
@@ -582,8 +592,13 @@ export default function ReviewPage() {
                 <div className="flex items-center gap-3 mb-1">
                   <span className="text-xs text-gray-500 w-8">#{seg.index}</span>
                   <span className="text-xs text-gray-400 font-mono">
-                    {formatTime(seg.start_ms)}→{formatTime(seg.end_ms)}
+                    {formatSegmentTime(seg.start_ms)}→{formatSegmentTime(seg.end_ms)}
                   </span>
+                  {speakerLabel && (
+                    <span className="text-xs px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/20">
+                      {speakerLabel}
+                    </span>
+                  )}
                   <button
                     onClick={() => playSegment(seg)}
                     className="text-blue-400 hover:text-blue-300 text-xs"

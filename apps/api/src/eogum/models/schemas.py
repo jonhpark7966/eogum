@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ── Upload ──
@@ -28,6 +28,12 @@ class UpdateExtraSourcesRequest(BaseModel):
 
 
 # ── Projects ──
+class MulticamStatus(BaseModel):
+    applied: bool = False
+    applied_at: datetime | None = None
+    source_count: int = 0
+
+
 class ProjectCreate(BaseModel):
     name: str
     cut_type: str  # subtitle_cut | podcast_cut
@@ -41,6 +47,8 @@ class ProjectCreate(BaseModel):
 
 class ProjectResponse(BaseModel):
     id: str
+    user_id: str
+    user_display_name: str | None = None
     name: str
     status: str
     cut_type: str
@@ -48,6 +56,7 @@ class ProjectResponse(BaseModel):
     source_filename: str | None
     source_duration_seconds: int | None
     extra_sources: list[dict] = []
+    multicam_status: MulticamStatus = Field(default_factory=MulticamStatus)
     active_job: "JobResponse | None" = None
     created_at: datetime
     updated_at: datetime
@@ -123,6 +132,7 @@ class ReviewSegment(EnginePayloadModel):
     start_ms: int
     end_ms: int
     text: str
+    speaker: str | None = None
     ai: AiDecision | None = None
     human: HumanDecision | None = None
 

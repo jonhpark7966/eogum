@@ -10,6 +10,7 @@ from eogum.models.schemas import (
     ProjectResponse,
     UpdateExtraSourcesRequest,
 )
+from eogum.services.access_control import project_query_for_user, projects_query_for_user
 from eogum.services.credit import get_balance
 from eogum.services.database import get_db
 from eogum.services.job_runner import cancel_reprocess, enqueue, enqueue_reprocess
@@ -17,6 +18,77 @@ from eogum.services.r2 import download_to_bytes
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 logger = logging.getLogger(__name__)
+
+
+def _extra_source_keys(extra_sources: list[dict] | None) -> list[str]:
+    return [
+        str(source.get("r2_key"))
+        for source in extra_sources or []
+        if isinstance(source, dict) and source.get("r2_key")
+    ]
+
+
+def _extra_source_count(project: dict) -> int:
+    extra_sources = project.get("extra_sources") or []
+    return len(extra_sources) if isinstance(extra_sources, list) else 0
+
+
+def _multicam_status(project: dict) -> dict:
+    source_count = _extra_source_count(project)
+    settings = project.get("settings") or {}
+    raw_status = settings.get("multicam") if isinstance(settings, dict) else None
+    if not isinstance(raw_status, dict):
+        return {"applied": False, "applied_at": None, "source_count": source_count}
+
+    source_keys = _extra_source_keys(project.get("extra_sources") or [])
+    applied_source_keys = raw_status.get("source_keys")
+    keys_match = isinstance(applied_source_keys, list) and applied_source_keys == source_keys
+    if not applied_source_keys:
+        keys_match = int(raw_status.get("source_count") or 0) == source_count
+
+    applied = bool(raw_status.get("applied")) and source_count > 0 and keys_match
+    return {
+        "applied": applied,
+        "applied_at": raw_status.get("applied_at") if applied else None,
+        "source_count": source_count,
+    }
+
+
+def _with_multicam_status(project: dict) -> dict:
+    data = dict(project)
+    data["multicam_status"] = _multicam_status(data)
+    return data
+
+
+def _with_owner_display_names(db, projects: list[dict]) -> list[dict]:
+    user_ids = sorted({project["user_id"] for project in projects if project.get("user_id")})
+    if not user_ids:
+        return projects
+
+    profiles = (
+        db.table("profiles")
+        .select("id, display_name")
+        .in_("id", user_ids)
+        .execute()
+        .data
+    )
+    display_names_by_id = {profile["id"]: profile.get("display_name") for profile in profiles}
+
+    for project in projects:
+        project["user_display_name"] = display_names_by_id.get(project.get("user_id"))
+
+    return projects
+
+
+def _settings_with_multicam_pending(project: dict, extra_sources: list[dict]) -> dict:
+    settings = dict(project.get("settings") or {})
+    settings["multicam"] = {
+        "applied": False,
+        "applied_at": None,
+        "source_count": len(extra_sources),
+        "source_keys": _extra_source_keys(extra_sources),
+    }
+    return settings
 
 
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
@@ -46,13 +118,13 @@ def create_project(req: ProjectCreate, user_id: str = Depends(get_user_id)):
     # Enqueue for processing
     enqueue(project["id"])
 
-    return project
+    return _with_multicam_status(project)
 
 
 @router.get("", response_model=list[ProjectResponse])
 def list_projects(user_id: str = Depends(get_user_id)):
     db = get_db()
-    result = db.table("projects").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
+    result = projects_query_for_user(db, user_id).order("created_at", desc=True).execute()
     projects = result.data
     if not projects:
         return projects
@@ -83,14 +155,15 @@ def list_projects(user_id: str = Depends(get_user_id)):
     for project in projects:
         project["active_job"] = active_jobs_by_project.get(project["id"])
 
-    return projects
+    projects = _with_owner_display_names(db, projects)
+    return [_with_multicam_status(project) for project in projects]
 
 
 @router.get("/{project_id}", response_model=ProjectDetailResponse)
 def get_project(project_id: str, user_id: str = Depends(get_user_id)):
     db = get_db()
 
-    project = db.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).single().execute()
+    project = project_query_for_user(db, project_id, user_id).single().execute()
     if not project.data:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
 
@@ -105,14 +178,15 @@ def get_project(project_id: str, user_id: str = Depends(get_user_id)):
     data = project.data
     data["jobs"] = jobs.data
     data["report"] = report_data
-    return data
+    _with_owner_display_names(db, [data])
+    return _with_multicam_status(data)
 
 
 @router.post("/{project_id}/retry", response_model=ProjectResponse)
 def retry_project(project_id: str, user_id: str = Depends(get_user_id)):
     db = get_db()
 
-    project = db.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).single().execute()
+    project = project_query_for_user(db, project_id, user_id).single().execute()
     if not project.data:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
 
@@ -123,8 +197,9 @@ def retry_project(project_id: str, user_id: str = Depends(get_user_id)):
         )
 
     # Check credits
+    owner_id = project.data["user_id"]
     duration = project.data["source_duration_seconds"]
-    balance = get_balance(user_id)
+    balance = get_balance(owner_id)
     if balance["available_seconds"] < duration:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -141,7 +216,7 @@ def retry_project(project_id: str, user_id: str = Depends(get_user_id)):
     # Enqueue for processing
     enqueue(project_id)
 
-    return updated
+    return _with_multicam_status(updated)
 
 
 @router.put("/{project_id}/extra-sources", response_model=ProjectResponse)
@@ -152,7 +227,7 @@ def update_extra_sources(
 ):
     db = get_db()
 
-    project = db.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).single().execute()
+    project = project_query_for_user(db, project_id, user_id).single().execute()
     if not project.data:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
 
@@ -163,8 +238,17 @@ def update_extra_sources(
         )
 
     extra_sources = [s.model_dump() for s in req.extra_sources]
-    updated = db.table("projects").update({"extra_sources": extra_sources}).eq("id", project_id).execute().data[0]
-    return updated
+    updated = (
+        db.table("projects")
+        .update({
+            "extra_sources": extra_sources,
+            "settings": _settings_with_multicam_pending(project.data, extra_sources),
+        })
+        .eq("id", project_id)
+        .execute()
+        .data[0]
+    )
+    return _with_multicam_status(updated)
 
 
 @router.post("/{project_id}/multicam", response_model=ProjectResponse)
@@ -172,7 +256,7 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
     """Queue project reprocess via split avid-cli commands."""
     db = get_db()
 
-    project = db.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).single().execute()
+    project = project_query_for_user(db, project_id, user_id).single().execute()
     if not project.data:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
 
@@ -226,7 +310,7 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
         db.table("evaluations")
         .select("segments")
         .eq("project_id", project_id)
-        .eq("evaluator_id", user_id)
+        .eq("evaluator_id", project.data["user_id"])
         .limit(1)
         .execute()
     )
@@ -247,14 +331,15 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
     db.table("projects").update({"status": "processing"}).eq("id", project_id).execute()
     queued_job = db.table("jobs").insert({
         "project_id": project_id,
-        "user_id": user_id,
+        "user_id": project.data["user_id"],
         "type": "reprocess_multicam",
         "status": "pending",
         "progress": 0,
     }).execute().data[0]
     enqueue_reprocess(project_id, queued_job["id"])
 
-    return db.table("projects").select("*").eq("id", project_id).single().execute().data
+    updated = db.table("projects").select("*").eq("id", project_id).single().execute().data
+    return _with_multicam_status(updated)
 
 
 @router.post("/{project_id}/multicam/cancel", response_model=ProjectResponse)
@@ -262,7 +347,7 @@ def cancel_multicam_reprocess(project_id: str, user_id: str = Depends(get_user_i
     """Cancel a pending or running multicam reprocess job."""
     db = get_db()
 
-    project = db.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).single().execute()
+    project = project_query_for_user(db, project_id, user_id).single().execute()
     if not project.data:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
 
@@ -292,14 +377,15 @@ def cancel_multicam_reprocess(project_id: str, user_id: str = Depends(get_user_i
     }).eq("id", job_id).execute()
     db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
 
-    return db.table("projects").select("*").eq("id", project_id).single().execute().data
+    updated = db.table("projects").select("*").eq("id", project_id).single().execute().data
+    return _with_multicam_status(updated)
 
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_project(project_id: str, user_id: str = Depends(get_user_id)):
     db = get_db()
 
-    project = db.table("projects").select("id").eq("id", project_id).eq("user_id", user_id).single().execute()
+    project = project_query_for_user(db, project_id, user_id, "id").single().execute()
     if not project.data:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
 

@@ -3,6 +3,7 @@ from fastapi.responses import RedirectResponse
 
 from eogum.auth import get_user_id
 from eogum.models.schemas import DownloadResponse
+from eogum.services.access_control import project_query_for_user
 from eogum.services.database import get_db
 from eogum.services.r2 import generate_presigned_download
 
@@ -16,10 +17,7 @@ def download_extra_source(project_id: str, index: int, user_id: str = Depends(ge
     db = get_db()
 
     project = (
-        db.table("projects")
-        .select("user_id, extra_sources")
-        .eq("id", project_id)
-        .eq("user_id", user_id)
+        project_query_for_user(db, project_id, user_id, "user_id, extra_sources")
         .single()
         .execute()
     )
@@ -46,10 +44,7 @@ def download_file(project_id: str, file_type: str, user_id: str = Depends(get_us
     # Source download: use project's source_r2_key directly
     if file_type == "source":
         project = (
-            db.table("projects")
-            .select("name, user_id, source_r2_key, source_filename")
-            .eq("id", project_id)
-            .eq("user_id", user_id)
+            project_query_for_user(db, project_id, user_id, "name, user_id, source_r2_key, source_filename")
             .single()
             .execute()
         )
@@ -65,7 +60,7 @@ def download_file(project_id: str, file_type: str, user_id: str = Depends(get_us
         return DownloadResponse(download_url=download_url, filename=filename)
 
     # Verify ownership
-    project = db.table("projects").select("name, user_id").eq("id", project_id).eq("user_id", user_id).single().execute()
+    project = project_query_for_user(db, project_id, user_id, "name, user_id").single().execute()
     if not project.data:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
 

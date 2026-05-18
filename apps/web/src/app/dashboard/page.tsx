@@ -46,6 +46,26 @@ function getProjectDateGroups(projects: Project[]): { key: string; label: string
     }));
 }
 
+function getProjectOwnerLabel(project: Project): string {
+  return project.user_display_name || project.user_id.slice(0, 8);
+}
+
+function getProjectUserGroups(projects: Project[]): { id: string; label: string; count: number }[] {
+  const groups = new Map<string, { label: string; count: number }>();
+
+  for (const project of projects) {
+    const current = groups.get(project.user_id);
+    groups.set(project.user_id, {
+      label: current?.label || getProjectOwnerLabel(project),
+      count: (current?.count ?? 0) + 1,
+    });
+  }
+
+  return Array.from(groups.entries())
+    .sort(([, a], [, b]) => b.count - a.count || a.label.localeCompare(b.label))
+    .map(([id, group]) => ({ id, ...group }));
+}
+
 const STATUS_CONFIG: Record<string, { label: string; color: string; icon: string; bg: string }> = {
   queued:     { label: "대기 중",   color: "text-amber-400",  icon: "◷", bg: "bg-amber-400/10" },
   processing: { label: "처리 중",   color: "text-cyan-400",   icon: "⟳", bg: "bg-cyan-400/10" },
@@ -261,6 +281,7 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [retryingId, setRetryingId] = useState<string | null>(null);
+  const [selectedUserId, setSelectedUserId] = useState<string>("all");
   const [selectedDateKey, setSelectedDateKey] = useState<string | null>(null);
 
   const handleRetry = async (e: MouseEvent, projectId: string) => {
@@ -309,8 +330,21 @@ export default function DashboardPage() {
     return () => clearInterval(interval);
   }, [loadData]);
 
-  const projectDateGroups = useMemo(() => getProjectDateGroups(projects), [projects]);
+  const projectUserGroups = useMemo(() => getProjectUserGroups(projects), [projects]);
+  const showUserFilter = projectUserGroups.length > 1;
+  const filteredProjects = useMemo(
+    () => selectedUserId === "all" ? projects : projects.filter((project) => project.user_id === selectedUserId),
+    [projects, selectedUserId]
+  );
+  const projectDateGroups = useMemo(() => getProjectDateGroups(filteredProjects), [filteredProjects]);
   const selectedDateGroup = projectDateGroups.find((group) => group.key === selectedDateKey) ?? projectDateGroups[0] ?? null;
+
+  useEffect(() => {
+    if (selectedUserId !== "all" && !projectUserGroups.some((group) => group.id === selectedUserId)) {
+      setSelectedUserId("all");
+      setSelectedDateKey(null);
+    }
+  }, [projectUserGroups, selectedUserId]);
 
   const handleLogout = async () => {
     await supabase.auth.signOut();
@@ -393,6 +427,41 @@ export default function DashboardPage() {
           <EmptyState onNew={() => router.push("/dashboard/new")} />
         ) : (
           <div>
+            {showUserFilter && (
+              <div className="mb-4 flex gap-2 overflow-x-auto pb-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedUserId("all");
+                    setSelectedDateKey(null);
+                  }}
+                  className={`shrink-0 rounded-full border px-4 py-2 text-sm font-medium transition-colors ${
+                    selectedUserId === "all"
+                      ? "border-violet-500/30 bg-violet-500/10 text-violet-200"
+                      : "border-white/[0.06] bg-white/[0.02] text-gray-400 hover:border-white/[0.12] hover:bg-white/[0.05] hover:text-gray-200"
+                  }`}
+                >
+                  전체 유저 <span className="ml-1 text-xs opacity-70">{projects.length}</span>
+                </button>
+                {projectUserGroups.map((group) => (
+                  <button
+                    key={group.id}
+                    type="button"
+                    onClick={() => {
+                      setSelectedUserId(group.id);
+                      setSelectedDateKey(null);
+                    }}
+                    className={`shrink-0 rounded-full border px-4 py-2 text-sm font-medium transition-colors ${
+                      selectedUserId === group.id
+                        ? "border-violet-500/30 bg-violet-500/10 text-violet-200"
+                        : "border-white/[0.06] bg-white/[0.02] text-gray-400 hover:border-white/[0.12] hover:bg-white/[0.05] hover:text-gray-200"
+                    }`}
+                  >
+                    {group.label} <span className="ml-1 text-xs opacity-70">{group.count}</span>
+                  </button>
+                ))}
+              </div>
+            )}
             <div className="mb-5 flex gap-2 overflow-x-auto pb-1">
               {projectDateGroups.map((group) => {
                 const isSelected = group.key === selectedDateGroup?.key;

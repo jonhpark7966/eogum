@@ -6,6 +6,7 @@ import re
 import threading
 import time
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 
 import sentry_sdk
@@ -25,6 +26,28 @@ _reprocess_cancel_events: dict[str, threading.Event] = {}
 
 class ReprocessCancelled(RuntimeError):
     """Raised when a multicam reprocess job is cancelled."""
+
+
+def _extra_source_keys(extra_sources: list[dict] | None) -> list[str]:
+    return [
+        str(source.get("r2_key"))
+        for source in extra_sources or []
+        if isinstance(source, dict) and source.get("r2_key")
+    ]
+
+
+def _settings_with_multicam_status(project: dict, *, applied: bool) -> dict:
+    extra_sources = project.get("extra_sources") or []
+    source_count = len(extra_sources) if isinstance(extra_sources, list) else 0
+    applied = bool(applied and source_count)
+    settings = dict(project.get("settings") or {})
+    settings["multicam"] = {
+        "applied": applied,
+        "applied_at": datetime.now(timezone.utc).isoformat() if applied else None,
+        "source_count": source_count,
+        "source_keys": _extra_source_keys(extra_sources),
+    }
+    return settings
 
 
 def enqueue(project_id: str) -> None:
@@ -220,6 +243,7 @@ def _process_project(project_id: str) -> None:
             output_dir=str(output_dir),
             extra_sources=extra_source_paths or None,
         )
+        result_paths["storyline"] = storyline_path
         _update_progress(db, job_id, 75)
 
         # 5.5. Generate low-quality preview for review page
@@ -262,7 +286,10 @@ def _process_project(project_id: str) -> None:
             "result_r2_keys": r2_keys,
             "completed_at": "now()",
         }).eq("id", job_id).execute()
-        db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
+        project_update = {"status": "completed"}
+        if extra_source_paths:
+            project_update["settings"] = _settings_with_multicam_status(project, applied=True)
+        db.table("projects").update(project_update).eq("id", project_id).execute()
 
         # 10. Send email
         try:
@@ -549,7 +576,13 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
             "result_r2_keys": new_r2_keys,
             "completed_at": "now()",
         }).eq("id", job_id).execute()
-        db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
+        db.table("projects").update({
+            "status": "completed",
+            "settings": _settings_with_multicam_status(
+                project,
+                applied="rebuild-multicam" in steps and has_extra_sources,
+            ),
+        }).eq("id", project_id).execute()
         logger.info("Reprocess completed for project %s", project_id)
     except (ReprocessCancelled, avid.AvidCommandCancelled) as exc:
         logger.info("Project reprocess cancelled for project %s", project_id)

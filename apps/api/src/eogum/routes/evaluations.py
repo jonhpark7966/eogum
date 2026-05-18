@@ -21,6 +21,7 @@ from eogum.models.schemas import (
     SegmentsResponse,
     VideoUrlResponse,
 )
+from eogum.services.access_control import project_query_for_user
 from eogum.services import avid
 from eogum.services.database import get_db
 from eogum.services.r2 import download_to_bytes, generate_presigned_stream
@@ -62,13 +63,15 @@ def _evaluation_response_from_row(row: dict) -> EvaluationResponse:
     )
 
 
+def _project_evaluator_id(project: dict, user_id: str) -> str:
+    """Admins edit the project owner's evaluation when reviewing another user's project."""
+    return project.get("user_id") or user_id
+
+
 def _get_completed_job(db, project_id: str, user_id: str):
     """Get the latest completed job for a project, verifying ownership."""
     project = (
-        db.table("projects")
-        .select("id, user_id")
-        .eq("id", project_id)
-        .eq("user_id", user_id)
+        project_query_for_user(db, project_id, user_id, "id, user_id")
         .single()
         .execute()
     )
@@ -156,23 +159,21 @@ def get_evaluation(project_id: str, user_id: str = Depends(get_user_id)):
     """Get existing evaluation for this project by the current user."""
     db = get_db()
 
-    # Verify project ownership
+    # Verify project access
     project = (
-        db.table("projects")
-        .select("id, user_id")
-        .eq("id", project_id)
-        .eq("user_id", user_id)
+        project_query_for_user(db, project_id, user_id, "id, user_id")
         .single()
         .execute()
     )
     if not project.data:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
 
+    evaluator_id = _project_evaluator_id(project.data, user_id)
     result = (
         db.table("evaluations")
         .select("*")
         .eq("project_id", project_id)
-        .eq("evaluator_id", user_id)
+        .eq("evaluator_id", evaluator_id)
         .limit(1)
         .execute()
     )
@@ -191,17 +192,16 @@ def save_evaluation(
     """Save or update evaluation (upsert on project_id + evaluator_id)."""
     db = get_db()
 
-    # Verify project ownership
+    # Verify project access
     project = (
-        db.table("projects")
-        .select("id, user_id")
-        .eq("id", project_id)
-        .eq("user_id", user_id)
+        project_query_for_user(db, project_id, user_id, "id, user_id")
         .single()
         .execute()
     )
     if not project.data:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+
+    evaluator_id = _project_evaluator_id(project.data, user_id)
 
     # Collect git versions
     avid_version = avid.get_version()
@@ -229,7 +229,7 @@ def save_evaluation(
         .upsert(
             {
                 "project_id": project_id,
-                "evaluator_id": user_id,
+                "evaluator_id": evaluator_id,
                 "segments": stored_segments,
                 "avid_version": avid_version,
                 "eogum_version": eogum_version,
@@ -247,12 +247,22 @@ def get_eval_report(project_id: str, user_id: str = Depends(get_user_id)):
     """Compare AI decisions vs human ground truth and produce a report."""
     db = get_db()
 
+    project = (
+        project_query_for_user(db, project_id, user_id, "id, user_id")
+        .single()
+        .execute()
+    )
+    if not project.data:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+
+    evaluator_id = _project_evaluator_id(project.data, user_id)
+
     # Get evaluation
     eval_result = (
         db.table("evaluations")
         .select("*")
         .eq("project_id", project_id)
-        .eq("evaluator_id", user_id)
+        .eq("evaluator_id", evaluator_id)
         .limit(1)
         .execute()
     )

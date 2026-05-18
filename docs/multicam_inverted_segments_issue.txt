@@ -1,0 +1,54 @@
+멀티캠 적용 후 extra source 컷/킵 반전 오류 정리
+
+현재 관찰된 상태
+
+- 프로젝트 최초 생성 시 넣은 메인 라이브캠 source:
+  - 사용자가 keep으로 남긴 세그먼트만 정상적으로 남아 있음
+  - cut 처리한 구간은 정상적으로 제거됨
+
+- 이후 멀티캠 소스로 추가한 source:
+  - 반대로 동작함
+  - 사용자가 cut한 세그먼트가 남아 있음
+  - 사용자가 keep한 세그먼트가 빠져 있거나 기대와 다르게 처리됨
+
+기대 결과
+
+메인 source:
+  keep 구간만 남아야 함
+
+멀티캠 source:
+  keep 구간만 남아야 함
+
+현재 실제 결과
+
+메인 source:
+  keep 구간만 정상적으로 남음
+
+멀티캠 source:
+  cut 구간이 들어와 있음
+
+핵심 문제 정의
+
+멀티캠 적용 과정에서 기존 편집/evaluation의 keep/cut 결정이 extra source에 재적용될 때,
+extra source 트랙 또는 angle에 대해 세그먼트 포함/제외 조건이 뒤집혀 적용되고 있다.
+
+가능성이 높은 원인 범위
+
+1. rebuild-multicam 단계에서 extra source angle을 붙일 때 segment mask를 반대로 해석
+2. apply-evaluation 이후의 project JSON에는 keep/cut이 맞지만, rebuild-multicam이 새 source에 원본 구간을 잘못 붙임
+3. export-project에서 multicam angle별 clip range를 만들 때 extra source만 cut 구간 기준으로 생성
+
+확인해야 할 중간 산출물
+
+1. 01_eval_applied.project.avid.json
+   - 메인 source의 남은 segments가 keep인지 확인
+
+2. 02_multicam.project.avid.json
+   - extra source가 추가된 뒤에도 같은 keep 구간만 source_files/segments에 연결되어 있는지 확인
+
+3. exported fcpxml
+   - extra angle clip들이 keep 구간을 참조하는지, cut 구간을 참조하는지 확인
+
+한 줄 요약
+
+메인 영상에는 evaluation 결과가 정상 적용되지만, 멀티캠 extra source에는 동일한 keep/cut 마스크가 반대로 적용되어 컷해야 할 구간이 타임라인에 들어오는 버그다.

@@ -70,6 +70,8 @@ class JobResponse(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     created_at: datetime
+    pipeline_stages: list[dict] = []
+    external_task_ids: dict = {}
 
 
 # ── Credits ──

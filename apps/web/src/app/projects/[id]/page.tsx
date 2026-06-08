@@ -3,7 +3,7 @@
 export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
-import { api, uploadFile, type ProjectDetail, type ExtraSource } from "@/lib/api";
+import { api, uploadFile, type ProjectDetail, type ExtraSource, type PipelineStage } from "@/lib/api";
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -35,6 +35,59 @@ const JOB_TYPE_LABELS: Record<string, string> = {
   subtitle_cut: "편집 처리",
   podcast_cut: "편집 처리",
 };
+
+const STAGE_STATUS_CONFIG: Record<string, { label: string; dot: string; text: string }> = {
+  pending: { label: "대기", dot: "bg-gray-600", text: "text-gray-500" },
+  running: { label: "진행 중", dot: "bg-cyan-400 shadow-[0_0_12px_rgba(34,211,238,0.45)]", text: "text-cyan-300" },
+  completed: { label: "완료", dot: "bg-emerald-400", text: "text-emerald-300" },
+  failed: { label: "실패", dot: "bg-red-400", text: "text-red-300" },
+  skipped: { label: "건너뜀", dot: "bg-gray-500", text: "text-gray-400" },
+};
+
+function getStageStatusConfig(status: string) {
+  return STAGE_STATUS_CONFIG[status] ?? STAGE_STATUS_CONFIG.pending;
+}
+
+function PipelineStageList({ stages }: { stages: PipelineStage[] }) {
+  if (!stages.length) return null;
+
+  return (
+    <div className="mt-4 grid gap-2">
+      {stages.map((stage) => {
+        const config = getStageStatusConfig(stage.status);
+        const showProgress = stage.status === "running" || (stage.progress > 0 && stage.progress < 100);
+
+        return (
+          <div
+            key={stage.id}
+            className="flex items-start gap-3 rounded-xl border border-white/[0.05] bg-white/[0.025] px-3 py-2.5"
+          >
+            <span className={"mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full " + config.dot} />
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center justify-between gap-3 text-xs">
+                <span className="min-w-0 truncate font-medium text-gray-300">{stage.label}</span>
+                <span className={"shrink-0 " + config.text}>
+                  {config.label}{showProgress ? " " + Math.round(stage.progress) + "%" : ""}
+                </span>
+              </div>
+              {stage.detail && (
+                <p className="mt-1 truncate text-[11px] leading-4 text-gray-500">{stage.detail}</p>
+              )}
+              {showProgress && (
+                <div className="mt-2 h-1 overflow-hidden rounded-full bg-white/[0.06]">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-cyan-400/80 to-violet-400/80 transition-all duration-700"
+                    style={{ width: Math.min(100, Math.max(0, stage.progress)).toString() + "%" }}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 /* ── Section wrapper ── */
 function Section({ title, icon, children, className = "" }: {
@@ -310,6 +363,7 @@ export default function ProjectDetailPage() {
                       <div className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-cyan-500 to-violet-500 w-full" />
                     )}
                   </div>
+                  <PipelineStageList stages={job.pipeline_stages ?? []} />
                 </div>
               ))}
             </div>

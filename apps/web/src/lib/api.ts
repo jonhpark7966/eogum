@@ -52,6 +52,16 @@ export interface ProjectDetail extends Project {
   report: EditReport | null;
 }
 
+export interface PipelineStage {
+  id: string;
+  label: string;
+  status: "pending" | "running" | "completed" | "failed" | "skipped" | string;
+  progress: number;
+  detail?: string;
+  started_at?: string;
+  completed_at?: string;
+}
+
 export interface Job {
   id: string;
   type: string;
@@ -61,6 +71,8 @@ export interface Job {
   started_at: string | null;
   completed_at: string | null;
   created_at: string;
+  pipeline_stages: PipelineStage[];
+  external_task_ids: Record<string, string>;
 }
 
 export interface CreditBalance {

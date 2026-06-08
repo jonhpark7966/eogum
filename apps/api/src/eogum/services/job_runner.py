@@ -7,7 +7,7 @@ from collections import deque
 from pathlib import Path
 
 from eogum.config import settings
-from eogum.services import avid, credit, email, r2
+from eogum.services import avid, chalna, credit, email, r2
 from eogum.services.database import get_db
 
 logger = logging.getLogger(__name__)
@@ -112,6 +112,8 @@ def _process_project(project_id: str) -> None:
             "user_id": user_id,
             "type": project["cut_type"],
             "status": "running",
+            "pipeline_stages": _initial_pipeline_stages(),
+            "external_task_ids": {},
         }).execute().data[0]
         job_id = job["id"]
 
@@ -143,7 +145,13 @@ def _process_project(project_id: str) -> None:
 
         # 3. Transcribe
         transcription_context = (project.get("settings") or {}).get("transcription_context")
-        srt_path = avid.transcribe(source_path, language=project["language"], output_dir=str(temp_dir), context=transcription_context)
+        srt_path = chalna.transcribe_to_srt(
+            source_path,
+            language=project["language"],
+            output_dir=str(temp_dir),
+            context=transcription_context,
+            on_status=lambda payload: _update_chalna_pipeline_status(db, job_id, payload),
+        )
         _update_progress(db, job_id, 30)
 
         # 4. Transcript overview (Pass 1)
@@ -464,6 +472,211 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
 
 def _update_progress(db, job_id: str, progress: int) -> None:
     db.table("jobs").update({"progress": progress}).eq("id", job_id).execute()
+
+
+def _initial_pipeline_stages() -> list[dict[str, object]]:
+    return [
+        {
+            "id": "vibevoice_asr",
+            "label": "VibeVoice-ASR",
+            "status": "pending",
+            "progress": 0,
+            "detail": "음성 인식 대기 중",
+        },
+        {
+            "id": "qwen_forced_aligner",
+            "label": "Qwen forced aligner",
+            "status": "pending",
+            "progress": 0,
+            "detail": "1차 타임스탬프 정렬 대기 중",
+        },
+        {
+            "id": "llm_refine",
+            "label": "LLM refine",
+            "status": "pending",
+            "progress": 0,
+            "detail": "문장 정제 대기 중",
+        },
+        {
+            "id": "qwen_forced_aligner_after_refine",
+            "label": "Qwen forced aligner after refine",
+            "status": "pending",
+            "progress": 0,
+            "detail": "정제 후 재정렬 대기 중",
+        },
+    ]
+
+
+def _update_chalna_pipeline_status(db, job_id: str | None, payload: dict[str, object]) -> None:
+    if not job_id:
+        return
+
+    try:
+        update_payload: dict[str, object] = {
+            "pipeline_stages": _build_chalna_pipeline_stages(payload),
+        }
+
+        chalna_job_id = payload.get("job_id")
+        if isinstance(chalna_job_id, str) and chalna_job_id:
+            update_payload["external_task_ids"] = {"chalna": chalna_job_id}
+
+        progress = payload.get("progress")
+        if isinstance(progress, (int, float)):
+            update_payload["progress"] = min(30, max(10, int(10 + float(progress) * 20)))
+
+        db.table("jobs").update(update_payload).eq("id", job_id).execute()
+    except Exception:
+        logger.exception("Failed to persist Chalna pipeline status for job %s", job_id)
+
+
+def _build_chalna_pipeline_stages(payload: dict[str, object]) -> list[dict[str, object]]:
+    stages = _initial_pipeline_stages()
+    status = str(payload.get("status") or "")
+    current_stage = str(payload.get("current_stage") or "")
+    history_value = payload.get("progress_history") or []
+    history = history_value if isinstance(history_value, list) else []
+    latest = _latest_stage_entries(history)
+
+    current_rank = {
+        "validating": 0,
+        "transcribing": 1,
+        "loading_models": 2,
+        "aligning": 3,
+        "refining": 4,
+    }.get(current_stage, -1)
+
+    _apply_stage(
+        stages[0],
+        latest.get("transcribing"),
+        running=current_stage == "transcribing",
+        completed=current_rank > 1 or "aligning" in latest or "refining" in latest or status == "completed",
+        failed=status == "failed" and current_stage == "transcribing",
+        pending_detail="음성 인식 대기 중",
+        running_detail=_chalna_chunk_detail(payload, "음성 인식 진행 중"),
+        completed_detail="음성 인식 완료",
+    )
+    _apply_stage(
+        stages[1],
+        latest.get("aligning"),
+        running=current_stage == "aligning" or current_stage == "loading_models",
+        completed=current_rank > 3 or "refining" in latest or status == "completed",
+        failed=status == "failed" and current_stage in {"loading_models", "aligning"},
+        pending_detail="1차 타임스탬프 정렬 대기 중",
+        running_detail="Qwen forced aligner 실행 중",
+        completed_detail="1차 타임스탬프 정렬 완료",
+    )
+    _apply_refinement_stages(stages, latest.get("refining"), current_stage=current_stage, status=status)
+
+    return stages
+
+
+def _latest_stage_entries(history: list[object]) -> dict[str, dict[str, object]]:
+    latest: dict[str, dict[str, object]] = {}
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        stage = entry.get("stage")
+        if isinstance(stage, str):
+            latest[stage] = entry
+    return latest
+
+
+def _apply_stage(
+    stage: dict[str, object],
+    entry: dict[str, object] | None,
+    *,
+    running: bool,
+    completed: bool,
+    failed: bool,
+    pending_detail: str,
+    running_detail: str,
+    completed_detail: str,
+) -> None:
+    progress = round(_stage_progress(entry) * 100) if entry else 0
+    timestamp = _entry_timestamp(entry)
+
+    stage["progress"] = progress
+    if timestamp:
+        stage["started_at"] = timestamp
+
+    if failed:
+        stage.update({"status": "failed", "detail": "처리 실패"})
+        return
+    if completed:
+        stage.update({"status": "completed", "progress": 100, "detail": completed_detail})
+        if timestamp:
+            stage["completed_at"] = timestamp
+        return
+    if running or entry:
+        stage.update({"status": "running", "progress": max(1, progress), "detail": running_detail})
+        return
+
+    stage["detail"] = pending_detail
+
+
+def _apply_refinement_stages(
+    stages: list[dict[str, object]],
+    entry: dict[str, object] | None,
+    *,
+    current_stage: str,
+    status: str,
+) -> None:
+    progress = _stage_progress(entry) if entry else 0.0
+    timestamp = _entry_timestamp(entry)
+    llm_stage = stages[2]
+    realign_stage = stages[3]
+    llm_progress = min(100, round(min(progress, 0.5) * 200))
+    realign_progress = min(100, round(max(0.0, progress - 0.5) * 200))
+
+    if timestamp:
+        llm_stage["started_at"] = timestamp
+        if progress >= 0.5:
+            realign_stage["started_at"] = timestamp
+
+    if status == "failed" and current_stage == "refining" and progress <= 0.5:
+        llm_stage.update({"status": "failed", "progress": max(1, llm_progress), "detail": "문장 정제 실패"})
+    elif status == "completed" or progress >= 0.5:
+        llm_stage.update({"status": "completed", "progress": 100, "detail": "문장 정제 완료"})
+        if timestamp:
+            llm_stage["completed_at"] = timestamp
+    elif current_stage == "refining" or entry:
+        llm_stage.update({"status": "running", "progress": max(1, llm_progress), "detail": "문장 정제 진행 중"})
+
+    if status == "failed" and current_stage == "refining" and progress > 0.5:
+        realign_stage.update({"status": "failed", "progress": max(1, realign_progress), "detail": "정제 후 재정렬 실패"})
+    elif status == "completed":
+        realign_stage.update({"status": "completed", "progress": 100, "detail": "정제 후 재정렬 완료"})
+        if timestamp:
+            realign_stage["completed_at"] = timestamp
+    elif progress > 0.5:
+        realign_stage.update({"status": "running", "progress": max(1, realign_progress), "detail": "정제 후 재정렬 진행 중"})
+
+
+def _stage_progress(entry: dict[str, object] | None) -> float:
+    if not entry:
+        return 0.0
+    value = entry.get("progress")
+    if not isinstance(value, (int, float)):
+        return 0.0
+    numeric = float(value)
+    if numeric > 1.0:
+        numeric = numeric / 100.0
+    return max(0.0, min(1.0, numeric))
+
+
+def _entry_timestamp(entry: dict[str, object] | None) -> str | None:
+    if not entry:
+        return None
+    timestamp = entry.get("timestamp")
+    return timestamp if isinstance(timestamp, str) and timestamp else None
+
+
+def _chalna_chunk_detail(payload: dict[str, object], fallback: str) -> str:
+    chunk = payload.get("chunks_completed")
+    total = payload.get("total_chunks")
+    if isinstance(chunk, int) and isinstance(total, int) and total > 0:
+        return f"음성 인식 chunk {chunk}/{total} 처리 중"
+    return fallback
 
 
 def _save_report(db, project_id: str, total_duration: int, report_markdown: str) -> None:

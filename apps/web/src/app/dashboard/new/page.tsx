@@ -8,6 +8,25 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 type SourceMode = "file" | "youtube";
+type TargetDurationMinutes = 20 | 40 | 60;
+
+const TARGET_DURATION_OPTIONS: {
+  value: TargetDurationMinutes;
+  label: string;
+  description: string;
+}[] = [
+  { value: 20, label: "20분", description: "18-22분" },
+  { value: 40, label: "40분", description: "36-44분" },
+  { value: 60, label: "1시간", description: "54-66분" },
+];
+
+function getTargetDurationRange(minutes: TargetDurationMinutes) {
+  const targetSeconds = minutes * 60;
+  return {
+    minSeconds: Math.floor(targetSeconds * 0.9),
+    maxSeconds: Math.ceil(targetSeconds * 1.1),
+  };
+}
 
 export default function NewProjectPage() {
   const router = useRouter();
@@ -18,6 +37,7 @@ export default function NewProjectPage() {
   const [sourceMode, setSourceMode] = useState<SourceMode>("file");
   const [name, setName] = useState("");
   const [cutType, setCutType] = useState("subtitle_cut");
+  const [targetDuration, setTargetDuration] = useState<TargetDurationMinutes>(20);
   const [language, setLanguage] = useState("ko");
   const [context, setContext] = useState("");
   const [uploading, setUploading] = useState(false);
@@ -27,6 +47,7 @@ export default function NewProjectPage() {
 
   // File upload state
   const [file, setFile] = useState<File | null>(null);
+  const [fileDurationSeconds, setFileDurationSeconds] = useState<number | null>(null);
 
   // YouTube state
   const [youtubeUrl, setYoutubeUrl] = useState("");
@@ -34,12 +55,20 @@ export default function NewProjectPage() {
   const [ytLoading, setYtLoading] = useState(false);
   const [ytTaskId, setYtTaskId] = useState<string | null>(null);
 
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = e.target.files?.[0];
     if (!selected) return;
     setFile(selected);
+    setFileDurationSeconds(null);
+    setError("");
     if (!name) {
       setName(selected.name.replace(/\.[^.]+$/, ""));
+    }
+    try {
+      const duration = await getVideoDuration(selected);
+      setFileDurationSeconds(duration);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "영상 메타데이터를 읽을 수 없습니다");
     }
   };
 
@@ -69,6 +98,15 @@ export default function NewProjectPage() {
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
     if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
     return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  };
+
+  const validateTargetDuration = (sourceDurationSeconds: number) => {
+    const range = getTargetDurationRange(targetDuration);
+    if (sourceDurationSeconds < range.minSeconds) {
+      throw new Error(
+        `선택한 결과 길이는 원본이 최소 ${formatDuration(range.minSeconds)} 이상이어야 합니다`
+      );
+    }
   };
 
   // Fetch YouTube info when URL changes
@@ -109,7 +147,10 @@ export default function NewProjectPage() {
           setUploadProgress(95);
 
           // Create project with downloaded file
-          const projectSettings: Record<string, unknown> = {};
+          validateTargetDuration(task.duration_seconds);
+          const projectSettings: Record<string, unknown> = {
+            output_target_duration_minutes: targetDuration,
+          };
           if (context.trim()) {
             projectSettings.transcription_context = context.trim();
           }
@@ -143,7 +184,7 @@ export default function NewProjectPage() {
     };
 
     poll();
-  }, [name, cutType, language, context, router]);
+  }, [name, cutType, targetDuration, language, context, router]);
 
   // Start YouTube download flow
   const handleYoutubeSubmit = async (e: React.FormEvent) => {
@@ -186,6 +227,7 @@ export default function NewProjectPage() {
       const token = session.access_token;
 
       const duration = await getVideoDuration(file);
+      validateTargetDuration(duration);
 
       setUploadProgress(5);
       const r2Key = await uploadFile(token, file, (loaded, total) => {
@@ -195,7 +237,9 @@ export default function NewProjectPage() {
       setUploadProgress(95);
       setProgressLabel("프로젝트 생성 중...");
 
-      const projectSettings: Record<string, unknown> = {};
+      const projectSettings: Record<string, unknown> = {
+        output_target_duration_minutes: targetDuration,
+      };
       if (context.trim()) {
         projectSettings.transcription_context = context.trim();
       }
@@ -221,9 +265,15 @@ export default function NewProjectPage() {
   };
 
   const handleSubmit = sourceMode === "youtube" ? handleYoutubeSubmit : handleFileSubmit;
+  const sourceDurationSeconds = sourceMode === "youtube"
+    ? ytInfo?.duration_seconds ?? null
+    : fileDurationSeconds;
+  const selectedTargetRange = getTargetDurationRange(targetDuration);
+  const targetDurationUnavailable = sourceDurationSeconds !== null
+    && sourceDurationSeconds < selectedTargetRange.minSeconds;
   const canSubmit = sourceMode === "youtube"
-    ? !!youtubeUrl.trim() && !!name && !uploading
-    : !!file && !!name && !uploading;
+    ? !!youtubeUrl.trim() && !!name && !uploading && !targetDurationUnavailable
+    : !!file && !!name && !uploading && !targetDurationUnavailable;
 
   return (
     <div className="min-h-screen bg-gray-950 text-white">
@@ -396,6 +446,39 @@ export default function NewProjectPage() {
                 </p>
               </button>
             </div>
+          </div>
+
+          {/* Target duration */}
+          <div>
+            <label className="block text-sm font-medium mb-2">결과 길이</label>
+            <div className="grid grid-cols-3 gap-2">
+              {TARGET_DURATION_OPTIONS.map((option) => {
+                const range = getTargetDurationRange(option.value);
+                const isUnavailable = sourceDurationSeconds !== null
+                  && sourceDurationSeconds < range.minSeconds;
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    onClick={() => setTargetDuration(option.value)}
+                    disabled={isUnavailable}
+                    className={`p-3 rounded-lg border text-left transition disabled:opacity-40 disabled:cursor-not-allowed ${
+                      targetDuration === option.value
+                        ? "border-white bg-gray-800"
+                        : "border-gray-700 hover:border-gray-500"
+                    }`}
+                  >
+                    <p className="font-medium">{option.label}</p>
+                    <p className="text-xs text-gray-400 mt-1">±10% · {option.description}</p>
+                  </button>
+                );
+              })}
+            </div>
+            {targetDurationUnavailable && (
+              <p className="text-sm text-red-300 mt-2">
+                선택한 결과 길이는 원본이 최소 {formatDuration(selectedTargetRange.minSeconds)} 이상이어야 합니다.
+              </p>
+            )}
           </div>
 
           {/* Language */}

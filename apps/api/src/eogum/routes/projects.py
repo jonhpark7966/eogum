@@ -16,9 +16,46 @@ from eogum.services.r2 import download_to_bytes
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
+ALLOWED_TARGET_DURATION_MINUTES = {20, 40, 60}
+
+
+def _validate_project_settings(req: ProjectCreate) -> None:
+    target = (req.settings or {}).get("output_target_duration_minutes")
+    if target is None:
+        return
+
+    if isinstance(target, bool):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="결과 길이는 20, 40, 60분 중 하나여야 합니다",
+        )
+
+    try:
+        target_minutes = int(target)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="결과 길이는 20, 40, 60분 중 하나여야 합니다",
+        ) from None
+
+    if target_minutes not in ALLOWED_TARGET_DURATION_MINUTES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="결과 길이는 20, 40, 60분 중 하나여야 합니다",
+        )
+
+    min_source_seconds = int(target_minutes * 60 * 0.9)
+    if req.source_duration_seconds < min_source_seconds:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{target_minutes}분 결과물을 만들려면 원본이 최소 {min_source_seconds}초 이상이어야 합니다",
+        )
+
 
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
 def create_project(req: ProjectCreate, user_id: str = Depends(get_user_id)):
+    _validate_project_settings(req)
+
     # Check credits
     balance = get_balance(user_id)
     if balance["available_seconds"] < req.source_duration_seconds:

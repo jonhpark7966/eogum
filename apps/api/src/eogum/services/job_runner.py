@@ -166,6 +166,7 @@ def _process_project(project_id: str) -> None:
             context_path=storyline_path,
             output_dir=str(output_dir),
             extra_sources=extra_source_paths or None,
+            target_duration_minutes=_output_target_duration_minutes(project),
         )
         _update_progress(db, job_id, 75)
 
@@ -243,6 +244,19 @@ def _process_project(project_id: str) -> None:
         # Cleanup temp files
         import shutil
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _output_target_duration_minutes(project: dict) -> int | None:
+    target = (project.get("settings") or {}).get("output_target_duration_minutes")
+    if target is None or isinstance(target, bool):
+        return None
+    try:
+        target_minutes = int(target)
+    except (TypeError, ValueError):
+        return None
+    if target_minutes not in {20, 40, 60}:
+        return None
+    return target_minutes
 
 
 def _resolve_extra_source_offsets(extra_sources: list[dict]) -> list[int] | None:

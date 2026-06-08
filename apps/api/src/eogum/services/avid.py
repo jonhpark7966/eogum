@@ -156,6 +156,7 @@ def subtitle_cut(
     output_dir: str | None = None,
     final: bool = False,
     extra_sources: list[str] | None = None,
+    target_duration_minutes: int | None = None,
 ) -> dict[str, str]:
     """Run avid subtitle-cut (Pass 2). Returns result paths dict."""
     args = _apply_provider_args(["subtitle-cut", source_path, "--srt", srt_path])
@@ -165,6 +166,8 @@ def subtitle_cut(
         args += ["-d", output_dir]
     if final:
         args += ["--final"]
+    if target_duration_minutes is not None:
+        args += ["--target-duration-minutes", str(target_duration_minutes)]
     for src in extra_sources or []:
         args += ["--extra-source", src]
 
@@ -179,6 +182,7 @@ def podcast_cut(
     output_dir: str | None = None,
     final: bool = False,
     extra_sources: list[str] | None = None,
+    target_duration_minutes: int | None = None,
 ) -> dict[str, str]:
     """Run avid podcast-cut (Pass 2). Returns result paths dict."""
     args = _apply_provider_args(["podcast-cut", source_path])
@@ -190,6 +194,8 @@ def podcast_cut(
         args += ["-d", output_dir]
     if final:
         args += ["--final"]
+    if target_duration_minutes is not None:
+        args += ["--target-duration-minutes", str(target_duration_minutes)]
     for src in extra_sources or []:
         args += ["--extra-source", src]
 

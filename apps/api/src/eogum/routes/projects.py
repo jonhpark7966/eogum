@@ -410,7 +410,6 @@ def delete_project(project_id: str, user_id: str = Depends(get_user_id)):
         .eq("project_id", project_id)
         .in_("status", ["pending", "running", "cancel_requested"])
         .limit(1)
-        .maybe_single()
         .execute()
     )
     if active_job.data:

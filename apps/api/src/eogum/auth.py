@@ -3,7 +3,7 @@ import logging
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jwt import PyJWKClient
+from jwt import PyJWKClient, PyJWKClientError
 
 from eogum.config import settings
 
@@ -26,6 +26,9 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) 
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired")
+    except PyJWKClientError as e:
+        logger.error("JWT signing key lookup failed: %s", e)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
     except jwt.InvalidTokenError as e:
         logger.error("JWT verification failed: %s", e)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")

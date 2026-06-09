@@ -29,6 +29,7 @@ def transcribe_to_srt(
     diarize: bool = True,
     tag_audio_events: bool = True,
     num_speakers: int | None = None,
+    use_llm_segmentation: bool = True,
     use_llm_refinement: bool = True,
     on_status: StatusCallback | None = None,
     timeout_seconds: float = 7200.0,
@@ -50,6 +51,7 @@ def transcribe_to_srt(
     form_data = {
         "language": language,
         "use_alignment": "false",
+        "use_llm_segmentation": str(use_llm_segmentation).lower(),
         "use_llm_refinement": str(use_llm_refinement).lower(),
         "diarize": str(diarize).lower(),
         "tag_audio_events": str(tag_audio_events).lower(),

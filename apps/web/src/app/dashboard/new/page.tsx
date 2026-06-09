@@ -35,6 +35,7 @@ export default function NewProjectPage() {
   const [diarize, setDiarize] = useState(true);
   const [tagAudioEvents, setTagAudioEvents] = useState(true);
   const [numSpeakers, setNumSpeakers] = useState("");
+  const [useLlmSegmentation, setUseLlmSegmentation] = useState(true);
   const [useLlmRefinement, setUseLlmRefinement] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
@@ -97,6 +98,7 @@ export default function NewProjectPage() {
       edit_intensity: editIntensity,
       diarize,
       tag_audio_events: tagAudioEvents,
+      use_llm_segmentation: useLlmSegmentation,
       use_llm_refinement: useLlmRefinement,
     };
     const speakerCount = Number(numSpeakers);
@@ -107,7 +109,15 @@ export default function NewProjectPage() {
       projectSettings.transcription_context = context.trim();
     }
     return projectSettings;
-  }, [context, diarize, editIntensity, numSpeakers, tagAudioEvents, useLlmRefinement]);
+  }, [
+    context,
+    diarize,
+    editIntensity,
+    numSpeakers,
+    tagAudioEvents,
+    useLlmSegmentation,
+    useLlmRefinement,
+  ]);
 
   // Fetch YouTube info when URL changes
   const fetchYoutubeInfo = async () => {
@@ -524,6 +534,21 @@ export default function NewProjectPage() {
                   type="checkbox"
                   checked={tagAudioEvents}
                   onChange={(e) => setTagAudioEvents(e.target.checked)}
+                  className="h-4 w-4 accent-white"
+                />
+              </label>
+
+              <label className="flex items-center justify-between gap-4 text-sm">
+                <span>
+                  <span className="block font-medium">LLM 자막 구간 나누기</span>
+                  <span className="block text-xs text-gray-500">
+                    Scribe word timestamp 기준으로 의미 단위 자막 구간 결정
+                  </span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={useLlmSegmentation}
+                  onChange={(e) => setUseLlmSegmentation(e.target.checked)}
                   className="h-4 w-4 accent-white"
                 />
               </label>

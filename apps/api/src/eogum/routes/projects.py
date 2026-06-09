@@ -97,7 +97,7 @@ def _validate_project_settings(req: ProjectCreate) -> None:
                 detail=f"{target_minutes}분 결과물을 만들려면 원본이 최소 {min_source_seconds}초 이상이어야 합니다",
             )
 
-    for key in ("diarize", "tag_audio_events", "use_llm_refinement"):
+    for key in ("diarize", "tag_audio_events", "use_llm_segmentation", "use_llm_refinement"):
         value = settings_value.get(key)
         if value is not None and not isinstance(value, bool):
             raise HTTPException(

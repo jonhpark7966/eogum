@@ -165,6 +165,11 @@ def _process_project(project_id: str) -> None:
             "use_llm_refinement",
             default=True,
         )
+        use_llm_segmentation = _bool_project_setting(
+            project_settings,
+            "use_llm_segmentation",
+            default=True,
+        )
         srt_path = chalna.transcribe_to_srt(
             source_path,
             language=project["language"],
@@ -177,11 +182,16 @@ def _process_project(project_id: str) -> None:
                 default=True,
             ),
             num_speakers=_optional_int_project_setting(project_settings, "num_speakers"),
+            use_llm_segmentation=use_llm_segmentation,
             use_llm_refinement=use_llm_refinement,
             on_status=lambda payload: _update_chalna_pipeline_status(
                 db,
                 job_id,
-                {**payload, "use_llm_refinement": use_llm_refinement},
+                {
+                    **payload,
+                    "use_llm_segmentation": use_llm_segmentation,
+                    "use_llm_refinement": use_llm_refinement,
+                },
             ),
         )
         _update_progress(db, job_id, 30)
@@ -877,7 +887,21 @@ def _optional_int_project_setting(settings_value: dict, key: str) -> int | None:
         return None
 
 
-def _initial_pipeline_stages(*, use_llm_refinement: bool = True) -> list[dict[str, object]]:
+def _initial_pipeline_stages(
+    *,
+    use_llm_segmentation: bool = True,
+    use_llm_refinement: bool = True,
+) -> list[dict[str, object]]:
+    transcribe_label = (
+        "Scribe V2 + LLM segmentation"
+        if use_llm_segmentation
+        else "Scribe V2 transcription"
+    )
+    transcribe_detail = (
+        "Scribe V2 전사 및 자막 구간 나누기 대기 중"
+        if use_llm_segmentation
+        else "Scribe V2 전사 대기 중"
+    )
     stages: list[dict[str, object]] = [
         {
             "id": "validate_audio",
@@ -888,10 +912,10 @@ def _initial_pipeline_stages(*, use_llm_refinement: bool = True) -> list[dict[st
         },
         {
             "id": "scribe_v2_transcribe",
-            "label": "Scribe V2 transcription",
+            "label": transcribe_label,
             "status": "pending",
             "progress": 0,
-            "detail": "Scribe V2 전사 대기 중",
+            "detail": transcribe_detail,
         },
     ]
     if use_llm_refinement:
@@ -928,8 +952,12 @@ def _update_chalna_pipeline_status(db, job_id: str | None, payload: dict[str, ob
 
 
 def _build_chalna_pipeline_stages(payload: dict[str, object]) -> list[dict[str, object]]:
+    use_llm_segmentation = payload.get("use_llm_segmentation")
     use_llm_refinement = payload.get("use_llm_refinement")
     stages = _initial_pipeline_stages(
+        use_llm_segmentation=(
+            use_llm_segmentation if isinstance(use_llm_segmentation, bool) else True
+        ),
         use_llm_refinement=use_llm_refinement if isinstance(use_llm_refinement, bool) else True,
     )
     status = str(payload.get("status") or "")
@@ -954,15 +982,30 @@ def _build_chalna_pipeline_stages(payload: dict[str, object]) -> list[dict[str, 
         running_detail="미디어 검증 중",
         completed_detail="미디어 검증 완료",
     )
+    transcribing_pending_detail = (
+        "Scribe V2 전사 및 자막 구간 나누기 대기 중"
+        if (use_llm_segmentation if isinstance(use_llm_segmentation, bool) else True)
+        else "Scribe V2 전사 대기 중"
+    )
+    transcribing_running_detail = (
+        "Scribe V2 전사 및 자막 구간 나누기 진행 중"
+        if (use_llm_segmentation if isinstance(use_llm_segmentation, bool) else True)
+        else "Scribe V2 전사 진행 중"
+    )
+    transcribing_completed_detail = (
+        "Scribe V2 전사 및 자막 구간 나누기 완료"
+        if (use_llm_segmentation if isinstance(use_llm_segmentation, bool) else True)
+        else "Scribe V2 전사 완료"
+    )
     _apply_stage(
         stages[1],
         latest.get("transcribing"),
         running=current_stage == "transcribing",
         completed=current_rank > 1 or "refining" in latest or status == "completed",
         failed=status == "failed" and current_stage == "transcribing",
-        pending_detail="Scribe V2 전사 대기 중",
-        running_detail=_chalna_chunk_detail(payload, "Scribe V2 전사 진행 중"),
-        completed_detail="Scribe V2 전사 완료",
+        pending_detail=transcribing_pending_detail,
+        running_detail=_chalna_chunk_detail(payload, transcribing_running_detail),
+        completed_detail=transcribing_completed_detail,
     )
     if len(stages) > 2:
         _apply_stage(

@@ -40,6 +40,10 @@ export default function NewProjectPage() {
   const [targetDuration, setTargetDuration] = useState<TargetDurationMinutes>(20);
   const [language, setLanguage] = useState("ko");
   const [context, setContext] = useState("");
+  const [diarize, setDiarize] = useState(true);
+  const [tagAudioEvents, setTagAudioEvents] = useState(true);
+  const [numSpeakers, setNumSpeakers] = useState("");
+  const [useLlmRefinement, setUseLlmRefinement] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
@@ -100,14 +104,31 @@ export default function NewProjectPage() {
     return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
   };
 
-  const validateTargetDuration = (sourceDurationSeconds: number) => {
+  const validateTargetDuration = useCallback((sourceDurationSeconds: number) => {
     const range = getTargetDurationRange(targetDuration);
     if (sourceDurationSeconds < range.minSeconds) {
       throw new Error(
         `선택한 결과 길이는 원본이 최소 ${formatDuration(range.minSeconds)} 이상이어야 합니다`
       );
     }
-  };
+  }, [targetDuration]);
+
+  const buildProjectSettings = useCallback(() => {
+    const projectSettings: Record<string, unknown> = {
+      output_target_duration_minutes: targetDuration,
+      diarize,
+      tag_audio_events: tagAudioEvents,
+      use_llm_refinement: useLlmRefinement,
+    };
+    const speakerCount = Number(numSpeakers);
+    if (numSpeakers.trim() && Number.isInteger(speakerCount)) {
+      projectSettings.num_speakers = speakerCount;
+    }
+    if (context.trim()) {
+      projectSettings.transcription_context = context.trim();
+    }
+    return projectSettings;
+  }, [context, diarize, numSpeakers, tagAudioEvents, targetDuration, useLlmRefinement]);
 
   // Fetch YouTube info when URL changes
   const fetchYoutubeInfo = async () => {
@@ -148,12 +169,6 @@ export default function NewProjectPage() {
 
           // Create project with downloaded file
           validateTargetDuration(task.duration_seconds);
-          const projectSettings: Record<string, unknown> = {
-            output_target_duration_minutes: targetDuration,
-          };
-          if (context.trim()) {
-            projectSettings.transcription_context = context.trim();
-          }
           const project = await api.createProject(token, {
             name,
             cut_type: cutType,
@@ -162,7 +177,7 @@ export default function NewProjectPage() {
             source_filename: task.filename || "youtube.mp4",
             source_duration_seconds: task.duration_seconds,
             source_size_bytes: task.filesize_bytes,
-            settings: projectSettings,
+            settings: buildProjectSettings(),
           });
 
           setUploadProgress(100);
@@ -184,7 +199,7 @@ export default function NewProjectPage() {
     };
 
     poll();
-  }, [name, cutType, targetDuration, language, context, router]);
+  }, [buildProjectSettings, cutType, language, name, router, validateTargetDuration]);
 
   // Start YouTube download flow
   const handleYoutubeSubmit = async (e: React.FormEvent) => {
@@ -237,12 +252,6 @@ export default function NewProjectPage() {
       setUploadProgress(95);
       setProgressLabel("프로젝트 생성 중...");
 
-      const projectSettings: Record<string, unknown> = {
-        output_target_duration_minutes: targetDuration,
-      };
-      if (context.trim()) {
-        projectSettings.transcription_context = context.trim();
-      }
       const project = await api.createProject(token, {
         name,
         cut_type: cutType,
@@ -251,7 +260,7 @@ export default function NewProjectPage() {
         source_filename: file.name,
         source_duration_seconds: duration,
         source_size_bytes: file.size,
-        settings: projectSettings,
+        settings: buildProjectSettings(),
       });
 
       setUploadProgress(100);
@@ -271,9 +280,12 @@ export default function NewProjectPage() {
   const selectedTargetRange = getTargetDurationRange(targetDuration);
   const targetDurationUnavailable = sourceDurationSeconds !== null
     && sourceDurationSeconds < selectedTargetRange.minSeconds;
+  const speakerCount = Number(numSpeakers);
+  const numSpeakersInvalid = numSpeakers.trim() !== ""
+    && (!Number.isInteger(speakerCount) || speakerCount < 1 || speakerCount > 32);
   const canSubmit = sourceMode === "youtube"
-    ? !!youtubeUrl.trim() && !!name && !uploading && !targetDurationUnavailable
-    : !!file && !!name && !uploading && !targetDurationUnavailable;
+    ? !!youtubeUrl.trim() && !!name && !uploading && !targetDurationUnavailable && !numSpeakersInvalid
+    : !!file && !!name && !uploading && !targetDurationUnavailable && !numSpeakersInvalid;
 
   return (
     <div className="min-h-screen bg-gray-950 text-white">
@@ -507,6 +519,70 @@ export default function NewProjectPage() {
               rows={3}
               className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-3 focus:outline-none focus:border-gray-500 resize-y"
             />
+          </div>
+
+          {/* Scribe options */}
+          <div>
+            <label className="block text-sm font-medium mb-3">자막 생성 옵션</label>
+            <div className="space-y-3 rounded-lg border border-gray-800 bg-gray-900/70 p-4">
+              <label className="flex items-center justify-between gap-4 text-sm">
+                <span>
+                  <span className="block font-medium">화자 분리</span>
+                  <span className="block text-xs text-gray-500">Scribe V2 diarization 사용</span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={diarize}
+                  onChange={(e) => setDiarize(e.target.checked)}
+                  className="h-4 w-4 accent-white"
+                />
+              </label>
+
+              <div>
+                <label className="block text-sm font-medium mb-2">
+                  예상 화자 수 <span className="text-gray-500 font-normal">(선택)</span>
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  max={32}
+                  value={numSpeakers}
+                  onChange={(e) => setNumSpeakers(e.target.value)}
+                  placeholder="자동"
+                  disabled={!diarize}
+                  className="w-full bg-gray-950 border border-gray-700 rounded-lg px-4 py-3 focus:outline-none focus:border-gray-500 disabled:opacity-50"
+                />
+                {numSpeakersInvalid && (
+                  <p className="text-sm text-red-300 mt-2">예상 화자 수는 1에서 32 사이여야 합니다.</p>
+                )}
+              </div>
+
+              <label className="flex items-center justify-between gap-4 text-sm">
+                <span>
+                  <span className="block font-medium">오디오 이벤트 태깅</span>
+                  <span className="block text-xs text-gray-500">웃음, 음악 같은 비언어 이벤트 포함</span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={tagAudioEvents}
+                  onChange={(e) => setTagAudioEvents(e.target.checked)}
+                  className="h-4 w-4 accent-white"
+                />
+              </label>
+
+              <label className="flex items-center justify-between gap-4 text-sm">
+                <span>
+                  <span className="block font-medium">LLM 자막 교정</span>
+                  <span className="block text-xs text-gray-500">Scribe V2 결과 이후 텍스트만 다듬기</span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={useLlmRefinement}
+                  onChange={(e) => setUseLlmRefinement(e.target.checked)}
+                  className="h-4 w-4 accent-white"
+                />
+              </label>
+            </div>
           </div>
 
           {error && (

@@ -144,13 +144,31 @@ def _process_project(project_id: str) -> None:
         _update_progress(db, job_id, 10)
 
         # 3. Transcribe
-        transcription_context = (project.get("settings") or {}).get("transcription_context")
+        project_settings = project.get("settings") or {}
+        transcription_context = project_settings.get("transcription_context")
+        use_llm_refinement = _bool_project_setting(
+            project_settings,
+            "use_llm_refinement",
+            default=True,
+        )
         srt_path = chalna.transcribe_to_srt(
             source_path,
             language=project["language"],
             output_dir=str(temp_dir),
             context=transcription_context,
-            on_status=lambda payload: _update_chalna_pipeline_status(db, job_id, payload),
+            diarize=_bool_project_setting(project_settings, "diarize", default=True),
+            tag_audio_events=_bool_project_setting(
+                project_settings,
+                "tag_audio_events",
+                default=True,
+            ),
+            num_speakers=_optional_int_project_setting(project_settings, "num_speakers"),
+            use_llm_refinement=use_llm_refinement,
+            on_status=lambda payload: _update_chalna_pipeline_status(
+                db,
+                job_id,
+                {**payload, "use_llm_refinement": use_llm_refinement},
+            ),
         )
         _update_progress(db, job_id, 30)
 
@@ -488,37 +506,49 @@ def _update_progress(db, job_id: str, progress: int) -> None:
     db.table("jobs").update({"progress": progress}).eq("id", job_id).execute()
 
 
-def _initial_pipeline_stages() -> list[dict[str, object]]:
-    return [
+def _bool_project_setting(settings_value: dict, key: str, *, default: bool) -> bool:
+    value = settings_value.get(key)
+    return value if isinstance(value, bool) else default
+
+
+def _optional_int_project_setting(settings_value: dict, key: str) -> int | None:
+    value = settings_value.get(key)
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _initial_pipeline_stages(*, use_llm_refinement: bool = True) -> list[dict[str, object]]:
+    stages: list[dict[str, object]] = [
         {
-            "id": "vibevoice_asr",
-            "label": "VibeVoice-ASR",
+            "id": "validate_audio",
+            "label": "입력 검증",
             "status": "pending",
             "progress": 0,
-            "detail": "음성 인식 대기 중",
+            "detail": "미디어 검증 대기 중",
         },
         {
-            "id": "qwen_forced_aligner",
-            "label": "Qwen forced aligner",
+            "id": "scribe_v2_transcribe",
+            "label": "Scribe V2 transcription",
             "status": "pending",
             "progress": 0,
-            "detail": "1차 타임스탬프 정렬 대기 중",
+            "detail": "Scribe V2 전사 대기 중",
         },
-        {
+    ]
+    if use_llm_refinement:
+        stages.append({
             "id": "llm_refine",
             "label": "LLM refine",
             "status": "pending",
             "progress": 0,
             "detail": "문장 정제 대기 중",
-        },
-        {
-            "id": "qwen_forced_aligner_after_refine",
-            "label": "Qwen forced aligner after refine",
-            "status": "pending",
-            "progress": 0,
-            "detail": "정제 후 재정렬 대기 중",
-        },
-    ]
+        })
+    return stages
 
 
 def _update_chalna_pipeline_status(db, job_id: str | None, payload: dict[str, object]) -> None:
@@ -544,7 +574,10 @@ def _update_chalna_pipeline_status(db, job_id: str | None, payload: dict[str, ob
 
 
 def _build_chalna_pipeline_stages(payload: dict[str, object]) -> list[dict[str, object]]:
-    stages = _initial_pipeline_stages()
+    use_llm_refinement = payload.get("use_llm_refinement")
+    stages = _initial_pipeline_stages(
+        use_llm_refinement=use_llm_refinement if isinstance(use_llm_refinement, bool) else True,
+    )
     status = str(payload.get("status") or "")
     current_stage = str(payload.get("current_stage") or "")
     history_value = payload.get("progress_history") or []
@@ -554,32 +587,40 @@ def _build_chalna_pipeline_stages(payload: dict[str, object]) -> list[dict[str, 
     current_rank = {
         "validating": 0,
         "transcribing": 1,
-        "loading_models": 2,
-        "aligning": 3,
-        "refining": 4,
+        "refining": 2,
     }.get(current_stage, -1)
 
     _apply_stage(
         stages[0],
-        latest.get("transcribing"),
-        running=current_stage == "transcribing",
-        completed=current_rank > 1 or "aligning" in latest or "refining" in latest or status == "completed",
-        failed=status == "failed" and current_stage == "transcribing",
-        pending_detail="음성 인식 대기 중",
-        running_detail=_chalna_chunk_detail(payload, "음성 인식 진행 중"),
-        completed_detail="음성 인식 완료",
+        latest.get("validating"),
+        running=current_stage == "validating",
+        completed=current_rank > 0 or "transcribing" in latest or status == "completed",
+        failed=status == "failed" and current_stage == "validating",
+        pending_detail="미디어 검증 대기 중",
+        running_detail="미디어 검증 중",
+        completed_detail="미디어 검증 완료",
     )
     _apply_stage(
         stages[1],
-        latest.get("aligning"),
-        running=current_stage == "aligning" or current_stage == "loading_models",
-        completed=current_rank > 3 or "refining" in latest or status == "completed",
-        failed=status == "failed" and current_stage in {"loading_models", "aligning"},
-        pending_detail="1차 타임스탬프 정렬 대기 중",
-        running_detail="Qwen forced aligner 실행 중",
-        completed_detail="1차 타임스탬프 정렬 완료",
+        latest.get("transcribing"),
+        running=current_stage == "transcribing",
+        completed=current_rank > 1 or "refining" in latest or status == "completed",
+        failed=status == "failed" and current_stage == "transcribing",
+        pending_detail="Scribe V2 전사 대기 중",
+        running_detail=_chalna_chunk_detail(payload, "Scribe V2 전사 진행 중"),
+        completed_detail="Scribe V2 전사 완료",
     )
-    _apply_refinement_stages(stages, latest.get("refining"), current_stage=current_stage, status=status)
+    if len(stages) > 2:
+        _apply_stage(
+            stages[2],
+            latest.get("refining"),
+            running=current_stage == "refining",
+            completed=status == "completed",
+            failed=status == "failed" and current_stage == "refining",
+            pending_detail="문장 정제 대기 중",
+            running_detail="문장 정제 진행 중",
+            completed_detail="문장 정제 완료",
+        )
 
     return stages
 
@@ -626,44 +667,6 @@ def _apply_stage(
         return
 
     stage["detail"] = pending_detail
-
-
-def _apply_refinement_stages(
-    stages: list[dict[str, object]],
-    entry: dict[str, object] | None,
-    *,
-    current_stage: str,
-    status: str,
-) -> None:
-    progress = _stage_progress(entry) if entry else 0.0
-    timestamp = _entry_timestamp(entry)
-    llm_stage = stages[2]
-    realign_stage = stages[3]
-    llm_progress = min(100, round(min(progress, 0.5) * 200))
-    realign_progress = min(100, round(max(0.0, progress - 0.5) * 200))
-
-    if timestamp:
-        llm_stage["started_at"] = timestamp
-        if progress >= 0.5:
-            realign_stage["started_at"] = timestamp
-
-    if status == "failed" and current_stage == "refining" and progress <= 0.5:
-        llm_stage.update({"status": "failed", "progress": max(1, llm_progress), "detail": "문장 정제 실패"})
-    elif status == "completed" or progress >= 0.5:
-        llm_stage.update({"status": "completed", "progress": 100, "detail": "문장 정제 완료"})
-        if timestamp:
-            llm_stage["completed_at"] = timestamp
-    elif current_stage == "refining" or entry:
-        llm_stage.update({"status": "running", "progress": max(1, llm_progress), "detail": "문장 정제 진행 중"})
-
-    if status == "failed" and current_stage == "refining" and progress > 0.5:
-        realign_stage.update({"status": "failed", "progress": max(1, realign_progress), "detail": "정제 후 재정렬 실패"})
-    elif status == "completed":
-        realign_stage.update({"status": "completed", "progress": 100, "detail": "정제 후 재정렬 완료"})
-        if timestamp:
-            realign_stage["completed_at"] = timestamp
-    elif progress > 0.5:
-        realign_stage.update({"status": "running", "progress": max(1, realign_progress), "detail": "정제 후 재정렬 진행 중"})
 
 
 def _stage_progress(entry: dict[str, object] | None) -> float:

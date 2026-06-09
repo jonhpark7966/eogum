@@ -338,7 +338,7 @@ export default function LandingPage() {
                 </svg>
               }
               title="자동 자막 생성"
-              desc="Whisper 기반 음성 인식 + LLM 후처리로 높은 정확도의 자막을 생성합니다."
+              desc="Scribe V2 음성 인식 + 선택적 LLM 후처리로 정확한 자막을 생성합니다."
             />
             <FeatureCard
               icon={

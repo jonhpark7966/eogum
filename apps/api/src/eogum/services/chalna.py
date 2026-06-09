@@ -26,6 +26,10 @@ def transcribe_to_srt(
     language: str = "ko",
     output_dir: str | None = None,
     context: str | None = None,
+    diarize: bool = True,
+    tag_audio_events: bool = True,
+    num_speakers: int | None = None,
+    use_llm_refinement: bool = True,
     on_status: StatusCallback | None = None,
     timeout_seconds: float = 7200.0,
     poll_interval_seconds: float = 1.0,
@@ -43,20 +47,26 @@ def transcribe_to_srt(
     output_path = output_root / "source.srt"
 
     base_url = settings.chalna_url.rstrip("/")
+    form_data = {
+        "language": language,
+        "use_alignment": "false",
+        "use_llm_refinement": str(use_llm_refinement).lower(),
+        "diarize": str(diarize).lower(),
+        "tag_audio_events": str(tag_audio_events).lower(),
+        "output_format": "json",
+        "include_logs": "true",
+        "include_intermediate": "false",
+        **({"context": context} if context else {}),
+    }
+    if num_speakers is not None:
+        form_data["num_speakers"] = str(num_speakers)
+
     with httpx.Client(timeout=60.0) as client:
         with source.open("rb") as file_obj:
             response = client.post(
                 f"{base_url}/transcribe/async",
                 files={"file": (source.name, file_obj, "application/octet-stream")},
-                data={
-                    "language": language,
-                    "use_alignment": "true",
-                    "use_llm_refinement": "true",
-                    "output_format": "json",
-                    "include_logs": "true",
-                    "include_intermediate": "false",
-                    **({"context": context} if context else {}),
-                },
+                data=form_data,
             )
 
     if response.status_code != 200:

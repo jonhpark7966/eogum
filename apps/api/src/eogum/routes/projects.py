@@ -20,35 +20,65 @@ ALLOWED_TARGET_DURATION_MINUTES = {20, 40, 60}
 
 
 def _validate_project_settings(req: ProjectCreate) -> None:
-    target = (req.settings or {}).get("output_target_duration_minutes")
+    settings_value = req.settings or {}
+    target = settings_value.get("output_target_duration_minutes")
     if target is None:
-        return
+        target_minutes = None
+    else:
+        if isinstance(target, bool):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="결과 길이는 20, 40, 60분 중 하나여야 합니다",
+            )
 
-    if isinstance(target, bool):
+        try:
+            target_minutes = int(target)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="결과 길이는 20, 40, 60분 중 하나여야 합니다",
+            ) from None
+
+        if target_minutes not in ALLOWED_TARGET_DURATION_MINUTES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="결과 길이는 20, 40, 60분 중 하나여야 합니다",
+            )
+
+        min_source_seconds = int(target_minutes * 60 * 0.9)
+        if req.source_duration_seconds < min_source_seconds:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{target_minutes}분 결과물을 만들려면 원본이 최소 {min_source_seconds}초 이상이어야 합니다",
+            )
+
+    for key in ("diarize", "tag_audio_events", "use_llm_refinement"):
+        value = settings_value.get(key)
+        if value is not None and not isinstance(value, bool):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{key} 옵션은 true 또는 false여야 합니다",
+            )
+
+    num_speakers = settings_value.get("num_speakers")
+    if num_speakers in (None, ""):
+        return
+    if isinstance(num_speakers, bool):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="결과 길이는 20, 40, 60분 중 하나여야 합니다",
+            detail="예상 화자 수는 1에서 32 사이 숫자여야 합니다",
         )
-
     try:
-        target_minutes = int(target)
+        speaker_count = int(num_speakers)
     except (TypeError, ValueError):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="결과 길이는 20, 40, 60분 중 하나여야 합니다",
+            detail="예상 화자 수는 1에서 32 사이 숫자여야 합니다",
         ) from None
-
-    if target_minutes not in ALLOWED_TARGET_DURATION_MINUTES:
+    if not 1 <= speaker_count <= 32:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="결과 길이는 20, 40, 60분 중 하나여야 합니다",
-        )
-
-    min_source_seconds = int(target_minutes * 60 * 0.9)
-    if req.source_duration_seconds < min_source_seconds:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"{target_minutes}분 결과물을 만들려면 원본이 최소 {min_source_seconds}초 이상이어야 합니다",
+            detail="예상 화자 수는 1에서 32 사이 숫자여야 합니다",
         )
 
 

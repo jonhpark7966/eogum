@@ -125,6 +125,8 @@ class ReviewSegment(EnginePayloadModel):
     index: int
     start_ms: int
     end_ms: int
+    raw_start_ms: int | None = None
+    raw_end_ms: int | None = None
     text: str
     ai: AiDecision | None = None
     human: HumanDecision | None = None

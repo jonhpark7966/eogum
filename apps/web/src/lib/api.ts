@@ -145,6 +145,8 @@ export interface SegmentWithDecision {
   index: number;
   start_ms: number;
   end_ms: number;
+  raw_start_ms?: number | null;
+  raw_end_ms?: number | null;
   text: string;
   ai: AiDecision | null;
   human?: HumanDecision | null;
@@ -155,6 +157,8 @@ export interface EvalSegment {
   index: number;
   start_ms: number;
   end_ms: number;
+  raw_start_ms?: number | null;
+  raw_end_ms?: number | null;
   text: string;
   ai: AiDecision | null;
   human: HumanDecision | null;

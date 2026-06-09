@@ -143,11 +143,7 @@ export default function ReviewPage() {
       const merged: EvalSegment[] = segRes.segments.map((seg: SegmentWithDecision) => {
         const saved = evalMap.get(seg.index);
         return {
-          index: seg.index,
-          start_ms: seg.start_ms,
-          end_ms: seg.end_ms,
-          text: seg.text,
-          ai: seg.ai,
+          ...seg,
           human: saved?.human ?? null,
         };
       });

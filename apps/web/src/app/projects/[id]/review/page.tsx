@@ -48,10 +48,19 @@ const KEEP_REASONS = [
 // ── Helpers ──
 
 function formatTime(ms: number): string {
-  const totalSec = Math.floor(ms / 1000);
-  const m = Math.floor(totalSec / 60);
-  const s = totalSec % 60;
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  const totalMs = Math.max(0, Math.round(ms));
+  const m = Math.floor(totalMs / 60000);
+  const s = Math.floor((totalMs % 60000) / 1000);
+  const millis = totalMs % 1000;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
+}
+
+function msToMediaTime(ms: number): number {
+  return Number((Math.max(0, Math.round(ms)) / 1000).toFixed(3));
+}
+
+function mediaTimeToMs(video: HTMLVideoElement): number {
+  return Math.round(video.currentTime * 1000);
 }
 
 type ReviewMetadata = Pick<
@@ -70,6 +79,7 @@ export default function ReviewPage() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const segmentRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const playEndRef = useRef<number | null>(null);
+  const playFrameRef = useRef<number | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -194,18 +204,60 @@ export default function ReviewPage() {
     };
   }, [finalPreviewJobId, finalPreviewStatus, projectId, supabase]);
 
+  const stopSegmentPlayback = useCallback(() => {
+    const video = videoRef.current;
+    if (video) video.pause();
+    playEndRef.current = null;
+    if (playFrameRef.current !== null) {
+      window.cancelAnimationFrame(playFrameRef.current);
+      playFrameRef.current = null;
+    }
+  }, []);
+
+  const scheduleSegmentPlaybackMonitor = useCallback(() => {
+    if (playFrameRef.current !== null) {
+      window.cancelAnimationFrame(playFrameRef.current);
+      playFrameRef.current = null;
+    }
+
+    const tick = () => {
+      const video = videoRef.current;
+      const endMs = playEndRef.current;
+      if (!video || endMs === null || video.paused || video.ended) {
+        playFrameRef.current = null;
+        return;
+      }
+
+      if (mediaTimeToMs(video) >= endMs) {
+        stopSegmentPlayback();
+        return;
+      }
+
+      playFrameRef.current = window.requestAnimationFrame(tick);
+    };
+
+    playFrameRef.current = window.requestAnimationFrame(tick);
+  }, [stopSegmentPlayback]);
+
+  useEffect(() => {
+    return () => {
+      if (playFrameRef.current !== null) {
+        window.cancelAnimationFrame(playFrameRef.current);
+      }
+    };
+  }, []);
+
   // Video timeupdate → highlight current segment
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
     const onTimeUpdate = () => {
-      const currentMs = video.currentTime * 1000;
+      const currentMs = mediaTimeToMs(video);
 
       // Stop at segment end if playing a specific segment
       if (playEndRef.current !== null && currentMs >= playEndRef.current) {
-        video.pause();
-        playEndRef.current = null;
+        stopSegmentPlayback();
       }
 
       // Find current segment
@@ -228,15 +280,25 @@ export default function ReviewPage() {
 
     video.addEventListener("timeupdate", onTimeUpdate);
     return () => video.removeEventListener("timeupdate", onTimeUpdate);
-  }, [segments, currentIndex]);
+  }, [segments, currentIndex, stopSegmentPlayback]);
 
   // Play segment
   const playSegment = (seg: EvalSegment) => {
     const video = videoRef.current;
     if (!video) return;
-    video.currentTime = seg.start_ms / 1000;
-    playEndRef.current = seg.end_ms;
-    video.play();
+    stopSegmentPlayback();
+    const startMs = Math.round(seg.start_ms);
+    const endMs = Math.round(seg.end_ms);
+    video.currentTime = msToMediaTime(startMs);
+    playEndRef.current = endMs;
+    setCurrentIndex(seg.index);
+    const playPromise = video.play();
+    scheduleSegmentPlaybackMonitor();
+    if (playPromise) {
+      playPromise.catch(() => {
+        stopSegmentPlayback();
+      });
+    }
   };
 
   // Set human decision

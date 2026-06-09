@@ -666,60 +666,93 @@ def _has_audio_stream(source_path: Path) -> bool:
 
 
 def _render_intervals(source_path: Path, intervals: list[tuple[float, float]], output_path: Path) -> None:
+    """Render keep intervals without building one large ffmpeg filter graph.
+
+    A single trim/atrim/concat graph keeps many decoded streams alive at once and
+    can consume tens of GB for ordinary review timelines. Render each interval
+    independently, then concatenate the normalized segment files.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    filter_script = output_path.with_suffix(".filter.txt")
+    segment_dir = output_path.parent / f"{output_path.stem}_segments"
+    segment_dir.mkdir(parents=True, exist_ok=True)
     has_audio = _has_audio_stream(source_path)
 
-    lines: list[str] = []
-    concat_inputs: list[str] = []
+    segment_paths: list[Path] = []
     for index, (start, duration) in enumerate(intervals):
-        lines.append(
-            f"[0:v]trim=start={start:.6f}:duration={duration:.6f},"
-            f"setpts=PTS-STARTPTS[v{index}]"
-        )
-        concat_inputs.append(f"[v{index}]")
-        if has_audio:
-            lines.append(
-                f"[0:a]atrim=start={start:.6f}:duration={duration:.6f},"
-                f"asetpts=PTS-STARTPTS[a{index}]"
-            )
-            concat_inputs.append(f"[a{index}]")
+        if duration <= 0:
+            continue
 
-    concat_args = "".join(concat_inputs)
-    if has_audio:
-        lines.append(f"{concat_args}concat=n={len(intervals)}:v=1:a=1[vcat][acat]")
-    else:
-        lines.append(f"{concat_args}concat=n={len(intervals)}:v=1:a=0[vcat]")
-    filter_script.write_text(";\n".join(lines), encoding="utf-8")
+        segment_path = segment_dir / f"segment_{index:04d}.mp4"
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-ss",
+            f"{max(0.0, start):.6f}",
+            "-i",
+            str(source_path),
+            "-t",
+            f"{duration:.6f}",
+            "-map",
+            "0:v:0",
+        ]
+        if has_audio:
+            cmd += ["-map", "0:a:0"]
+        cmd += [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "28",
+            "-pix_fmt",
+            "yuv420p",
+        ]
+        if has_audio:
+            cmd += ["-c:a", "aac", "-b:a", "128k", "-ac", "2"]
+        else:
+            cmd += ["-an"]
+        cmd += ["-movflags", "+faststart", str(segment_path)]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"final preview segment render failed at interval {index + 1}/{len(intervals)} "
+                f"(start={start:.3f}s, duration={duration:.3f}s): {result.stderr[-1000:]}"
+            )
+        segment_paths.append(segment_path)
+
+    if not segment_paths:
+        raise RuntimeError("미리보기로 렌더링할 keep 구간이 없습니다")
+
+    concat_list = output_path.with_suffix(".concat.txt")
+    concat_list.write_text(
+        "\n".join(f"file '{str(path).replace(chr(39), chr(92) + chr(39))}'" for path in segment_paths),
+        encoding="utf-8",
+    )
 
     cmd = [
         "ffmpeg",
         "-hide_banner",
+        "-nostdin",
         "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
         "-i",
-        str(source_path),
-        "-filter_complex_script",
-        str(filter_script),
-        "-map",
-        "[vcat]",
+        str(concat_list),
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output_path),
     ]
-    if has_audio:
-        cmd += ["-map", "[acat]"]
-    cmd += [
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "28",
-    ]
-    if has_audio:
-        cmd += ["-c:a", "aac", "-b:a", "128k"]
-    cmd += ["-movflags", "+faststart", str(output_path)]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
     if result.returncode != 0:
-        raise RuntimeError(f"final preview render failed: {result.stderr[-1000:]}")
+        raise RuntimeError(f"final preview concat failed: {result.stderr[-1000:]}")
 
 
 def _burn_subtitles(input_path: Path, srt_path: Path | None, output_path: Path) -> None:

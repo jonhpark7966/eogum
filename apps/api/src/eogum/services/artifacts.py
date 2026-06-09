@@ -26,8 +26,9 @@ def get_latest_artifact_job(
     )
     if user_id is not None:
         query = query.eq("user_id", user_id)
-    query = query.order("created_at", desc=True).limit(1).maybe_single()
+    query = query.order("created_at", desc=True).limit(1)
     result = query.execute()
-    if not result.data or not result.data.get("result_r2_keys"):
+    row = result.data[0] if result.data else None
+    if not row or not row.get("result_r2_keys"):
         return None
-    return result.data
+    return row

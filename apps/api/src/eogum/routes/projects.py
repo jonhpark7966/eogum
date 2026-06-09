@@ -64,6 +64,13 @@ def _pending_multicam_state(project: dict, extra_sources: list[dict]) -> dict:
     }
 
 
+def _first_row(result) -> dict | None:
+    data = getattr(result, "data", None)
+    if isinstance(data, list):
+        return data[0] if data else None
+    return data if isinstance(data, dict) else None
+
+
 def _validate_project_settings(req: ProjectCreate) -> None:
     settings_value = req.settings or {}
     target = settings_value.get("output_target_duration_minutes")
@@ -274,10 +281,9 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
         .in_("status", ["pending", "running"])
         .order("created_at", desc=True)
         .limit(1)
-        .maybe_single()
         .execute()
     )
-    if existing_reprocess.data:
+    if _first_row(existing_reprocess):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="이미 재처리 작업이 진행 중입니다",
@@ -359,14 +365,14 @@ def cancel_multicam_reprocess(project_id: str, user_id: str = Depends(get_user_i
         .in_("status", ["pending", "running", "cancel_requested"])
         .order("created_at", desc=True)
         .limit(1)
-        .maybe_single()
         .execute()
     )
-    if not latest.data:
+    latest_job = _first_row(latest)
+    if not latest_job:
         raise HTTPException(status_code=404, detail="취소할 멀티캠 작업이 없습니다")
 
-    job_status = latest.data["status"]
-    job_id = latest.data["id"]
+    job_status = latest_job["status"]
+    job_id = latest_job["id"]
     next_job_status = "canceled" if job_status == "pending" else "cancel_requested"
     job_update = {"status": next_job_status}
     if next_job_status == "canceled":

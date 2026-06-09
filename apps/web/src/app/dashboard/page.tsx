@@ -21,6 +21,7 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; icon: string
   processing: { label: "처리 중",   color: "text-cyan-400",   icon: "⟳", bg: "bg-cyan-400/10" },
   completed:  { label: "완료",      color: "text-emerald-400",icon: "✓", bg: "bg-emerald-400/10" },
   failed:     { label: "실패",      color: "text-red-400",    icon: "✕", bg: "bg-red-400/10" },
+  reprocess_failed: { label: "재적용 실패", color: "text-red-400", icon: "✕", bg: "bg-red-400/10" },
 };
 
 function StatusBadge({ status }: { status: string }) {
@@ -80,15 +81,18 @@ function CreditCard({ credits }: { credits: CreditBalance }) {
 function ProjectCard({
   project,
   onRetry,
+  onDelete,
   retrying,
+  deleting,
   onClick,
 }: {
   project: Project;
   onRetry: (e: MouseEvent) => void;
+  onDelete: (e: MouseEvent) => void;
   retrying: boolean;
+  deleting: boolean;
   onClick: () => void;
 }) {
-  const config = STATUS_CONFIG[project.status] ?? STATUS_CONFIG.created;
   const isProcessing = project.status === "processing" || project.status === "queued";
   const isFailed = project.status === "failed";
   const isCompleted = project.status === "completed";
@@ -104,9 +108,11 @@ function ProjectCard({
   );
 
   return (
-    <button
+    <div
       onClick={onClick}
-      className="group relative w-full text-left"
+      className="group relative w-full cursor-pointer text-left"
+      role="button"
+      tabIndex={0}
     >
       {/* Gradient border on hover */}
       <div className={`absolute -inset-px rounded-xl transition-opacity duration-500 ${
@@ -153,6 +159,14 @@ function ProjectCard({
                 {retrying ? "재시도 중..." : "재시도"}
               </button>
             )}
+            <button
+              onClick={onDelete}
+              disabled={isProcessing || deleting}
+              className="px-3 py-1.5 text-xs font-medium rounded-lg border border-red-500/20 text-red-300 hover:bg-red-500/10 transition disabled:opacity-40 disabled:cursor-not-allowed"
+              title={isProcessing ? "처리 중인 프로젝트는 삭제할 수 없습니다" : "프로젝트 삭제"}
+            >
+              {deleting ? "삭제 중..." : "삭제"}
+            </button>
             <StatusBadge status={project.status} />
           </div>
         </div>
@@ -164,7 +178,7 @@ function ProjectCard({
           </div>
         )}
       </div>
-    </button>
+    </div>
   );
 }
 
@@ -210,6 +224,8 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [retryingId, setRetryingId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
 
   const handleRetry = async (e: MouseEvent, projectId: string) => {
     e.stopPropagation();
@@ -224,6 +240,22 @@ export default function DashboardPage() {
       setError(err instanceof Error ? err.message : "재시도에 실패했습니다");
     } finally {
       setRetryingId(null);
+    }
+  };
+
+  const handleDelete = async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session || !deleteTarget) return;
+
+    setDeletingId(deleteTarget.id);
+    try {
+      await api.deleteProject(session.access_token, deleteTarget.id);
+      setProjects((prev) => prev.filter((project) => project.id !== deleteTarget.id));
+      setDeleteTarget(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "프로젝트 삭제에 실패했습니다");
+    } finally {
+      setDeletingId(null);
     }
   };
 
@@ -343,13 +375,44 @@ export default function DashboardPage() {
                 key={project.id}
                 project={project}
                 onRetry={(e) => handleRetry(e, project.id)}
+                onDelete={(e) => {
+                  e.stopPropagation();
+                  setDeleteTarget(project);
+                }}
                 retrying={retryingId === project.id}
+                deleting={deletingId === project.id}
                 onClick={() => router.push(`/projects/${project.id}`)}
               />
             ))}
           </div>
         )}
       </main>
+      {deleteTarget && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/70 px-4">
+          <div className="w-full max-w-md rounded-2xl border border-white/10 bg-[#0a0f1a] p-6 shadow-2xl">
+            <h2 className="text-lg font-semibold">프로젝트 삭제</h2>
+            <p className="mt-3 text-sm leading-6 text-gray-400">
+              “{deleteTarget.name}” 프로젝트를 삭제합니다. 삭제 후에는 복구할 수 없습니다.
+            </p>
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                onClick={() => setDeleteTarget(null)}
+                disabled={deletingId === deleteTarget.id}
+                className="rounded-lg border border-white/10 px-4 py-2 text-sm text-gray-300 transition hover:bg-white/5 disabled:opacity-50"
+              >
+                취소
+              </button>
+              <button
+                onClick={handleDelete}
+                disabled={deletingId === deleteTarget.id}
+                className="rounded-lg bg-red-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-red-400 disabled:opacity-50"
+              >
+                {deletingId === deleteTarget.id ? "삭제 중..." : "삭제"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

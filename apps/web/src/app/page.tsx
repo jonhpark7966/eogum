@@ -12,7 +12,7 @@ function Waveform({ barCount = 48 }: { barCount?: number }) {
   const bars = useMemo(
     () =>
       Array.from({ length: barCount }, (_, i) => ({
-        height: 20 + Math.random() * 80,
+        height: 20 + ((i * 37) % 80),
         delay: (i * 0.06) % 1.2,
       })),
     [barCount]

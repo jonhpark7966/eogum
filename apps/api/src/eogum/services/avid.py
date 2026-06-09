@@ -3,13 +3,20 @@
 import json
 import logging
 import os
+import signal
 import subprocess
+import tempfile
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from eogum.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class AvidCommandCanceled(RuntimeError):
+    """Raised when an avid-cli subprocess is canceled by the caller."""
 
 
 def _apply_provider_args(args: list[str]) -> list[str]:
@@ -35,19 +42,75 @@ def _build_avid_env() -> dict[str, str]:
     return env
 
 
-def _run_avid(args: list[str], timeout: int = 3600) -> subprocess.CompletedProcess[str]:
+def _run_avid(
+    args: list[str],
+    timeout: int = 3600,
+    is_canceled: Callable[[], bool] | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Run an avid-cli command."""
     cmd = [str(settings.resolved_avid_bin)] + args
     logger.info("Running avid-cli: %s", " ".join(cmd))
 
-    result = subprocess.run(
-        cmd,
-        cwd=str(settings.resolved_avid_backend_root),
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=_build_avid_env(),
-    )
+    with tempfile.TemporaryFile("w+", encoding="utf-8") as stdout_file, tempfile.TemporaryFile(
+        "w+", encoding="utf-8"
+    ) as stderr_file:
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(settings.resolved_avid_backend_root),
+            stdout=stdout_file,
+            stderr=stderr_file,
+            text=True,
+            start_new_session=True,
+            env=_build_avid_env(),
+        )
+        deadline = time.monotonic() + timeout
+
+        while process.poll() is None:
+            if is_canceled and is_canceled():
+                logger.info("Canceling avid-cli process group for: %s", " ".join(cmd))
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                raise AvidCommandCanceled("avid-cli command canceled")
+
+            if time.monotonic() >= deadline:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                raise subprocess.TimeoutExpired(
+                    cmd,
+                    timeout,
+                    output=stdout_file.read(),
+                    stderr=stderr_file.read(),
+                )
+
+            time.sleep(1)
+
+        stdout_file.seek(0)
+        stderr_file.seek(0)
+        stdout = stdout_file.read()
+        stderr = stderr_file.read()
+    result = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
     if result.returncode != 0:
         logger.error("avid-cli stdout: %s", result.stdout[-500:] if result.stdout else "")
@@ -58,11 +121,15 @@ def _run_avid(args: list[str], timeout: int = 3600) -> subprocess.CompletedProce
     return result
 
 
-def _run_avid_json(args: list[str], timeout: int = 3600) -> dict[str, Any]:
+def _run_avid_json(
+    args: list[str],
+    timeout: int = 3600,
+    is_canceled: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     if "--json" not in args:
         args = [*args, "--json"]
 
-    result = _run_avid(args, timeout=timeout)
+    result = _run_avid(args, timeout=timeout, is_canceled=is_canceled)
     stdout = result.stdout.strip()
 
     try:
@@ -232,6 +299,7 @@ def apply_evaluation(
     project_json_path: str,
     evaluation_path: str,
     output_project_json: str,
+    is_canceled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     args = [
         "apply-evaluation",
@@ -239,7 +307,7 @@ def apply_evaluation(
         "--evaluation", evaluation_path,
         "--output-project-json", output_project_json,
     ]
-    return _run_avid_json(args, timeout=300)
+    return _run_avid_json(args, timeout=300, is_canceled=is_canceled)
 
 
 def review_segments(
@@ -258,6 +326,7 @@ def export_project(
     output_path: str | None = None,
     silence_mode: str = "cut",
     content_mode: str = "disabled",
+    is_canceled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     args = [
         "export-project",
@@ -268,7 +337,7 @@ def export_project(
     ]
     if output_path:
         args += ["-o", output_path]
-    return _run_avid_json(args, timeout=3600)
+    return _run_avid_json(args, timeout=3600, is_canceled=is_canceled)
 
 
 def rebuild_multicam(
@@ -277,6 +346,7 @@ def rebuild_multicam(
     extra_sources: list[str],
     output_project_json: str,
     offsets: list[int] | None = None,
+    is_canceled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     args = [
         "rebuild-multicam",
@@ -288,16 +358,17 @@ def rebuild_multicam(
         args += ["--extra-source", src]
     for offset in offsets or []:
         args += ["--offset", str(offset)]
-    return _run_avid_json(args, timeout=3600)
+    return _run_avid_json(args, timeout=3600, is_canceled=is_canceled)
 
 
 def clear_extra_sources(
     project_json_path: str,
     output_project_json: str,
+    is_canceled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     args = [
         "clear-extra-sources",
         "--project-json", project_json_path,
         "--output-project-json", output_project_json,
     ]
-    return _run_avid_json(args, timeout=300)
+    return _run_avid_json(args, timeout=300, is_canceled=is_canceled)

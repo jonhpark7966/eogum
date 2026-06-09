@@ -17,13 +17,17 @@ from eogum.models.schemas import (
     EvalReportResponse,
     EvaluationResponse,
     EvaluationSave,
+    FinalPreviewJobResponse,
+    FinalPreviewRequest,
     ReasonBreakdown,
     SegmentsResponse,
     VideoUrlResponse,
 )
 from eogum.services import avid
+from eogum.services.artifacts import get_latest_artifact_job
 from eogum.services.database import get_db
 from eogum.services.r2 import download_to_bytes, generate_presigned_stream
+from eogum.services.job_runner import enqueue_final_preview
 
 logger = logging.getLogger(__name__)
 
@@ -75,20 +79,11 @@ def _get_completed_job(db, project_id: str, user_id: str):
     if not project.data:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
 
-    job = (
-        db.table("jobs")
-        .select("result_r2_keys")
-        .eq("project_id", project_id)
-        .eq("status", "completed")
-        .order("created_at", desc=True)
-        .limit(1)
-        .maybe_single()
-        .execute()
-    )
-    if not job.data or not job.data.get("result_r2_keys"):
+    job = get_latest_artifact_job(db, project_id, select="result_r2_keys")
+    if not job:
         raise HTTPException(status_code=404, detail="완료된 작업이 없습니다")
 
-    return job.data["result_r2_keys"]
+    return job["result_r2_keys"]
 
 
 @router.get("/segments", response_model=SegmentsResponse)
@@ -182,6 +177,41 @@ def get_evaluation(project_id: str, user_id: str = Depends(get_user_id)):
     return _evaluation_response_from_row(result.data[0])
 
 
+def _save_evaluation_payload(db, project_id: str, user_id: str, payload: dict) -> EvaluationResponse:
+    avid_version = avid.get_version()
+    eogum_version = None
+
+    try:
+        import subprocess
+
+        eogum_repo = Path(__file__).resolve().parents[5]
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(eogum_repo),
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            eogum_version = result.stdout.strip()
+    except Exception:
+        pass
+
+    result = (
+        db.table("evaluations")
+        .upsert(
+            {
+                "project_id": project_id,
+                "evaluator_id": user_id,
+                "segments": payload,
+                "avid_version": avid_version,
+                "eogum_version": eogum_version,
+            },
+            on_conflict="project_id,evaluator_id",
+        )
+        .execute()
+    )
+    return _evaluation_response_from_row(result.data[0])
+
+
 @router.post("/evaluation", response_model=EvaluationResponse)
 def save_evaluation(
     project_id: str,
@@ -203,43 +233,81 @@ def save_evaluation(
     if not project.data:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
 
-    # Collect git versions
-    avid_version = avid.get_version()
-    eogum_version = None
+    return _save_evaluation_payload(db, project_id, user_id, req.model_dump())
 
-    try:
-        import subprocess
 
-        eogum_repo = Path(__file__).resolve().parents[5]
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=str(eogum_repo),
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            eogum_version = result.stdout.strip()
-    except Exception:
-        pass
+@router.post("/final-preview", response_model=FinalPreviewJobResponse)
+def start_final_preview(
+    project_id: str,
+    req: FinalPreviewRequest,
+    user_id: str = Depends(get_user_id),
+):
+    db = get_db()
 
-    stored_segments = req.model_dump()
-
-    # Atomic upsert using unique index on (project_id, evaluator_id)
-    result = (
-        db.table("evaluations")
-        .upsert(
-            {
-                "project_id": project_id,
-                "evaluator_id": user_id,
-                "segments": stored_segments,
-                "avid_version": avid_version,
-                "eogum_version": eogum_version,
-            },
-            on_conflict="project_id,evaluator_id",
-        )
+    project = (
+        db.table("projects")
+        .select("id, user_id, source_duration_seconds")
+        .eq("id", project_id)
+        .eq("user_id", user_id)
+        .single()
         .execute()
     )
+    if not project.data:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
 
-    return _evaluation_response_from_row(result.data[0])
+    payload = req.model_dump()
+    _save_evaluation_payload(db, project_id, user_id, payload)
+
+    job = (
+        db.table("jobs")
+        .insert({
+            "project_id": project_id,
+            "user_id": user_id,
+            "type": "final_preview",
+            "status": "pending",
+            "progress": 0,
+            "input_payload": payload,
+        })
+        .execute()
+        .data[0]
+    )
+    enqueue_final_preview(project_id, job["id"])
+    return FinalPreviewJobResponse(
+        job_id=job["id"],
+        status=job["status"],
+        progress=job["progress"],
+        duration_ms=(project.data.get("source_duration_seconds") or 0) * 1000,
+    )
+
+
+@router.get("/final-preview/{job_id}", response_model=FinalPreviewJobResponse)
+def get_final_preview(project_id: str, job_id: str, user_id: str = Depends(get_user_id)):
+    db = get_db()
+
+    job = (
+        db.table("jobs")
+        .select("*")
+        .eq("id", job_id)
+        .eq("project_id", project_id)
+        .eq("user_id", user_id)
+        .eq("type", "final_preview")
+        .maybe_single()
+        .execute()
+    )
+    if not job.data:
+        raise HTTPException(status_code=404, detail="미리보기 작업을 찾을 수 없습니다")
+
+    r2_keys = job.data.get("result_r2_keys") or {}
+    preview_key = r2_keys.get("final_preview")
+    video_url = generate_presigned_stream(preview_key) if preview_key else None
+    return FinalPreviewJobResponse(
+        job_id=job.data["id"],
+        status=job.data["status"],
+        progress=job.data.get("progress") or 0,
+        error_message=job.data.get("error_message"),
+        video_url=video_url,
+        duration_ms=r2_keys.get("duration_ms"),
+    )
 
 
 @router.get("/eval-report", response_model=EvalReportResponse)

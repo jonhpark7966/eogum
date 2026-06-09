@@ -5,8 +5,7 @@ import logging
 import subprocess
 import threading
 import uuid
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 
 from eogum.config import settings
 from eogum.services import r2

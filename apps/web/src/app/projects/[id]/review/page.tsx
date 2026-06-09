@@ -74,6 +74,7 @@ export default function ReviewPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [videoUrl, setVideoUrl] = useState("");
+  const [originalVideoUrl, setOriginalVideoUrl] = useState("");
   const [durationMs, setDurationMs] = useState(0);
   const [segments, setSegments] = useState<EvalSegment[]>([]);
   const [reviewMetadata, setReviewMetadata] = useState<ReviewMetadata>({
@@ -88,6 +89,11 @@ export default function ReviewPage() {
   const [showReport, setShowReport] = useState(false);
   const [loadingReport, setLoadingReport] = useState(false);
   const [saveError, setSaveError] = useState("");
+  const [finalPreviewJobId, setFinalPreviewJobId] = useState<string | null>(null);
+  const [finalPreviewStatus, setFinalPreviewStatus] = useState<string | null>(null);
+  const [finalPreviewProgress, setFinalPreviewProgress] = useState(0);
+  const [finalPreviewError, setFinalPreviewError] = useState("");
+  const [usingFinalPreview, setUsingFinalPreview] = useState(false);
 
   // Load all data
   const loadData = useCallback(async () => {
@@ -109,6 +115,7 @@ export default function ReviewPage() {
 
       if (vidRes) {
         setVideoUrl(vidRes.video_url);
+        setOriginalVideoUrl(vidRes.video_url);
         setDurationMs(vidRes.duration_ms || segRes.source_duration_ms);
       } else {
         setDurationMs(segRes.source_duration_ms);
@@ -144,11 +151,48 @@ export default function ReviewPage() {
       setError(err instanceof Error ? err.message : "데이터 로딩 실패");
     }
     setLoading(false);
-  }, [projectId]);
+  }, [projectId, router, supabase.auth]);
 
   useEffect(() => {
-    loadData();
+    void Promise.resolve().then(loadData);
   }, [loadData]);
+
+  useEffect(() => {
+    if (!finalPreviewJobId || finalPreviewStatus === "completed" || finalPreviewStatus === "failed") return;
+
+    let canceled = false;
+    const poll = async () => {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      if (!session || canceled) return;
+      try {
+        const job = await api.getFinalPreview(session.access_token, projectId, finalPreviewJobId);
+        if (canceled) return;
+        setFinalPreviewStatus(job.status);
+        setFinalPreviewProgress(job.progress);
+        if (job.status === "completed" && job.video_url) {
+          setVideoUrl(job.video_url);
+          setUsingFinalPreview(true);
+          setDirty(false);
+          if (job.duration_ms) setDurationMs(job.duration_ms);
+        } else if (job.status === "failed") {
+          setFinalPreviewError(job.error_message || "완성본 미리보기 생성에 실패했습니다");
+        }
+      } catch (err) {
+        if (!canceled) {
+          setFinalPreviewError(err instanceof Error ? err.message : "미리보기 상태 확인에 실패했습니다");
+        }
+      }
+    };
+
+    void poll();
+    const interval = window.setInterval(poll, 3000);
+    return () => {
+      canceled = true;
+      window.clearInterval(interval);
+    };
+  }, [finalPreviewJobId, finalPreviewStatus, projectId, supabase]);
 
   // Video timeupdate → highlight current segment
   useEffect(() => {
@@ -258,6 +302,35 @@ export default function ReviewPage() {
     setSaving(false);
   };
 
+  const handleGenerateFinalPreview = async () => {
+    setFinalPreviewError("");
+    setFinalPreviewStatus("pending");
+    setFinalPreviewProgress(0);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      if (!session) return;
+      const job = await api.startFinalPreview(session.access_token, projectId, {
+        ...reviewMetadata,
+        segments,
+      });
+      setFinalPreviewJobId(job.job_id);
+      setFinalPreviewStatus(job.status);
+      setFinalPreviewProgress(job.progress);
+      setDirty(false);
+    } catch (err) {
+      setFinalPreviewStatus("failed");
+      setFinalPreviewError(err instanceof Error ? err.message : "완성본 미리보기 생성에 실패했습니다");
+    }
+  };
+
+  const restoreOriginalPreview = () => {
+    if (!originalVideoUrl) return;
+    setVideoUrl(originalVideoUrl);
+    setUsingFinalPreview(false);
+  };
+
   // Load report
   const loadReport = async () => {
     setLoadingReport(true);
@@ -317,6 +390,23 @@ export default function ReviewPage() {
               <span className="text-amber-400 text-xs">● 변경사항 있음</span>
             )}
             <button
+              onClick={handleGenerateFinalPreview}
+              disabled={finalPreviewStatus === "pending" || finalPreviewStatus === "running"}
+              className="px-4 py-1.5 rounded-lg text-sm font-medium transition bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-50"
+            >
+              {finalPreviewStatus === "pending" || finalPreviewStatus === "running"
+                ? `생성 중 ${finalPreviewProgress}%`
+                : "완성본 미리보기 생성"}
+            </button>
+            {usingFinalPreview && (
+              <button
+                onClick={restoreOriginalPreview}
+                className="px-4 py-1.5 rounded-lg text-sm font-medium transition bg-gray-800 text-gray-300 hover:bg-gray-700"
+              >
+                원본 미리보기
+              </button>
+            )}
+            <button
               onClick={() => {
                 if (showReport) {
                   setShowReport(false);
@@ -357,6 +447,15 @@ export default function ReviewPage() {
         </div>
       )}
 
+      {finalPreviewError && (
+        <div className="max-w-6xl mx-auto px-6 py-2">
+          <div className="bg-red-900/50 border border-red-700 rounded-lg px-4 py-2 text-red-200 text-sm flex items-center justify-between">
+            <span>{finalPreviewError}</span>
+            <button onClick={() => setFinalPreviewError("")} className="text-red-400 hover:text-red-200 ml-3">✕</button>
+          </div>
+        </div>
+      )}
+
       {/* Video Player (sticky) */}
       {videoUrl ? (
         <div className="sticky top-[53px] z-20 bg-gray-950 border-b border-gray-800">
@@ -368,6 +467,11 @@ export default function ReviewPage() {
               className="w-full max-h-[40vh] bg-black"
               preload="metadata"
             />
+            {usingFinalPreview && (
+              <div className="px-3 py-2 text-center text-xs text-cyan-300 bg-cyan-500/10">
+                현재 decision 기준 완성본 미리보기
+              </div>
+            )}
           </div>
         </div>
       ) : (
@@ -385,6 +489,7 @@ export default function ReviewPage() {
           <span>리뷰완료 <strong className="text-white">{reviewedCount}</strong></span>
           <span>AI삭제 <strong className="text-red-400">{aiCutCount}</strong></span>
           <span>일치율 <strong className="text-white">{agreePct}%</strong></span>
+          <span>미리보기 <strong className="text-white">{formatTime(durationMs)}</strong></span>
         </div>
       </div>
 

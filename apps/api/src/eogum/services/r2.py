@@ -1,6 +1,7 @@
 import uuid
 
 import boto3
+from botocore.exceptions import ClientError
 from botocore.config import Config
 
 from eogum.config import settings
@@ -107,11 +108,18 @@ def complete_multipart_upload(r2_key: str, upload_id: str, parts: list[dict]) ->
 def abort_multipart_upload(r2_key: str, upload_id: str) -> None:
     """Abort a multipart upload."""
     client = get_r2_client()
-    client.abort_multipart_upload(
-        Bucket=settings.r2_bucket_name,
-        Key=r2_key,
-        UploadId=upload_id,
-    )
+    try:
+        client.abort_multipart_upload(
+            Bucket=settings.r2_bucket_name,
+            Key=r2_key,
+            UploadId=upload_id,
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        status_code = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if code in {"NoSuchUpload", "NoSuchKey"} or status_code == 404:
+            return
+        raise
 
 
 def download_to_bytes(r2_key: str) -> bytes:
@@ -133,3 +141,18 @@ def upload_file(local_path: str, r2_key: str, content_type: str = "application/o
     client = get_r2_client()
     client.upload_file(local_path, settings.r2_bucket_name, r2_key, ExtraArgs={"ContentType": content_type})
     return r2_key
+
+
+def delete_objects(r2_keys: list[str]) -> None:
+    """Best-effort delete for a set of R2 objects."""
+    keys = [key for key in dict.fromkeys(r2_keys) if key]
+    if not keys:
+        return
+
+    client = get_r2_client()
+    for i in range(0, len(keys), 1000):
+        batch = keys[i : i + 1000]
+        client.delete_objects(
+            Bucket=settings.r2_bucket_name,
+            Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
+        )

@@ -48,6 +48,7 @@ class ProjectResponse(BaseModel):
     source_filename: str | None
     source_duration_seconds: int | None
     extra_sources: list[dict] = []
+    multicam_state: dict = {}
     created_at: datetime
     updated_at: datetime
 
@@ -72,6 +73,7 @@ class JobResponse(BaseModel):
     created_at: datetime
     pipeline_stages: list[dict] = []
     external_task_ids: dict = {}
+    result_r2_keys: dict | None = None
 
 
 # ── Credits ──
@@ -178,6 +180,19 @@ class VideoUrlResponse(BaseModel):
     duration_ms: int
 
 
+class FinalPreviewRequest(EvaluationSave):
+    pass
+
+
+class FinalPreviewJobResponse(BaseModel):
+    job_id: str
+    status: str
+    progress: int
+    error_message: str | None = None
+    video_url: str | None = None
+    duration_ms: int | None = None
+
+
 # ── Eval Report ──
 class ConfusionMatrix(BaseModel):
     tp: int  # AI=cut, truth=cut (correct cut)
@@ -258,6 +273,11 @@ class MultipartCompleteRequest(BaseModel):
     r2_key: str
     upload_id: str
     parts: list[MultipartCompletePart]
+
+
+class MultipartAbortRequest(BaseModel):
+    r2_key: str
+    upload_id: str
 
 
 # ── Downloads ──

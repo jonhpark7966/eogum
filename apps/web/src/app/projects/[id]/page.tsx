@@ -3,7 +3,8 @@
 export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
-import { api, uploadFile, type ProjectDetail, type ExtraSource, type PipelineStage } from "@/lib/api";
+import { api, type ProjectDetail, type PipelineStage, type MulticamState } from "@/lib/api";
+import { useUploads } from "@/lib/upload-provider";
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -29,11 +30,14 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; icon: string
   processing: { label: "처리 중",   color: "text-cyan-400",    icon: "⟳", bg: "bg-cyan-400/10" },
   completed:  { label: "완료",      color: "text-emerald-400", icon: "✓", bg: "bg-emerald-400/10" },
   failed:     { label: "실패",      color: "text-red-400",     icon: "✕", bg: "bg-red-400/10" },
+  reprocess_failed: { label: "재적용 실패", color: "text-red-400", icon: "✕", bg: "bg-red-400/10" },
 };
 
 const JOB_TYPE_LABELS: Record<string, string> = {
   subtitle_cut: "편집 처리",
   podcast_cut: "편집 처리",
+  reprocess_multicam: "멀티캠 적용",
+  final_preview: "완성본 미리보기",
 };
 
 const STAGE_STATUS_CONFIG: Record<string, { label: string; dot: string; text: string }> = {
@@ -89,6 +93,22 @@ function PipelineStageList({ stages }: { stages: PipelineStage[] }) {
   );
 }
 
+function multicamLabel(state: MulticamState | undefined, extraCount: number): string {
+  const status = state?.status || (extraCount > 0 ? "pending_apply" : "not_applied");
+  if (status === "not_applied") return "멀티캠 소스 없음";
+  if (status === "pending_apply") return "소스 등록됨, 아직 적용 전";
+  if (status === "queued") return "멀티캠 적용 대기 중";
+  if (status === "running") return "멀티캠 적용 중";
+  if (status === "applied") {
+    const appliedAt = state?.applied_at ? new Date(state.applied_at).toLocaleString("ko-KR") : "";
+    return `적용 완료: ${state?.source_count ?? extraCount}개 소스${appliedAt ? `, ${appliedAt}` : ""}`;
+  }
+  if (status === "failed") return "적용 실패";
+  if (status === "canceling") return "취소 중";
+  if (status === "canceled") return "취소됨";
+  return status;
+}
+
 /* ── Section wrapper ── */
 function Section({ title, icon, children, className = "" }: {
   title: string;
@@ -114,19 +134,22 @@ export default function ProjectDetailPage() {
   const params = useParams();
   const router = useRouter();
   const supabase = createClient();
+  const { tasks, startUpload, cancelUpload } = useUploads();
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [retrying, setRetrying] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   // Multicam state
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
-  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
-  const [uploading, setUploading] = useState(false);
   const [multicamProcessing, setMulticamProcessing] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const projectId = params.id as string;
+  const uploadTask = tasks.find((task) => task.projectId === projectId && ["queued", "uploading", "registering"].includes(task.status));
+  const latestUploadTaskStatus = tasks.find((task) => task.projectId === projectId)?.status;
 
   const loadProject = useCallback(async () => {
     const { data: { session } } = await supabase.auth.getSession();
@@ -143,12 +166,25 @@ export default function ProjectDetailPage() {
   useEffect(() => {
     loadProject();
     const interval = setInterval(() => {
-      if (project?.status === "processing" || project?.status === "queued") {
+      const multicamStatus = project?.multicam_state?.status;
+      if (
+        project?.status === "processing" ||
+        project?.status === "queued" ||
+        multicamStatus === "queued" ||
+        multicamStatus === "running" ||
+        multicamStatus === "canceling"
+      ) {
         loadProject();
       }
     }, 5000);
     return () => clearInterval(interval);
-  }, [loadProject, project?.status]);
+  }, [loadProject, project?.status, project?.multicam_state?.status]);
+
+  useEffect(() => {
+    if (latestUploadTaskStatus === "completed") {
+      void loadProject();
+    }
+  }, [latestUploadTaskStatus, loadProject]);
 
   const handleRetry = async () => {
     const { data: { session } } = await supabase.auth.getSession();
@@ -197,34 +233,9 @@ export default function ProjectDetailPage() {
   };
 
   const handleUploadExtraSources = async () => {
-    const { data: { session } } = await supabase.auth.getSession();
-    if (!session || !project || pendingFiles.length === 0) return;
-    setUploading(true);
-    setUploadProgress(0);
-    try {
-      const newSources: ExtraSource[] = [];
-      const totalSize = pendingFiles.reduce((sum, f) => sum + f.size, 0);
-      let prevUploaded = 0;
-      for (let i = 0; i < pendingFiles.length; i++) {
-        const file = pendingFiles[i];
-        const baseUploaded = prevUploaded;
-        const r2Key = await uploadFile(session.access_token, file, (loaded) => {
-          setUploadProgress(Math.round(((baseUploaded + loaded) / totalSize) * 100));
-        });
-        prevUploaded += file.size;
-        newSources.push({ r2_key: r2Key, filename: file.name, size_bytes: file.size });
-      }
-      const allSources = [...project.extra_sources, ...newSources];
-      await api.updateExtraSources(session.access_token, projectId, allSources);
-      setPendingFiles([]);
-      setUploadProgress(100);
-      await loadProject();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "업로드에 실패했습니다");
-    } finally {
-      setUploading(false);
-      setUploadProgress(null);
-    }
+    if (!project || pendingFiles.length === 0 || uploadTask) return;
+    startUpload(projectId, pendingFiles);
+    setPendingFiles([]);
   };
 
   const handleMulticamReprocess = async () => {
@@ -237,6 +248,33 @@ export default function ProjectDetailPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "멀티캠 적용에 실패했습니다");
     } finally { setMulticamProcessing(false); }
+  };
+
+  const handleCancelMulticam = async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    setMulticamProcessing(true);
+    try {
+      await api.cancelMulticam(session.access_token, projectId);
+      await loadProject();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "멀티캠 취소에 실패했습니다");
+    } finally { setMulticamProcessing(false); }
+  };
+
+  const handleDeleteProject = async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session || !project) return;
+    setDeleting(true);
+    try {
+      await api.deleteProject(session.access_token, project.id);
+      router.replace("/dashboard");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "프로젝트 삭제에 실패했습니다");
+      setConfirmDelete(false);
+    } finally {
+      setDeleting(false);
+    }
   };
 
   /* ── Loading ── */
@@ -265,8 +303,13 @@ export default function ProjectDetailPage() {
   const statusConfig = STATUS_CONFIG[project.status] ?? { label: project.status, color: "text-gray-400", icon: "○", bg: "bg-gray-400/10" };
   const isProcessing = project.status === "processing" || project.status === "queued";
   const isCompleted = project.status === "completed";
-  const isFailed = project.status === "failed";
+  const isFailed = project.status === "failed" || project.status === "reprocess_failed";
   const cutTypeLabel = project.cut_type === "subtitle_cut" ? "강의/설명" : "팟캐스트";
+  const isUploadingExtraSources = Boolean(uploadTask);
+  const multicamStatus = project.multicam_state?.status || (project.extra_sources.length > 0 ? "pending_apply" : "not_applied");
+  const canApplyMulticam = project.extra_sources.length > 0 && !isUploadingExtraSources && !["queued", "running", "canceling"].includes(multicamStatus);
+  const canCancelMulticam = ["queued", "running", "canceling"].includes(multicamStatus);
+  const canDeleteProject = !isProcessing && !isUploadingExtraSources && !canCancelMulticam;
 
   return (
     <div className="min-h-screen bg-[#030712] text-white dot-grid">
@@ -320,10 +363,20 @@ export default function ProjectDetailPage() {
                   <span>{new Date(project.created_at).toLocaleDateString("ko-KR")}</span>
                 </div>
               </div>
-              <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium ${statusConfig.color} ${statusConfig.bg}`}>
-                <span className={isProcessing ? "animate-spin" : ""}>{statusConfig.icon}</span>
-                {statusConfig.label}
-              </span>
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  onClick={() => setConfirmDelete(true)}
+                  disabled={!canDeleteProject}
+                  className="rounded-lg border border-red-500/20 px-3 py-1.5 text-xs font-medium text-red-300 transition hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-40"
+                  title={canDeleteProject ? "프로젝트 삭제" : "진행 중인 작업이 있어 삭제할 수 없습니다"}
+                >
+                  삭제
+                </button>
+                <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium ${statusConfig.color} ${statusConfig.bg}`}>
+                  <span className={isProcessing ? "animate-spin" : ""}>{statusConfig.icon}</span>
+                  {statusConfig.label}
+                </span>
+              </div>
             </div>
           </div>
         </div>
@@ -481,6 +534,14 @@ export default function ProjectDetailPage() {
             <p className="text-xs text-gray-500 mb-4">
               오디오 크로스 코릴레이션으로 자동 싱크. 추가 크레딧이 차감됩니다.
             </p>
+            <div className="mb-4 rounded-lg border border-white/[0.06] bg-white/[0.025] px-4 py-3">
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-sm text-gray-300">{multicamLabel(project.multicam_state, project.extra_sources.length)}</span>
+                {project.multicam_state?.error && (
+                  <span className="max-w-[240px] truncate text-xs text-red-300">{project.multicam_state.error}</span>
+                )}
+              </div>
+            </div>
 
             {/* Registered sources */}
             {project.extra_sources.length > 0 && (
@@ -533,15 +594,20 @@ export default function ProjectDetailPage() {
             )}
 
             {/* Upload progress */}
-            {uploadProgress !== null && (
+            {uploadTask && (
               <div className="mb-4">
                 <div className="relative h-2 bg-white/[0.05] rounded-full overflow-hidden">
                   <div
                     className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-cyan-500 to-violet-500 transition-all duration-300"
-                    style={{ width: `${uploadProgress}%` }}
+                    style={{ width: `${uploadTask.progress}%` }}
                   />
                 </div>
-                <p className="text-xs text-gray-500 mt-1.5">{uploadProgress}% 업로드 중...</p>
+                <div className="mt-1.5 flex items-center justify-between gap-3 text-xs text-gray-500">
+                  <span>{uploadTask.progress}% 업로드 중...</span>
+                  <button onClick={() => cancelUpload(uploadTask.taskId)} className="text-red-400/70 hover:text-red-300">
+                    취소
+                  </button>
+                </div>
               </div>
             )}
 
@@ -561,7 +627,7 @@ export default function ProjectDetailPage() {
               />
               <button
                 onClick={() => fileInputRef.current?.click()}
-                disabled={uploading}
+                disabled={isUploadingExtraSources}
                 className="px-4 py-2 text-sm bg-white/[0.03] border border-white/[0.08] rounded-lg hover:bg-white/[0.06] hover:border-white/[0.12] transition-all disabled:opacity-50"
               >
                 파일 추가
@@ -569,20 +635,31 @@ export default function ProjectDetailPage() {
               {pendingFiles.length > 0 && (
                 <button
                   onClick={handleUploadExtraSources}
-                  disabled={uploading}
+                  disabled={isUploadingExtraSources}
                   className="px-4 py-2 text-sm font-medium bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 rounded-lg hover:bg-cyan-500/20 transition-all disabled:opacity-50"
                 >
-                  {uploading ? "업로드 중..." : "업로드"}
+                  {isUploadingExtraSources ? "업로드 중..." : "업로드"}
                 </button>
               )}
-              {project.extra_sources.length > 0 && !uploading && (
+              {canApplyMulticam && (
                 <button
                   onClick={handleMulticamReprocess}
                   disabled={multicamProcessing}
-                  className="group relative px-5 py-2 text-sm font-medium rounded-lg overflow-hidden transition-all duration-300 hover:shadow-[0_0_20px_rgba(6,182,212,0.2)] disabled:opacity-50"
+                  className={`group relative px-5 py-2 text-sm font-medium rounded-lg overflow-hidden transition-all duration-300 hover:shadow-[0_0_20px_rgba(6,182,212,0.2)] disabled:opacity-50 ${
+                    multicamStatus === "pending_apply" ? "ring-1 ring-cyan-300/40" : ""
+                  }`}
                 >
                   <div className="absolute inset-0 bg-gradient-to-r from-cyan-500 to-violet-500" />
                   <span className="relative text-white">{multicamProcessing ? "적용 중..." : "멀티캠 적용"}</span>
+                </button>
+              )}
+              {canCancelMulticam && (
+                <button
+                  onClick={handleCancelMulticam}
+                  disabled={multicamProcessing || multicamStatus === "canceling"}
+                  className="px-4 py-2 text-sm font-medium rounded-lg border border-red-500/20 bg-red-500/10 text-red-300 transition-all hover:bg-red-500/20 disabled:opacity-50"
+                >
+                  {multicamStatus === "canceling" ? "취소 중..." : "적용 취소"}
                 </button>
               )}
             </div>
@@ -641,7 +718,50 @@ export default function ProjectDetailPage() {
             </div>
           </Section>
         )}
+
+        <Section
+          title="프로젝트 관리"
+          icon={<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M3 6h18" /><path d="M8 6V4h8v2" /><path d="M19 6l-1 14H6L5 6" /></svg>}
+        >
+          <div className="flex items-center justify-between gap-4">
+            <p className="text-sm text-gray-500">삭제하면 프로젝트 기록과 결과 파일이 제거됩니다.</p>
+            <button
+              onClick={() => setConfirmDelete(true)}
+              disabled={!canDeleteProject}
+              className="rounded-lg border border-red-500/20 bg-red-500/10 px-4 py-2 text-sm font-medium text-red-300 transition hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              프로젝트 삭제
+            </button>
+          </div>
+        </Section>
       </main>
+
+      {confirmDelete && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/70 px-4">
+          <div className="w-full max-w-md rounded-2xl border border-white/10 bg-[#0a0f1a] p-6 shadow-2xl">
+            <h2 className="text-lg font-semibold">프로젝트 삭제</h2>
+            <p className="mt-3 text-sm leading-6 text-gray-400">
+              “{project.name}” 프로젝트를 삭제합니다. 삭제 후에는 복구할 수 없습니다.
+            </p>
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                onClick={() => setConfirmDelete(false)}
+                disabled={deleting}
+                className="rounded-lg border border-white/10 px-4 py-2 text-sm text-gray-300 transition hover:bg-white/5 disabled:opacity-50"
+              >
+                취소
+              </button>
+              <button
+                onClick={handleDeleteProject}
+                disabled={deleting}
+                className="rounded-lg bg-red-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-red-400 disabled:opacity-50"
+              >
+                {deleting ? "삭제 중..." : "삭제"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

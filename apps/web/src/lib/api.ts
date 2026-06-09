@@ -40,6 +40,7 @@ export interface Project {
   source_filename: string | null;
   source_duration_seconds: number | null;
   extra_sources: ExtraSource[];
+  multicam_state: MulticamState;
   created_at: string;
   updated_at: string;
 }
@@ -108,6 +109,11 @@ export interface MultipartInitiateResponse {
 
 export interface MultipartCompleteResponse {
   r2_key: string;
+}
+
+export interface MultipartAbortResponse {
+  r2_key: string;
+  aborted: boolean;
 }
 
 export interface DownloadResponse {
@@ -211,6 +217,25 @@ export interface EvaluationSavePayload {
 export interface VideoUrlResponse {
   video_url: string;
   duration_ms: number;
+}
+
+export interface FinalPreviewJobResponse {
+  job_id: string;
+  status: string;
+  progress: number;
+  error_message: string | null;
+  video_url: string | null;
+  duration_ms: number | null;
+}
+
+export interface MulticamState {
+  status?: "not_applied" | "pending_apply" | "queued" | "running" | "applied" | "failed" | "canceling" | "canceled" | string;
+  desired_sources_hash?: string | null;
+  applied_sources_hash?: string | null;
+  source_count?: number;
+  job_id?: string | null;
+  applied_at?: string | null;
+  error?: string | null;
 }
 
 export interface ConfusionMatrix {
@@ -319,6 +344,15 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
+  abortMultipart: (
+    token: string,
+    data: { r2_key: string; upload_id: string }
+  ) =>
+    apiFetch<MultipartAbortResponse>("/upload/multipart/abort", token, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
   // Projects
   listProjects: (token: string) => apiFetch<Project[]>("/projects", token),
 
@@ -357,6 +391,9 @@ export const api = {
 
   multicamReprocess: (token: string, id: string) =>
     apiFetch<Project>(`/projects/${id}/multicam`, token, { method: "POST" }),
+
+  cancelMulticam: (token: string, id: string) =>
+    apiFetch<Project>(`/projects/${id}/multicam/cancel`, token, { method: "POST" }),
 
   // Credits
   getCredits: (token: string) => apiFetch<CreditBalance>("/credits", token),
@@ -397,6 +434,15 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  startFinalPreview: (token: string, projectId: string, payload: EvaluationSavePayload) =>
+    apiFetch<FinalPreviewJobResponse>(`/projects/${projectId}/final-preview`, token, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  getFinalPreview: (token: string, projectId: string, jobId: string) =>
+    apiFetch<FinalPreviewJobResponse>(`/projects/${projectId}/final-preview/${jobId}`, token),
+
   getEvalReport: (token: string, projectId: string) =>
     apiFetch<EvalReportResponse>(`/projects/${projectId}/eval-report`, token),
 
@@ -419,12 +465,82 @@ export const api = {
 
 // ── Multipart Upload Utility ──
 const UPLOAD_CONCURRENCY = 3;
+const RETRYABLE_UPLOAD_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+const R2_NETWORK_ERROR_MESSAGE = "R2 업로드 네트워크가 끊겼습니다. 네트워크/VPN/Wi-Fi 확인 후 다시 시도해 주세요.";
+
+export interface UploadFileOptions {
+  onProgress?: (loaded: number, total: number) => void;
+  signal?: AbortSignal;
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const timeout = window.setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        window.clearTimeout(timeout);
+        reject(new DOMException("Aborted", "AbortError"));
+      },
+      { once: true }
+    );
+  });
+}
+
+function isRetryableUploadError(error: unknown): boolean {
+  if (error instanceof TypeError && error.message.includes("Failed to fetch")) return true;
+  if (error instanceof Error && error.message.includes("Failed to fetch")) return true;
+  return false;
+}
+
+function normalizeUploadError(error: unknown): Error {
+  if (error instanceof DOMException && error.name === "AbortError") {
+    return new Error("업로드가 취소되었습니다");
+  }
+  if (isRetryableUploadError(error)) return new Error(R2_NETWORK_ERROR_MESSAGE);
+  return error instanceof Error ? error : new Error("업로드에 실패했습니다");
+}
+
+async function fetchPartWithRetry(
+  url: string,
+  chunk: Blob,
+  signal: AbortSignal,
+  attempts = 3
+): Promise<Response> {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      const resp = await fetch(url, {
+        method: "PUT",
+        body: chunk,
+        signal,
+      });
+      if (resp.ok) return resp;
+      if (!RETRYABLE_UPLOAD_STATUSES.has(resp.status) || attempt === attempts - 1) {
+        throw new Error(`Part 업로드 실패: ${resp.status}`);
+      }
+      lastError = new Error(`Retryable upload status: ${resp.status}`);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      if (!isRetryableUploadError(error) || attempt === attempts - 1) throw error;
+      lastError = error;
+    }
+    await sleep(500 * 2 ** attempt, signal);
+  }
+  throw lastError instanceof Error ? lastError : new Error(R2_NETWORK_ERROR_MESSAGE);
+}
 
 export async function uploadFile(
   token: string,
   file: File,
-  onProgress?: (loaded: number, total: number) => void
+  options?: ((loaded: number, total: number) => void) | UploadFileOptions
 ): Promise<string> {
+  const onProgress = typeof options === "function" ? options : options?.onProgress;
+  const externalSignal = typeof options === "function" ? undefined : options?.signal;
   const contentType = file.type || "video/mp4";
 
   const initResp = await api.initiateMultipart(token, {
@@ -436,31 +552,58 @@ export async function uploadFile(
   const { part_urls, part_size, upload_id, r2_key } = initResp;
   const completedParts: { part_number: number; etag: string }[] = [];
   let totalUploaded = 0;
+  let completeStarted = false;
+  const batchControllers = new Set<AbortController>();
 
-  for (let i = 0; i < part_urls.length; i += UPLOAD_CONCURRENCY) {
-    const batch = part_urls.slice(i, i + UPLOAD_CONCURRENCY);
-    const results = await Promise.all(
-      batch.map(async (part) => {
-        const start = (part.part_number - 1) * part_size;
-        const end = Math.min(start + part_size, file.size);
-        const chunk = file.slice(start, end);
-
-        const resp = await fetch(part.upload_url, {
-          method: "PUT",
-          body: chunk,
-        });
-        if (!resp.ok) throw new Error(`Part ${part.part_number} 업로드 실패: ${resp.status}`);
-
-        const etag = resp.headers.get("ETag") || "";
-        totalUploaded += end - start;
-        onProgress?.(totalUploaded, file.size);
-        return { part_number: part.part_number, etag };
-      })
-    );
-    completedParts.push(...results);
+  const abortAllInFlight = () => {
+    for (const controller of batchControllers) controller.abort();
+  };
+  if (externalSignal) {
+    if (externalSignal.aborted) abortAllInFlight();
+    externalSignal.addEventListener("abort", abortAllInFlight, { once: true });
   }
 
-  completedParts.sort((a, b) => a.part_number - b.part_number);
-  await api.completeMultipart(token, { r2_key, upload_id, parts: completedParts });
-  return r2_key;
+  try {
+    for (let i = 0; i < part_urls.length; i += UPLOAD_CONCURRENCY) {
+      if (externalSignal?.aborted) throw new DOMException("Aborted", "AbortError");
+      const batch = part_urls.slice(i, i + UPLOAD_CONCURRENCY);
+      const results = await Promise.all(
+        batch.map(async (part) => {
+          const start = (part.part_number - 1) * part_size;
+          const end = Math.min(start + part_size, file.size);
+          const chunk = file.slice(start, end);
+          const controller = new AbortController();
+          batchControllers.add(controller);
+
+          const abortPart = () => controller.abort();
+          externalSignal?.addEventListener("abort", abortPart, { once: true });
+          try {
+            const resp = await fetchPartWithRetry(part.upload_url, chunk, controller.signal);
+            const etag = resp.headers.get("ETag") || "";
+            totalUploaded += end - start;
+            onProgress?.(totalUploaded, file.size);
+            return { part_number: part.part_number, etag };
+          } finally {
+            externalSignal?.removeEventListener("abort", abortPart);
+            batchControllers.delete(controller);
+          }
+        })
+      );
+      completedParts.push(...results);
+    }
+
+    completedParts.sort((a, b) => a.part_number - b.part_number);
+    completeStarted = true;
+    await api.completeMultipart(token, { r2_key, upload_id, parts: completedParts });
+    return r2_key;
+  } catch (error) {
+    abortAllInFlight();
+    if (!completeStarted) {
+      await api.abortMultipart(token, { r2_key, upload_id }).catch(() => undefined);
+      throw normalizeUploadError(error);
+    }
+    throw new Error("업로드 완료 확인에 실패했습니다. 프로젝트 상태를 새로고침한 뒤 다시 확인해 주세요.");
+  } finally {
+    externalSignal?.removeEventListener("abort", abortAllInFlight);
+  }
 }

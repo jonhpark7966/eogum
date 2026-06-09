@@ -2,12 +2,18 @@
 
 import json
 import logging
+import hashlib
+import subprocess
 import threading
 from collections import deque
+from datetime import datetime, timezone
+from fractions import Fraction
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 from eogum.config import settings
 from eogum.services import avid, chalna, credit, email, r2
+from eogum.services.artifacts import get_latest_artifact_job
 from eogum.services.database import get_db
 
 logger = logging.getLogger(__name__)
@@ -29,6 +35,12 @@ def enqueue_reprocess(project_id: str, job_id: str) -> None:
     _maybe_start_worker()
 
 
+def enqueue_final_preview(project_id: str, job_id: str) -> None:
+    """Add final-preview render task to queue."""
+    _queue.append({"kind": "final_preview", "project_id": project_id, "job_id": job_id})
+    _maybe_start_worker()
+
+
 def _maybe_start_worker() -> None:
     global _running
     with _lock:
@@ -47,6 +59,8 @@ def _worker_loop() -> None:
         try:
             if item["kind"] == "reprocess":
                 _reprocess_project(project_id, item["job_id"])
+            elif item["kind"] == "final_preview":
+                _render_final_preview(project_id, item["job_id"])
             else:
                 _process_project(project_id)
         except Exception:
@@ -99,7 +113,7 @@ def _process_project(project_id: str) -> None:
         duration = project["source_duration_seconds"]
 
         # Get user email
-        user = db.table("profiles").select("id, display_name").eq("id", user_id).single().execute().data
+        db.table("profiles").select("id, display_name").eq("id", user_id).single().execute()
         auth_user = db.auth.admin.get_user_by_id(user_id)
         user_email = auth_user.user.email
 
@@ -294,6 +308,43 @@ def _project_json_has_extra_sources(project_json_path: Path) -> bool:
     return len(data.get("source_files") or []) > 1
 
 
+class JobCanceled(RuntimeError):
+    """Raised when a queued or running job has been canceled."""
+
+
+def _extra_sources_hash(extra_sources: list[dict]) -> str | None:
+    if not extra_sources:
+        return None
+    normalized = [
+        {
+            "r2_key": item.get("r2_key"),
+            "filename": item.get("filename"),
+            "size_bytes": item.get("size_bytes"),
+            "offset_ms": item.get("offset_ms"),
+        }
+        for item in extra_sources
+    ]
+    payload = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _is_job_canceled(db, job_id: str) -> bool:
+    row = db.table("jobs").select("status").eq("id", job_id).maybe_single().execute()
+    return bool(row.data and row.data.get("status") in {"cancel_requested", "canceled"})
+
+
+def _raise_if_canceled(db, job_id: str) -> None:
+    if _is_job_canceled(db, job_id):
+        raise JobCanceled("작업 취소가 요청되었습니다")
+
+
+def _update_multicam_state(db, project_id: str, **updates) -> None:
+    project = db.table("projects").select("multicam_state").eq("id", project_id).maybe_single().execute()
+    state = dict(project.data.get("multicam_state") or {}) if project.data else {}
+    state.update(updates)
+    db.table("projects").update({"multicam_state": state}).eq("id", project_id).execute()
+
+
 def _plan_reprocess_steps(
     *,
     has_evaluation: bool,
@@ -321,38 +372,48 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
     project = db.table("projects").select("*").eq("id", project_id).single().execute().data
     user_id = project["user_id"]
 
+    def cancel_check() -> bool:
+        return _is_job_canceled(db, job_id)
+
+    try:
+        _raise_if_canceled(db, job_id)
+    except JobCanceled:
+        db.table("jobs").update({
+            "status": "canceled",
+            "progress": 0,
+            "completed_at": "now()",
+        }).eq("id", job_id).execute()
+        db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
+        _update_multicam_state(db, project_id, status="canceled", job_id=job_id)
+        return
+
     db.table("projects").update({"status": "processing"}).eq("id", project_id).execute()
     db.table("jobs").update({
         "status": "running",
         "progress": 5,
         "error_message": None,
     }).eq("id", job_id).execute()
+    _update_multicam_state(db, project_id, status="running", job_id=job_id, error=None)
 
     temp_dir = settings.avid_temp_dir / f"multicam_{project_id}"
     try:
+        _raise_if_canceled(db, job_id)
         temp_dir.mkdir(parents=True, exist_ok=True)
         output_dir = temp_dir / "output"
         output_dir.mkdir(exist_ok=True)
 
-        completed_job = (
-            db.table("jobs")
-            .select("id, result_r2_keys")
-            .eq("project_id", project_id)
-            .eq("status", "completed")
-            .order("created_at", desc=True)
-            .limit(1)
-            .maybe_single()
-            .execute()
-        )
-        if not completed_job.data or not completed_job.data.get("result_r2_keys"):
+        completed_job = get_latest_artifact_job(db, project_id, select="id, result_r2_keys")
+        if not completed_job:
             raise RuntimeError("완료된 작업이 없습니다. 전체 재처리가 필요합니다.")
 
-        r2_keys = dict(completed_job.data["result_r2_keys"])
+        r2_keys = dict(completed_job["result_r2_keys"])
         project_json_key = r2_keys.get("project_json")
         if not project_json_key:
             raise RuntimeError("프로젝트 JSON이 없습니다. 전체 재처리가 필요합니다.")
 
+        _raise_if_canceled(db, job_id)
         project_json_bytes = r2.download_to_bytes(project_json_key)
+        _raise_if_canceled(db, job_id)
         local_project_json = temp_dir / "input.project.avid.json"
         local_project_json.write_bytes(project_json_bytes)
         working_project_json = local_project_json
@@ -398,13 +459,17 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
         if has_extra_sources:
             source_ext = Path(project["source_filename"]).suffix
             local_source_path = temp_dir / f"source{source_ext}"
+            _raise_if_canceled(db, job_id)
             r2.download_file(project["source_r2_key"], str(local_source_path))
+            _raise_if_canceled(db, job_id)
             source_path = str(local_source_path)
 
             for i, es in enumerate(project["extra_sources"]):
                 ext = Path(es["filename"]).suffix
                 local_path = temp_dir / f"extra_{i}{ext}"
+                _raise_if_canceled(db, job_id)
                 r2.download_file(es["r2_key"], str(local_path))
+                _raise_if_canceled(db, job_id)
                 extra_paths.append(str(local_path))
 
         steps = _plan_reprocess_steps(
@@ -417,41 +482,53 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
 
         if "apply-evaluation" in steps:
             eval_output = temp_dir / "01_eval_applied.project.avid.json"
+            _raise_if_canceled(db, job_id)
             payload = avid.apply_evaluation(
                 project_json_path=str(working_project_json),
                 evaluation_path=str(evaluation_path),
                 output_project_json=str(eval_output),
+                is_canceled=cancel_check,
             )
+            _raise_if_canceled(db, job_id)
             working_project_json = Path(payload["artifacts"]["project_json"])
             logger.info("Applied evaluation via avid-cli: %s", payload)
 
         if "rebuild-multicam" in steps:
             multicam_output = temp_dir / "02_multicam.project.avid.json"
+            _raise_if_canceled(db, job_id)
             payload = avid.rebuild_multicam(
                 project_json_path=str(working_project_json),
                 source_path=str(source_path),
                 extra_sources=extra_paths,
                 output_project_json=str(multicam_output),
                 offsets=extra_offsets,
+                is_canceled=cancel_check,
             )
+            _raise_if_canceled(db, job_id)
             working_project_json = Path(payload["artifacts"]["project_json"])
             logger.info("Rebuilt multicam via avid-cli: %s", payload)
         elif "clear-extra-sources" in steps:
             clear_output = temp_dir / "02_cleared.project.avid.json"
+            _raise_if_canceled(db, job_id)
             payload = avid.clear_extra_sources(
                 project_json_path=str(working_project_json),
                 output_project_json=str(clear_output),
+                is_canceled=cancel_check,
             )
+            _raise_if_canceled(db, job_id)
             working_project_json = Path(payload["artifacts"]["project_json"])
             logger.info("Cleared extra sources via avid-cli: %s", payload)
 
         db.table("jobs").update({"progress": 70}).eq("id", job_id).execute()
 
+        _raise_if_canceled(db, job_id)
         payload = avid.export_project(
             project_json_path=str(working_project_json),
             output_dir=str(output_dir),
             content_mode="cut" if eval_segments else "disabled",
+            is_canceled=cancel_check,
         )
+        _raise_if_canceled(db, job_id)
         artifacts = payload.get("artifacts") or {}
         updated_json = working_project_json
         fcpxml_path = Path(artifacts["fcpxml"])
@@ -460,15 +537,18 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
         new_r2_keys = dict(r2_keys)
 
         pj_r2_key = f"results/{project_id}/{updated_json.name}"
+        _raise_if_canceled(db, job_id)
         r2.upload_file(str(updated_json), pj_r2_key, "application/json")
         new_r2_keys["project_json"] = pj_r2_key
 
         fcpxml_r2_key = f"results/{project_id}/{fcpxml_path.name}"
+        _raise_if_canceled(db, job_id)
         r2.upload_file(str(fcpxml_path), fcpxml_r2_key, "application/xml")
         new_r2_keys["fcpxml"] = fcpxml_r2_key
 
         if srt_path:
             srt_r2_key = f"results/{project_id}/{srt_path.name}"
+            _raise_if_canceled(db, job_id)
             r2.upload_file(str(srt_path), srt_r2_key, "text/plain")
             new_r2_keys["srt"] = srt_r2_key
 
@@ -476,6 +556,7 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
         if sync_diagnostics_path:
             sync_path = Path(sync_diagnostics_path)
             sync_r2_key = f"results/{project_id}/{sync_path.name}"
+            _raise_if_canceled(db, job_id)
             r2.upload_file(str(sync_path), sync_r2_key, "application/json")
             new_r2_keys["sync_diagnostics"] = sync_r2_key
         elif "sync_diagnostics" in new_r2_keys:
@@ -487,8 +568,29 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
             "result_r2_keys": new_r2_keys,
             "completed_at": "now()",
         }).eq("id", job_id).execute()
-        db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
+        applied_hash = _extra_sources_hash(project.get("extra_sources") or [])
+        db.table("projects").update({
+            "status": "completed",
+            "multicam_state": {
+                **(project.get("multicam_state") or {}),
+                "status": "applied" if has_extra_sources else "not_applied",
+                "desired_sources_hash": applied_hash,
+                "applied_sources_hash": applied_hash,
+                "source_count": len(project.get("extra_sources") or []),
+                "job_id": job_id,
+                "applied_at": datetime.now(timezone.utc).isoformat(),
+                "error": None,
+            },
+        }).eq("id", project_id).execute()
         logger.info("Reprocess completed for project %s", project_id)
+    except (JobCanceled, avid.AvidCommandCanceled):
+        logger.info("Project reprocess canceled for project %s", project_id)
+        db.table("jobs").update({
+            "status": "canceled",
+            "completed_at": "now()",
+        }).eq("id", job_id).execute()
+        db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
+        _update_multicam_state(db, project_id, status="canceled", job_id=job_id, error=None)
     except Exception as exc:
         logger.exception("Project reprocess failed for project %s", project_id)
         db.table("jobs").update({
@@ -497,7 +599,259 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
             "completed_at": "now()",
         }).eq("id", job_id).execute()
         db.table("projects").update({"status": "reprocess_failed"}).eq("id", project_id).execute()
+        _update_multicam_state(db, project_id, status="failed", job_id=job_id, error=str(exc)[:1000])
         raise
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _fcpxml_time_seconds(value: str | None) -> float:
+    if not value:
+        return 0.0
+    raw = value[:-1] if value.endswith("s") else value
+    if "/" in raw:
+        numerator, denominator = raw.split("/", 1)
+        return float(Fraction(int(numerator), int(denominator)))
+    return float(raw)
+
+
+def _primary_intervals_from_fcpxml(fcpxml_path: Path) -> list[tuple[float, float]]:
+    root = ET.parse(fcpxml_path).getroot()
+    spine = root.find("./library/event/project/sequence/spine")
+    if spine is None:
+        return []
+
+    intervals: list[tuple[float, float]] = []
+    for clip in list(spine):
+        if clip.tag != "asset-clip" or clip.get("lane") is not None:
+            continue
+        if clip.get("enabled") == "0":
+            continue
+        start = _fcpxml_time_seconds(clip.get("start"))
+        duration = _fcpxml_time_seconds(clip.get("duration"))
+        if duration > 0:
+            intervals.append((start, duration))
+    return intervals
+
+
+def _has_audio_stream(source_path: Path) -> bool:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+            str(source_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def _render_intervals(source_path: Path, intervals: list[tuple[float, float]], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    filter_script = output_path.with_suffix(".filter.txt")
+    has_audio = _has_audio_stream(source_path)
+
+    lines: list[str] = []
+    concat_inputs: list[str] = []
+    for index, (start, duration) in enumerate(intervals):
+        lines.append(
+            f"[0:v]trim=start={start:.6f}:duration={duration:.6f},"
+            f"setpts=PTS-STARTPTS[v{index}]"
+        )
+        concat_inputs.append(f"[v{index}]")
+        if has_audio:
+            lines.append(
+                f"[0:a]atrim=start={start:.6f}:duration={duration:.6f},"
+                f"asetpts=PTS-STARTPTS[a{index}]"
+            )
+            concat_inputs.append(f"[a{index}]")
+
+    concat_args = "".join(concat_inputs)
+    if has_audio:
+        lines.append(f"{concat_args}concat=n={len(intervals)}:v=1:a=1[vcat][acat]")
+    else:
+        lines.append(f"{concat_args}concat=n={len(intervals)}:v=1:a=0[vcat]")
+    filter_script.write_text(";\n".join(lines), encoding="utf-8")
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-y",
+        "-i",
+        str(source_path),
+        "-filter_complex_script",
+        str(filter_script),
+        "-map",
+        "[vcat]",
+    ]
+    if has_audio:
+        cmd += ["-map", "[acat]"]
+    cmd += [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "28",
+    ]
+    if has_audio:
+        cmd += ["-c:a", "aac", "-b:a", "128k"]
+    cmd += ["-movflags", "+faststart", str(output_path)]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+    if result.returncode != 0:
+        raise RuntimeError(f"final preview render failed: {result.stderr[-1000:]}")
+
+
+def _burn_subtitles(input_path: Path, srt_path: Path | None, output_path: Path) -> None:
+    import shutil
+
+    if not srt_path or not srt_path.exists() or not srt_path.read_text(encoding="utf-8").strip():
+        shutil.copyfile(input_path, output_path)
+        return
+
+    subtitle_filter = f"subtitles={srt_path}:charenc=UTF-8"
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-y",
+            "-i",
+            str(input_path),
+            "-vf",
+            subtitle_filter,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "26",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=7200,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"subtitle burn-in failed: {result.stderr[-1000:]}")
+
+
+def _render_final_preview(project_id: str, job_id: str | None) -> None:
+    import shutil
+
+    if not job_id:
+        raise RuntimeError("final preview job_id is required")
+
+    db = get_db()
+    temp_dir = settings.avid_temp_dir / f"final_preview_{project_id}_{job_id[:8]}"
+
+    try:
+        job = db.table("jobs").select("*").eq("id", job_id).single().execute().data
+        if not job:
+            raise RuntimeError("final preview job not found")
+        if job["status"] == "canceled":
+            return
+
+        project = db.table("projects").select("*").eq("id", project_id).single().execute().data
+        if not project:
+            raise RuntimeError("프로젝트를 찾을 수 없습니다")
+
+        db.table("jobs").update({
+            "status": "running",
+            "progress": 5,
+            "error_message": None,
+            "started_at": "now()",
+        }).eq("id", job_id).execute()
+
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = temp_dir / "output"
+        output_dir.mkdir(exist_ok=True)
+
+        completed_job = get_latest_artifact_job(db, project_id, select="id, result_r2_keys")
+        if not completed_job:
+            raise RuntimeError("완료된 기준 산출물이 없습니다")
+        project_json_key = completed_job["result_r2_keys"].get("project_json")
+        if not project_json_key:
+            raise RuntimeError("프로젝트 JSON이 없습니다")
+
+        project_json_bytes = r2.download_to_bytes(project_json_key)
+        input_project_json = temp_dir / "input.project.avid.json"
+        input_project_json.write_bytes(project_json_bytes)
+
+        evaluation_path = temp_dir / "evaluation.json"
+        evaluation_payload = job.get("input_payload") or {}
+        evaluation_path.write_text(
+            json.dumps(evaluation_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        db.table("jobs").update({"progress": 20}).eq("id", job_id).execute()
+
+        applied_project_json = temp_dir / "01_eval_applied.project.avid.json"
+        avid.apply_evaluation(
+            project_json_path=str(input_project_json),
+            evaluation_path=str(evaluation_path),
+            output_project_json=str(applied_project_json),
+        )
+        db.table("jobs").update({"progress": 35}).eq("id", job_id).execute()
+
+        export_payload = avid.export_project(
+            project_json_path=str(applied_project_json),
+            output_dir=str(output_dir),
+            silence_mode="cut",
+            content_mode="cut",
+        )
+        artifacts = export_payload.get("artifacts") or {}
+        fcpxml_path = Path(artifacts["fcpxml"])
+        srt_path = Path(artifacts["srt"]) if artifacts.get("srt") else None
+        intervals = _primary_intervals_from_fcpxml(fcpxml_path)
+        if not intervals:
+            raise RuntimeError("미리보기로 렌더링할 keep 구간이 없습니다")
+        duration_ms = int(sum(duration for _, duration in intervals) * 1000)
+        db.table("jobs").update({"progress": 50}).eq("id", job_id).execute()
+
+        source_ext = Path(project["source_filename"] or "source.mp4").suffix or ".mp4"
+        source_path = temp_dir / f"source{source_ext}"
+        r2.download_file(project["source_r2_key"], str(source_path))
+
+        no_subs_path = output_dir / "final_preview_no_subs.mp4"
+        final_path = output_dir / "final_preview.mp4"
+        _render_intervals(source_path, intervals, no_subs_path)
+        db.table("jobs").update({"progress": 80}).eq("id", job_id).execute()
+
+        _burn_subtitles(no_subs_path, srt_path, final_path)
+        final_r2_key = f"results/{project_id}/final_preview_{job_id}.mp4"
+        r2.upload_file(str(final_path), final_r2_key, "video/mp4")
+
+        db.table("jobs").update({
+            "status": "completed",
+            "progress": 100,
+            "result_r2_keys": {
+                "final_preview": final_r2_key,
+                "duration_ms": duration_ms,
+            },
+            "completed_at": "now()",
+        }).eq("id", job_id).execute()
+        logger.info("Final preview completed for project %s", project_id)
+    except Exception as exc:
+        logger.exception("Final preview failed for project %s", project_id)
+        db.table("jobs").update({
+            "status": "failed",
+            "error_message": str(exc)[:1000],
+            "completed_at": "now()",
+        }).eq("id", job_id).execute()
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 

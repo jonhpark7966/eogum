@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends
 
 from eogum.auth import get_user_id
 from eogum.models.schemas import (
+    MultipartAbortRequest,
     MultipartCompleteRequest,
     MultipartInitiateRequest,
     MultipartInitiateResponse,
@@ -13,6 +14,7 @@ from eogum.models.schemas import (
     PresignResponse,
 )
 from eogum.services.r2 import (
+    abort_multipart_upload,
     complete_multipart_upload,
     create_multipart_upload,
     generate_presigned_upload,
@@ -59,3 +61,9 @@ def complete_multipart(req: MultipartCompleteRequest, user_id: str = Depends(get
     parts = [{"PartNumber": p.part_number, "ETag": p.etag} for p in req.parts]
     complete_multipart_upload(req.r2_key, req.upload_id, parts)
     return {"r2_key": req.r2_key}
+
+
+@router.post("/multipart/abort")
+def abort_multipart(req: MultipartAbortRequest, user_id: str = Depends(get_user_id)):
+    abort_multipart_upload(req.r2_key, req.upload_id)
+    return {"r2_key": req.r2_key, "aborted": True}

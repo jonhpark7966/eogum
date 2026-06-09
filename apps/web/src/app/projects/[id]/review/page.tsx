@@ -104,6 +104,7 @@ export default function ReviewPage() {
   const [finalPreviewProgress, setFinalPreviewProgress] = useState(0);
   const [finalPreviewError, setFinalPreviewError] = useState("");
   const [usingFinalPreview, setUsingFinalPreview] = useState(false);
+  const [finalPreviewCaptionsUrl, setFinalPreviewCaptionsUrl] = useState("");
 
   // Load all data
   const loadData = useCallback(async () => {
@@ -183,6 +184,7 @@ export default function ReviewPage() {
         setFinalPreviewProgress(job.progress);
         if (job.status === "completed" && job.video_url) {
           setVideoUrl(job.video_url);
+          setFinalPreviewCaptionsUrl(job.captions_url || "");
           setUsingFinalPreview(true);
           setDirty(false);
           if (job.duration_ms) setDurationMs(job.duration_ms);
@@ -390,6 +392,7 @@ export default function ReviewPage() {
   const restoreOriginalPreview = () => {
     if (!originalVideoUrl) return;
     setVideoUrl(originalVideoUrl);
+    setFinalPreviewCaptionsUrl("");
     setUsingFinalPreview(false);
   };
 
@@ -523,12 +526,24 @@ export default function ReviewPage() {
         <div className="sticky top-[53px] z-20 bg-gray-950 border-b border-gray-800">
           <div className="max-w-4xl mx-auto">
             <video
+              key={`${videoUrl}:${finalPreviewCaptionsUrl}`}
               ref={videoRef}
-              src={videoUrl}
               controls
+              crossOrigin={finalPreviewCaptionsUrl ? "anonymous" : undefined}
               className="w-full max-h-[40vh] bg-black"
               preload="metadata"
-            />
+            >
+              <source src={videoUrl} />
+              {usingFinalPreview && finalPreviewCaptionsUrl && (
+                <track
+                  kind="subtitles"
+                  src={finalPreviewCaptionsUrl}
+                  srcLang="ko"
+                  label="한국어"
+                  default
+                />
+              )}
+            </video>
             {usingFinalPreview && (
               <div className="px-3 py-2 text-center text-xs text-cyan-300 bg-cyan-500/10">
                 현재 decision 기준 완성본 미리보기

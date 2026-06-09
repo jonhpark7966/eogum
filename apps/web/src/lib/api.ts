@@ -225,6 +225,7 @@ export interface FinalPreviewJobResponse {
   progress: number;
   error_message: string | null;
   video_url: string | null;
+  captions_url: string | null;
   duration_ms: number | null;
 }
 

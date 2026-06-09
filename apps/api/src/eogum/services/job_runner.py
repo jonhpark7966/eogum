@@ -15,6 +15,14 @@ from eogum.config import settings
 from eogum.services import avid, chalna, credit, email, r2
 from eogum.services.artifacts import get_latest_artifact_job
 from eogum.services.database import get_db
+from eogum.services.final_preview_cache import (
+    decision_hash,
+    new_cache_token,
+    preview_cache_key,
+    preview_cache_paths,
+    preview_cache_ready,
+    source_cache_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -792,6 +800,31 @@ def _burn_subtitles(input_path: Path, srt_path: Path | None, output_path: Path) 
         raise RuntimeError(f"subtitle burn-in failed: {result.stderr[-1000:]}")
 
 
+def _write_webvtt_from_srt(srt_path: Path | None, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not srt_path or not srt_path.exists() or not srt_path.read_text(encoding="utf-8").strip():
+        output_path.write_text("WEBVTT\n\n", encoding="utf-8")
+        return
+
+    lines = ["WEBVTT", ""]
+    for line in srt_path.read_text(encoding="utf-8").splitlines():
+        lines.append(line.replace(",", ".") if "-->" in line else line)
+    output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _get_cached_source_video(project: dict, temp_dir: Path) -> Path:
+    source_ext = Path(project.get("source_filename") or "source.mp4").suffix or ".mp4"
+    cached_path = source_cache_path(project["source_r2_key"], source_ext)
+    cached_path.parent.mkdir(parents=True, exist_ok=True)
+    if cached_path.is_file() and cached_path.stat().st_size > 0:
+        return cached_path
+
+    download_path = temp_dir / f"source_download{source_ext}"
+    r2.download_file(project["source_r2_key"], str(download_path))
+    download_path.replace(cached_path)
+    return cached_path
+
+
 def _render_final_preview(project_id: str, job_id: str | None) -> None:
     import shutil
 
@@ -811,6 +844,27 @@ def _render_final_preview(project_id: str, job_id: str | None) -> None:
         project = db.table("projects").select("*").eq("id", project_id).single().execute().data
         if not project:
             raise RuntimeError("프로젝트를 찾을 수 없습니다")
+
+        evaluation_payload = job.get("input_payload") or {}
+        existing_result_keys = job.get("result_r2_keys") or {}
+        hash_value = existing_result_keys.get("decision_hash") or decision_hash(evaluation_payload)
+        cache_token = existing_result_keys.get("cache_token") or new_cache_token()
+        cache_video_path, cache_captions_path = preview_cache_paths(project_id, hash_value)
+
+        if preview_cache_ready(project_id, hash_value):
+            db.table("jobs").update({
+                "status": "completed",
+                "progress": 100,
+                "result_r2_keys": {
+                    "cache_key": preview_cache_key(project_id, hash_value),
+                    "decision_hash": hash_value,
+                    "cache_token": cache_token,
+                    "duration_ms": existing_result_keys.get("duration_ms"),
+                },
+                "completed_at": "now()",
+            }).eq("id", job_id).execute()
+            logger.info("Final preview cache hit for project %s", project_id)
+            return
 
         db.table("jobs").update({
             "status": "running",
@@ -835,7 +889,6 @@ def _render_final_preview(project_id: str, job_id: str | None) -> None:
         input_project_json.write_bytes(project_json_bytes)
 
         evaluation_path = temp_dir / "evaluation.json"
-        evaluation_payload = job.get("input_payload") or {}
         evaluation_path.write_text(
             json.dumps(evaluation_payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -865,24 +918,30 @@ def _render_final_preview(project_id: str, job_id: str | None) -> None:
         duration_ms = int(sum(duration for _, duration in intervals) * 1000)
         db.table("jobs").update({"progress": 50}).eq("id", job_id).execute()
 
-        source_ext = Path(project["source_filename"] or "source.mp4").suffix or ".mp4"
-        source_path = temp_dir / f"source{source_ext}"
-        r2.download_file(project["source_r2_key"], str(source_path))
+        source_path = _get_cached_source_video(project, temp_dir)
 
         no_subs_path = output_dir / "final_preview_no_subs.mp4"
-        final_path = output_dir / "final_preview.mp4"
         _render_intervals(source_path, intervals, no_subs_path)
         db.table("jobs").update({"progress": 80}).eq("id", job_id).execute()
 
-        _burn_subtitles(no_subs_path, srt_path, final_path)
-        final_r2_key = f"results/{project_id}/final_preview_{job_id}.mp4"
-        r2.upload_file(str(final_path), final_r2_key, "video/mp4")
+        captions_tmp_path = output_dir / "captions.vtt"
+        _write_webvtt_from_srt(srt_path, captions_tmp_path)
+
+        cache_video_path.parent.mkdir(parents=True, exist_ok=True)
+        video_tmp_path = cache_video_path.with_suffix(".mp4.tmp")
+        captions_cache_tmp_path = cache_captions_path.with_suffix(".vtt.tmp")
+        shutil.move(str(no_subs_path), str(video_tmp_path))
+        shutil.move(str(captions_tmp_path), str(captions_cache_tmp_path))
+        video_tmp_path.replace(cache_video_path)
+        captions_cache_tmp_path.replace(cache_captions_path)
 
         db.table("jobs").update({
             "status": "completed",
             "progress": 100,
             "result_r2_keys": {
-                "final_preview": final_r2_key,
+                "cache_key": preview_cache_key(project_id, hash_value),
+                "decision_hash": hash_value,
+                "cache_token": cache_token,
                 "duration_ms": duration_ms,
             },
             "completed_at": "now()",

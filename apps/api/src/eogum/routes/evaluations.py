@@ -5,8 +5,10 @@ import json
 import logging
 from pathlib import Path
 import tempfile
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 
 from eogum.auth import get_user_id
 from eogum.config import settings
@@ -26,12 +28,160 @@ from eogum.models.schemas import (
 from eogum.services import avid
 from eogum.services.artifacts import get_latest_artifact_job
 from eogum.services.database import get_db
+from eogum.services.final_preview_cache import (
+    decision_hash,
+    preview_cache_paths,
+    preview_cache_ready,
+)
 from eogum.services.r2 import download_to_bytes, generate_presigned_stream
 from eogum.services.job_runner import enqueue_final_preview
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/projects/{project_id}", tags=["evaluations"])
+
+STREAM_CHUNK_SIZE = 1024 * 1024
+
+
+def _api_public_base(request: Request) -> str:
+    if settings.api_public_url:
+        return settings.api_public_url.rstrip("/")
+    return f"{str(request.base_url).rstrip('/')}/api/v1"
+
+
+def _local_preview_urls(request: Request, project_id: str, job_id: str, token: str) -> tuple[str, str]:
+    base = _api_public_base(request)
+    quoted_token = quote(token, safe="")
+    path = f"{base}/projects/{project_id}/final-preview/{job_id}"
+    return f"{path}/video?token={quoted_token}", f"{path}/captions?token={quoted_token}"
+
+
+def _response_from_final_preview_job(job: dict, request: Request, project_id: str) -> FinalPreviewJobResponse:
+    result_keys = job.get("result_r2_keys") or {}
+    video_url = None
+    captions_url = None
+
+    cache_token = result_keys.get("cache_token")
+    hash_value = result_keys.get("decision_hash")
+    if cache_token and hash_value and preview_cache_ready(project_id, hash_value):
+        video_url, captions_url = _local_preview_urls(request, project_id, job["id"], cache_token)
+    else:
+        preview_key = result_keys.get("final_preview")
+        if preview_key:
+            video_url = generate_presigned_stream(preview_key)
+
+    return FinalPreviewJobResponse(
+        job_id=job["id"],
+        status=job["status"],
+        progress=job.get("progress") or 0,
+        error_message=job.get("error_message"),
+        video_url=video_url,
+        captions_url=captions_url,
+        duration_ms=result_keys.get("duration_ms"),
+    )
+
+
+def _find_completed_cached_preview_job(db, project_id: str, user_id: str, hash_value: str) -> dict | None:
+    result = (
+        db.table("jobs")
+        .select("id,status,progress,error_message,result_r2_keys,created_at")
+        .eq("project_id", project_id)
+        .eq("user_id", user_id)
+        .eq("type", "final_preview")
+        .eq("status", "completed")
+        .order("created_at", desc=True)
+        .limit(20)
+        .execute()
+    )
+    for job in result.data or []:
+        result_keys = job.get("result_r2_keys") or {}
+        if result_keys.get("decision_hash") == hash_value and preview_cache_ready(project_id, hash_value):
+            return job
+    return None
+
+
+def _verify_cached_preview_job(project_id: str, job_id: str, token: str) -> tuple[Path, Path]:
+    db = get_db()
+    job = (
+        db.table("jobs")
+        .select("id,project_id,type,status,result_r2_keys")
+        .eq("id", job_id)
+        .eq("project_id", project_id)
+        .eq("type", "final_preview")
+        .eq("status", "completed")
+        .maybe_single()
+        .execute()
+    )
+    if not job.data:
+        raise HTTPException(status_code=404, detail="미리보기 작업을 찾을 수 없습니다")
+
+    result_keys = job.data.get("result_r2_keys") or {}
+    expected_token = result_keys.get("cache_token")
+    hash_value = result_keys.get("decision_hash")
+    if not expected_token or not hash_value or token != expected_token:
+        raise HTTPException(status_code=403, detail="미리보기 접근 토큰이 유효하지 않습니다")
+
+    video_path, captions_path = preview_cache_paths(project_id, hash_value)
+    if not video_path.is_file() or not captions_path.is_file():
+        raise HTTPException(status_code=404, detail="미리보기 캐시 파일을 찾을 수 없습니다")
+    return video_path, captions_path
+
+
+def _iter_file_range(path: Path, start: int, end: int):
+    with path.open("rb") as file:
+        file.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            chunk = file.read(min(STREAM_CHUNK_SIZE, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
+def _stream_cached_file(request: Request, path: Path, media_type: str) -> StreamingResponse:
+    size = path.stat().st_size
+    etag = f'"{path.stat().st_mtime_ns}-{size}"'
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "ETag": etag,
+    }
+
+    range_header = request.headers.get("range")
+    if range_header and range_header.startswith("bytes="):
+        range_value = range_header.removeprefix("bytes=").split(",", 1)[0].strip()
+        start_raw, _, end_raw = range_value.partition("-")
+        try:
+            if start_raw:
+                start = int(start_raw)
+                end = int(end_raw) if end_raw else size - 1
+            else:
+                suffix_length = int(end_raw)
+                start = max(0, size - suffix_length)
+                end = size - 1
+        except ValueError:
+            raise HTTPException(status_code=416, detail="Requested Range Not Satisfiable") from None
+        if start >= size or end < start:
+            raise HTTPException(status_code=416, detail="Requested Range Not Satisfiable")
+        end = min(end, size - 1)
+        headers.update({
+            "Content-Range": f"bytes {start}-{end}/{size}",
+            "Content-Length": str(end - start + 1),
+        })
+        return StreamingResponse(
+            _iter_file_range(path, start, end),
+            status_code=206,
+            media_type=media_type,
+            headers=headers,
+        )
+
+    headers["Content-Length"] = str(size)
+    return StreamingResponse(
+        _iter_file_range(path, 0, size - 1),
+        media_type=media_type,
+        headers=headers,
+    )
 
 
 def _normalize_evaluation_payload(segments_value) -> dict:
@@ -240,6 +390,7 @@ def save_evaluation(
 def start_final_preview(
     project_id: str,
     req: FinalPreviewRequest,
+    request: Request,
     user_id: str = Depends(get_user_id),
 ):
     db = get_db()
@@ -257,6 +408,11 @@ def start_final_preview(
 
     payload = req.model_dump()
     _save_evaluation_payload(db, project_id, user_id, payload)
+    hash_value = decision_hash(payload)
+
+    cached_job = _find_completed_cached_preview_job(db, project_id, user_id, hash_value)
+    if cached_job:
+        return _response_from_final_preview_job(cached_job, request, project_id)
 
     job = (
         db.table("jobs")
@@ -267,6 +423,9 @@ def start_final_preview(
             "status": "pending",
             "progress": 0,
             "input_payload": payload,
+            "result_r2_keys": {
+                "decision_hash": hash_value,
+            },
         })
         .execute()
         .data[0]
@@ -281,7 +440,7 @@ def start_final_preview(
 
 
 @router.get("/final-preview/{job_id}", response_model=FinalPreviewJobResponse)
-def get_final_preview(project_id: str, job_id: str, user_id: str = Depends(get_user_id)):
+def get_final_preview(project_id: str, job_id: str, request: Request, user_id: str = Depends(get_user_id)):
     db = get_db()
 
     job = (
@@ -297,17 +456,29 @@ def get_final_preview(project_id: str, job_id: str, user_id: str = Depends(get_u
     if not job.data:
         raise HTTPException(status_code=404, detail="미리보기 작업을 찾을 수 없습니다")
 
-    r2_keys = job.data.get("result_r2_keys") or {}
-    preview_key = r2_keys.get("final_preview")
-    video_url = generate_presigned_stream(preview_key) if preview_key else None
-    return FinalPreviewJobResponse(
-        job_id=job.data["id"],
-        status=job.data["status"],
-        progress=job.data.get("progress") or 0,
-        error_message=job.data.get("error_message"),
-        video_url=video_url,
-        duration_ms=r2_keys.get("duration_ms"),
-    )
+    return _response_from_final_preview_job(job.data, request, project_id)
+
+
+@router.get("/final-preview/{job_id}/video")
+def stream_final_preview_video(
+    project_id: str,
+    job_id: str,
+    request: Request,
+    token: str = Query(...),
+):
+    video_path, _ = _verify_cached_preview_job(project_id, job_id, token)
+    return _stream_cached_file(request, video_path, "video/mp4")
+
+
+@router.get("/final-preview/{job_id}/captions")
+def stream_final_preview_captions(
+    project_id: str,
+    job_id: str,
+    request: Request,
+    token: str = Query(...),
+):
+    _, captions_path = _verify_cached_preview_job(project_id, job_id, token)
+    return _stream_cached_file(request, captions_path, "text/vtt; charset=utf-8")
 
 
 @router.get("/eval-report", response_model=EvalReportResponse)

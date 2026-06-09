@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     # Server
     host: str = "0.0.0.0"
     port: int = 8000
+    api_public_url: str = ""
+
+    # Local preview cache
+    final_preview_cache_dir: Path = Path("/tmp/eogum/final-previews")
+    source_cache_dir: Path = Path("/tmp/eogum/sources")
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

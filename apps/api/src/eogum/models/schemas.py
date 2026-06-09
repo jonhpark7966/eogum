@@ -190,6 +190,7 @@ class FinalPreviewJobResponse(BaseModel):
     progress: int
     error_message: str | None = None
     video_url: str | None = None
+    captions_url: str | None = None
     duration_ms: int | None = None
 
 

@@ -40,6 +40,7 @@ export interface Project {
   source_filename: string | null;
   source_duration_seconds: number | null;
   source_sha256?: string | null;
+  settings?: Record<string, unknown>;
   extra_sources: ExtraSource[];
   multicam_state: MulticamState;
   created_at: string;

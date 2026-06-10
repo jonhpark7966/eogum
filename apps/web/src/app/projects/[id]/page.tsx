@@ -112,6 +112,13 @@ function PipelineStageList({ stages }: { stages: PipelineStage[] }) {
   );
 }
 
+function hasScribeV2CacheHit(project: ProjectDetail): boolean {
+  return project.jobs.some((job) => (job.pipeline_stages ?? []).some((stage) => {
+    if (stage.id !== "scribe_v2_transcribe" || stage.status !== "completed") return false;
+    return (stage.label ?? "").includes("cache") || (stage.detail ?? "").includes("캐시");
+  }));
+}
+
 function multicamLabel(state: MulticamState | undefined, extraCount: number): string {
   const status = state?.status || (extraCount > 0 ? "pending_apply" : "not_applied");
   if (status === "not_applied") return "멀티캠 소스 없음";
@@ -163,6 +170,7 @@ export default function ProjectDetailPage() {
   const [variantModalOpen, setVariantModalOpen] = useState(false);
   const [variantIntensity, setVariantIntensity] = useState<EditIntensity>("light");
   const [creatingVariant, setCreatingVariant] = useState(false);
+  const [sourceCacheReused, setSourceCacheReused] = useState(false);
 
   // Multicam state
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
@@ -177,8 +185,17 @@ export default function ProjectDetailPage() {
     const { data: { session } } = await supabase.auth.getSession();
     if (!session) { router.replace("/"); return; }
     try {
-      const data = await api.getProject(session.access_token, projectId);
+      const [data, projectList] = await Promise.all([
+        api.getProject(session.access_token, projectId),
+        api.listProjects(session.access_token).catch(() => []),
+      ]);
+      const sourceReused = Boolean(data.source_sha256) && projectList.some((item) =>
+        item.id !== data.id &&
+        item.source_sha256 === data.source_sha256 &&
+        new Date(item.created_at).getTime() <= new Date(data.created_at).getTime()
+      );
       setProject(data);
+      setSourceCacheReused(sourceReused);
     } catch (err) {
       setError(err instanceof Error ? err.message : "오류가 발생했습니다");
     }
@@ -367,6 +384,8 @@ export default function ProjectDetailPage() {
   const canApplyMulticam = project.extra_sources.length > 0 && !isUploadingExtraSources && !["queued", "running", "canceling"].includes(multicamStatus);
   const canCancelMulticam = ["queued", "running", "canceling"].includes(multicamStatus);
   const canDeleteProject = !isProcessing && !isUploadingExtraSources && !canCancelMulticam;
+  const scribeV2CacheHit = hasScribeV2CacheHit(project);
+  const showCacheReuseInfo = sourceCacheReused || scribeV2CacheHit;
 
   return (
     <div className="min-h-screen bg-[#030712] text-white dot-grid">
@@ -430,7 +449,7 @@ export default function ProjectDetailPage() {
                     onClick={openVariantModal}
                     className="rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-300 transition hover:bg-cyan-500/20"
                   >
-                    다른 편집 강도로 다시 만들기
+                    편집 강도 변경
                   </button>
                 )}
                 <button
@@ -458,6 +477,28 @@ export default function ProjectDetailPage() {
             </svg>
             {error}
           </div>
+        )}
+
+        {showCacheReuseInfo && (
+          <Section
+            title="캐시 재사용"
+            icon={<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M21 16V8" /><path d="M3 8v8" /><path d="M12 3 3 8l9 5 9-5-9-5Z" /><path d="m3 16 9 5 9-5" /><path d="m3 12 9 5 9-5" /></svg>}
+          >
+            <div className="grid gap-3 sm:grid-cols-2">
+              {sourceCacheReused && (
+                <div className="rounded-xl border border-cyan-500/15 bg-cyan-500/[0.04] px-4 py-3">
+                  <p className="text-sm font-medium text-cyan-200">원본 R2 캐시</p>
+                  <p className="mt-1 text-xs leading-5 text-gray-500">같은 원본 파일을 재업로드하지 않고 기존 R2 소스를 재사용했습니다.</p>
+                </div>
+              )}
+              {scribeV2CacheHit && (
+                <div className="rounded-xl border border-emerald-500/15 bg-emerald-500/[0.04] px-4 py-3">
+                  <p className="text-sm font-medium text-emerald-200">Scribe V2 캐시</p>
+                  <p className="mt-1 text-xs leading-5 text-gray-500">동일 원본과 전사 옵션의 raw Scribe V2 결과를 재사용했습니다.</p>
+                </div>
+              )}
+            </div>
+          </Section>
         )}
 
         {/* ── Processing Status ── */}
@@ -809,7 +850,7 @@ export default function ProjectDetailPage() {
       {variantModalOpen && (
         <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/70 px-4">
           <div className="w-full max-w-lg rounded-2xl border border-white/10 bg-[#0a0f1a] p-6 shadow-2xl">
-            <h2 className="text-lg font-semibold">다른 편집 강도로 다시 만들기</h2>
+            <h2 className="text-lg font-semibold">편집 강도 변경</h2>
             <div className="mt-4 rounded-xl border border-white/[0.06] bg-white/[0.025] px-4 py-3 text-sm text-gray-300">
               현재 강도: <span className="font-medium text-cyan-300">{currentEditIntensityLabel}</span>
             </div>

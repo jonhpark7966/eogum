@@ -24,6 +24,18 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; icon: string
   reprocess_failed: { label: "재적용 실패", color: "text-red-400", icon: "✕", bg: "bg-red-400/10" },
 };
 
+type EditIntensity = "light" | "normal" | "heavy";
+
+const EDIT_INTENSITY_LABELS: Record<EditIntensity, string> = {
+  light: "적게 편집",
+  normal: "일반 편집",
+  heavy: "많이 편집",
+};
+
+function normalizeEditIntensity(value: unknown): EditIntensity {
+  return value === "light" || value === "normal" || value === "heavy" ? value : "normal";
+}
+
 function StatusBadge({ status }: { status: string }) {
   const config = STATUS_CONFIG[status] ?? { label: status, color: "text-gray-400", icon: "?", bg: "bg-gray-400/10" };
   const isAnimated = status === "processing" || status === "queued";
@@ -97,6 +109,8 @@ function ProjectCard({
   const isFailed = project.status === "failed";
   const isCompleted = project.status === "completed";
   const cutTypeLabel = project.cut_type === "subtitle_cut" ? "강의/설명" : "팟캐스트";
+  const editIntensity = normalizeEditIntensity(project.settings?.edit_intensity);
+  const editIntensityLabel = EDIT_INTENSITY_LABELS[editIntensity];
   const cutTypeIcon = project.cut_type === "subtitle_cut" ? (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-gray-500">
       <rect x="2" y="2" width="20" height="20" rx="2" /><path d="M7 2v20" /><path d="M17 2v20" /><path d="M2 12h20" />
@@ -129,10 +143,16 @@ function ProjectCard({
         <div className="flex items-start justify-between gap-4">
           <div className="flex-1 min-w-0">
             <h3 className="font-semibold text-[15px] truncate group-hover:text-white transition-colors">{project.name}</h3>
-            <div className="flex items-center gap-3 mt-2 text-xs text-gray-500">
+            <div className="flex flex-wrap items-center gap-3 mt-2 text-xs text-gray-500">
               <span className="inline-flex items-center gap-1">
                 {cutTypeIcon}
                 {cutTypeLabel}
+              </span>
+              <span className="inline-flex items-center gap-1 text-cyan-300">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-cyan-400/70">
+                  <path d="M4 21v-7" /><path d="M4 10V3" /><path d="M12 21v-9" /><path d="M12 8V3" /><path d="M20 21v-5" /><path d="M20 12V3" /><path d="M2 14h4" /><path d="M10 8h4" /><path d="M18 16h4" />
+                </svg>
+                {editIntensityLabel}
               </span>
               {project.source_duration_seconds && (
                 <span>{formatDuration(project.source_duration_seconds)}</span>
@@ -272,7 +292,18 @@ export default function DashboardPage() {
         api.listProjects(token),
         api.getCredits(token),
       ]);
-      setProjects(projectList);
+      const projectsWithSettings = projectList.every((project) => project.settings)
+        ? projectList
+        : await Promise.all(projectList.map(async (project) => {
+            if (project.settings) return project;
+            try {
+              const detail = await api.getProject(token, project.id);
+              return { ...project, settings: detail.settings };
+            } catch {
+              return project;
+            }
+          }));
+      setProjects(projectsWithSettings);
       setCredits(creditBalance);
       setError(null);
     } catch (e) {

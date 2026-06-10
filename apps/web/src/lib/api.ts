@@ -39,6 +39,7 @@ export interface Project {
   language: string;
   source_filename: string | null;
   source_duration_seconds: number | null;
+  source_sha256?: string | null;
   extra_sources: ExtraSource[];
   multicam_state: MulticamState;
   created_at: string;
@@ -119,6 +120,12 @@ export interface MultipartAbortResponse {
 export interface DownloadResponse {
   download_url: string;
   filename: string;
+}
+
+export interface SourceLookupResponse {
+  hit: boolean;
+  r2_key: string | null;
+  source_asset_id: string | null;
 }
 
 // ── Evaluation ──
@@ -359,6 +366,12 @@ export const api = {
     }),
 
   // Projects
+  lookupSource: (token: string, data: { sha256: string; size_bytes: number }) =>
+    apiFetch<SourceLookupResponse>("/sources/lookup", token, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
   listProjects: (token: string) => apiFetch<Project[]>("/projects", token),
 
   getProject: (token: string, id: string) =>
@@ -374,6 +387,7 @@ export const api = {
       source_filename: string;
       source_duration_seconds: number;
       source_size_bytes: number;
+      source_sha256?: string | null;
       settings?: Record<string, unknown>;
     }
   ) =>
@@ -382,8 +396,18 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
+  createProjectVariant: (
+    token: string,
+    id: string,
+    data: { edit_intensity: "light" | "normal" | "heavy"; name?: string }
+  ) =>
+    apiFetch<Project>("/projects/" + id + "/variants", token, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
   deleteProject: (token: string, id: string) =>
-    apiFetch<void>(`/projects/${id}`, token, { method: "DELETE" }),
+    apiFetch<void>("/projects/" + id, token, { method: "DELETE" }),
 
   retryProject: (token: string, id: string) =>
     apiFetch<Project>(`/projects/${id}/retry`, token, { method: "POST" }),

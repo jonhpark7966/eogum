@@ -40,6 +40,25 @@ const JOB_TYPE_LABELS: Record<string, string> = {
   final_preview: "완성본 미리보기",
 };
 
+
+type EditIntensity = "light" | "normal" | "heavy";
+
+const EDIT_INTENSITY_OPTIONS: { value: EditIntensity; label: string; description: string }[] = [
+  { value: "light", label: "적게 편집", description: "꼭 필요한 컷만" },
+  { value: "normal", label: "일반 편집", description: "균형 있게 정리" },
+  { value: "heavy", label: "많이 편집", description: "적극적으로 압축" },
+];
+
+const EDIT_INTENSITY_LABELS: Record<EditIntensity, string> = {
+  light: "적게 편집",
+  normal: "일반 편집",
+  heavy: "많이 편집",
+};
+
+function normalizeEditIntensity(value: unknown): EditIntensity {
+  return value === "light" || value === "normal" || value === "heavy" ? value : "normal";
+}
+
 const STAGE_STATUS_CONFIG: Record<string, { label: string; dot: string; text: string }> = {
   pending: { label: "대기", dot: "bg-gray-600", text: "text-gray-500" },
   running: { label: "진행 중", dot: "bg-cyan-400 shadow-[0_0_12px_rgba(34,211,238,0.45)]", text: "text-cyan-300" },
@@ -141,6 +160,9 @@ export default function ProjectDetailPage() {
   const [retrying, setRetrying] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [variantModalOpen, setVariantModalOpen] = useState(false);
+  const [variantIntensity, setVariantIntensity] = useState<EditIntensity>("light");
+  const [creatingVariant, setCreatingVariant] = useState(false);
 
   // Multicam state
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
@@ -161,7 +183,7 @@ export default function ProjectDetailPage() {
       setError(err instanceof Error ? err.message : "오류가 발생했습니다");
     }
     setLoading(false);
-  }, [projectId]);
+  }, [projectId, router, supabase.auth]);
 
   useEffect(() => {
     loadProject();
@@ -277,6 +299,39 @@ export default function ProjectDetailPage() {
     }
   };
 
+
+  const openVariantModal = () => {
+    if (!project) return;
+    const current = normalizeEditIntensity(project.settings?.edit_intensity);
+    const next = EDIT_INTENSITY_OPTIONS.find((option) => option.value !== current)?.value ?? "normal";
+    setVariantIntensity(next);
+    setVariantModalOpen(true);
+    setError("");
+  };
+
+  const handleCreateVariant = async () => {
+    if (!project) return;
+    const current = normalizeEditIntensity(project.settings?.edit_intensity);
+    if (variantIntensity === current) {
+      setError("이미 현재 프로젝트가 해당 편집 강도입니다");
+      return;
+    }
+
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    setCreatingVariant(true);
+    try {
+      const variant = await api.createProjectVariant(session.access_token, projectId, {
+        edit_intensity: variantIntensity,
+      });
+      router.push("/projects/" + variant.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "새 편집 강도 프로젝트 생성에 실패했습니다");
+    } finally {
+      setCreatingVariant(false);
+    }
+  };
+
   /* ── Loading ── */
   if (loading) {
     return (
@@ -305,6 +360,8 @@ export default function ProjectDetailPage() {
   const isCompleted = project.status === "completed";
   const isFailed = project.status === "failed" || project.status === "reprocess_failed";
   const cutTypeLabel = project.cut_type === "subtitle_cut" ? "강의/설명" : "팟캐스트";
+  const currentEditIntensity = normalizeEditIntensity(project.settings?.edit_intensity);
+  const currentEditIntensityLabel = EDIT_INTENSITY_LABELS[currentEditIntensity];
   const isUploadingExtraSources = Boolean(uploadTask);
   const multicamStatus = project.multicam_state?.status || (project.extra_sources.length > 0 ? "pending_apply" : "not_applied");
   const canApplyMulticam = project.extra_sources.length > 0 && !isUploadingExtraSources && !["queued", "running", "canceling"].includes(multicamStatus);
@@ -353,6 +410,10 @@ export default function ProjectDetailPage() {
                     )}
                     {cutTypeLabel}
                   </span>
+                  <span className="inline-flex items-center gap-1.5 text-cyan-300">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M4 21v-7" /><path d="M4 10V3" /><path d="M12 21v-9" /><path d="M12 8V3" /><path d="M20 21v-5" /><path d="M20 12V3" /><path d="M2 14h4" /><path d="M10 8h4" /><path d="M18 16h4" /></svg>
+                    {currentEditIntensityLabel}
+                  </span>
                   {project.source_duration_seconds && (
                     <span className="inline-flex items-center gap-1.5">
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></svg>
@@ -363,7 +424,15 @@ export default function ProjectDetailPage() {
                   <span>{new Date(project.created_at).toLocaleDateString("ko-KR")}</span>
                 </div>
               </div>
-              <div className="flex shrink-0 items-center gap-2">
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                {isCompleted && (
+                  <button
+                    onClick={openVariantModal}
+                    className="rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-300 transition hover:bg-cyan-500/20"
+                  >
+                    다른 편집 강도로 다시 만들기
+                  </button>
+                )}
                 <button
                   onClick={() => setConfirmDelete(true)}
                   disabled={!canDeleteProject}
@@ -735,6 +804,59 @@ export default function ProjectDetailPage() {
           </div>
         </Section>
       </main>
+
+
+      {variantModalOpen && (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/70 px-4">
+          <div className="w-full max-w-lg rounded-2xl border border-white/10 bg-[#0a0f1a] p-6 shadow-2xl">
+            <h2 className="text-lg font-semibold">다른 편집 강도로 다시 만들기</h2>
+            <div className="mt-4 rounded-xl border border-white/[0.06] bg-white/[0.025] px-4 py-3 text-sm text-gray-300">
+              현재 강도: <span className="font-medium text-cyan-300">{currentEditIntensityLabel}</span>
+            </div>
+            <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-3">
+              {EDIT_INTENSITY_OPTIONS.map((option) => {
+                const isCurrent = option.value === currentEditIntensity;
+                const isSelected = option.value === variantIntensity;
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    onClick={() => !isCurrent && setVariantIntensity(option.value)}
+                    disabled={isCurrent || creatingVariant}
+                    className={"rounded-xl border p-3 text-left transition disabled:cursor-not-allowed disabled:opacity-45 " + (
+                      isSelected && !isCurrent
+                        ? "border-cyan-400/60 bg-cyan-500/10"
+                        : "border-white/[0.08] bg-white/[0.02] hover:border-white/[0.16] hover:bg-white/[0.04]"
+                    )}
+                  >
+                    <span className="block text-sm font-medium text-gray-100">{option.label}</span>
+                    <span className="mt-1 block text-xs text-gray-500">{isCurrent ? "현재 프로젝트" : option.description}</span>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="mt-4 rounded-xl border border-white/[0.06] bg-white/[0.025] px-4 py-3 text-xs text-gray-500">
+              새 프로젝트 이름: <span className="text-gray-300">{project.name} - {EDIT_INTENSITY_LABELS[variantIntensity]}</span>
+            </div>
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                onClick={() => setVariantModalOpen(false)}
+                disabled={creatingVariant}
+                className="rounded-lg border border-white/10 px-4 py-2 text-sm text-gray-300 transition hover:bg-white/5 disabled:opacity-50"
+              >
+                취소
+              </button>
+              <button
+                onClick={handleCreateVariant}
+                disabled={creatingVariant || variantIntensity === currentEditIntensity}
+                className="rounded-lg bg-cyan-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-cyan-400 disabled:opacity-50"
+              >
+                {creatingVariant ? "생성 중..." : "생성"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {confirmDelete && (
         <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/70 px-4">

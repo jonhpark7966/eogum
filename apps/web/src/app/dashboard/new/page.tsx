@@ -4,6 +4,7 @@ export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
 import { api, uploadFile, YouTubeInfoResponse } from "@/lib/api";
+import { sha256File } from "@/lib/hash";
 import { useRouter } from "next/navigation";
 import { useCallback, useRef, useState } from "react";
 
@@ -220,7 +221,8 @@ export default function NewProjectPage() {
 
     setError("");
     setUploading(true);
-    setProgressLabel("업로드 중...");
+    setUploadProgress(0);
+    setProgressLabel("파일 지문 계산 중...");
 
     try {
       const { data: { session } } = await supabase.auth.getSession();
@@ -228,11 +230,27 @@ export default function NewProjectPage() {
       const token = session.access_token;
 
       const duration = await getVideoDuration(file);
-
-      setUploadProgress(5);
-      const r2Key = await uploadFile(token, file, (loaded, total) => {
-        setUploadProgress(5 + Math.round((loaded / total) * 85));
+      const sourceSha256 = await sha256File(file, (loaded, total) => {
+        setUploadProgress(Math.round((loaded / total) * 10));
       });
+
+      setProgressLabel("기존 원본 확인 중...");
+      const cachedSource = await api.lookupSource(token, {
+        sha256: sourceSha256,
+        size_bytes: file.size,
+      });
+
+      let r2Key = cachedSource.r2_key || "";
+      if (cachedSource.hit && r2Key) {
+        setUploadProgress(90);
+        setProgressLabel("기존 원본 파일 재사용 중...");
+      } else {
+        setUploadProgress(10);
+        setProgressLabel("업로드 중...");
+        r2Key = await uploadFile(token, file, (loaded, total) => {
+          setUploadProgress(10 + Math.round((loaded / total) * 80));
+        });
+      }
 
       setUploadProgress(95);
       setProgressLabel("프로젝트 생성 중...");
@@ -245,6 +263,7 @@ export default function NewProjectPage() {
         source_filename: file.name,
         source_duration_seconds: duration,
         source_size_bytes: file.size,
+        source_sha256: sourceSha256,
         settings: buildProjectSettings(),
       });
 

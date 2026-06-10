@@ -8,6 +8,7 @@ import {
   type EvalSegment,
   type EvalReportResponse,
   type EvaluationSavePayload,
+  type FinalPreviewTimelineMap,
   type SegmentWithDecision,
 } from "@/lib/api";
 import { useParams, useRouter } from "next/navigation";
@@ -63,6 +64,34 @@ function mediaTimeToMs(video: HTMLVideoElement): number {
   return Math.round(video.currentTime * 1000);
 }
 
+function sourceMsToPreviewMs(sourceMs: number, map: FinalPreviewTimelineMap | null): number | null {
+  const intervals = map?.intervals || [];
+  if (intervals.length === 0) return null;
+  for (const interval of intervals) {
+    if (sourceMs >= interval.source_start_ms && sourceMs <= interval.source_end_ms) {
+      const requested = Math.max(1, interval.requested_duration_ms);
+      const scale = interval.actual_duration_ms / requested;
+      return interval.preview_start_ms + (sourceMs - interval.source_start_ms) * scale;
+    }
+    if (sourceMs < interval.source_start_ms) return interval.preview_start_ms;
+  }
+  return intervals[intervals.length - 1].preview_end_ms;
+}
+
+function previewMsToSourceMs(previewMs: number, map: FinalPreviewTimelineMap | null): number | null {
+  const intervals = map?.intervals || [];
+  if (intervals.length === 0) return null;
+  for (const interval of intervals) {
+    if (previewMs >= interval.preview_start_ms && previewMs <= interval.preview_end_ms) {
+      const actual = Math.max(1, interval.actual_duration_ms);
+      const scale = interval.requested_duration_ms / actual;
+      return interval.source_start_ms + (previewMs - interval.preview_start_ms) * scale;
+    }
+    if (previewMs < interval.preview_start_ms) return interval.source_start_ms;
+  }
+  return intervals[intervals.length - 1].source_end_ms;
+}
+
 type ReviewMetadata = Pick<
   EvaluationSavePayload,
   "schema_version" | "review_scope" | "join_strategy"
@@ -105,6 +134,8 @@ export default function ReviewPage() {
   const [finalPreviewError, setFinalPreviewError] = useState("");
   const [usingFinalPreview, setUsingFinalPreview] = useState(false);
   const [finalPreviewCaptionsUrl, setFinalPreviewCaptionsUrl] = useState("");
+  const [finalPreviewTimelineMap, setFinalPreviewTimelineMap] =
+    useState<FinalPreviewTimelineMap | null>(null);
 
   // Load all data
   const loadData = useCallback(async () => {
@@ -179,8 +210,16 @@ export default function ReviewPage() {
         setFinalPreviewStatus(job.status);
         setFinalPreviewProgress(job.progress);
         if (job.status === "completed" && job.video_url) {
+          let timelineMap: FinalPreviewTimelineMap | null = null;
+          if (job.timeline_map_url) {
+            const mapRes = await fetch(job.timeline_map_url);
+            if (mapRes.ok) {
+              timelineMap = await mapRes.json();
+            }
+          }
           setVideoUrl(job.video_url);
           setFinalPreviewCaptionsUrl(job.captions_url || "");
+          setFinalPreviewTimelineMap(timelineMap);
           setUsingFinalPreview(true);
           setDirty(false);
           if (job.duration_ms) setDurationMs(job.duration_ms);
@@ -252,6 +291,9 @@ export default function ReviewPage() {
 
     const onTimeUpdate = () => {
       const currentMs = mediaTimeToMs(video);
+      const currentSourceMs = usingFinalPreview
+        ? previewMsToSourceMs(currentMs, finalPreviewTimelineMap)
+        : currentMs;
 
       // Stop at segment end if playing a specific segment
       if (playEndRef.current !== null && currentMs >= playEndRef.current) {
@@ -260,10 +302,12 @@ export default function ReviewPage() {
 
       // Find current segment
       let found = -1;
-      for (let i = 0; i < segments.length; i++) {
-        if (currentMs >= segments[i].start_ms && currentMs < segments[i].end_ms) {
-          found = segments[i].index;
-          break;
+      if (currentSourceMs !== null) {
+        for (let i = 0; i < segments.length; i++) {
+          if (currentSourceMs >= segments[i].start_ms && currentSourceMs < segments[i].end_ms) {
+            found = segments[i].index;
+            break;
+          }
         }
       }
 
@@ -278,17 +322,24 @@ export default function ReviewPage() {
 
     video.addEventListener("timeupdate", onTimeUpdate);
     return () => video.removeEventListener("timeupdate", onTimeUpdate);
-  }, [segments, currentIndex, stopSegmentPlayback]);
+  }, [segments, currentIndex, stopSegmentPlayback, usingFinalPreview, finalPreviewTimelineMap]);
 
   // Play segment
   const playSegment = (seg: EvalSegment) => {
     const video = videoRef.current;
     if (!video) return;
     stopSegmentPlayback();
-    const startMs = Math.round(seg.start_ms);
-    const endMs = Math.round(seg.end_ms);
+    const sourceStartMs = Math.round(seg.start_ms);
+    const sourceEndMs = Math.round(seg.end_ms);
+    const startMs = usingFinalPreview
+      ? sourceMsToPreviewMs(sourceStartMs, finalPreviewTimelineMap)
+      : sourceStartMs;
+    const endMs = usingFinalPreview
+      ? sourceMsToPreviewMs(sourceEndMs, finalPreviewTimelineMap)
+      : sourceEndMs;
+    if (startMs === null || endMs === null) return;
     video.currentTime = msToMediaTime(startMs);
-    playEndRef.current = endMs;
+    playEndRef.current = Math.max(startMs + 1, endMs);
     setCurrentIndex(seg.index);
     const playPromise = video.play();
     scheduleSegmentPlaybackMonitor();
@@ -378,6 +429,21 @@ export default function ReviewPage() {
       setFinalPreviewJobId(job.job_id);
       setFinalPreviewStatus(job.status);
       setFinalPreviewProgress(job.progress);
+      setFinalPreviewTimelineMap(null);
+      if (job.status === "completed" && job.video_url) {
+        let timelineMap: FinalPreviewTimelineMap | null = null;
+        if (job.timeline_map_url) {
+          const mapRes = await fetch(job.timeline_map_url);
+          if (mapRes.ok) {
+            timelineMap = await mapRes.json();
+          }
+        }
+        setVideoUrl(job.video_url);
+        setFinalPreviewCaptionsUrl(job.captions_url || "");
+        setFinalPreviewTimelineMap(timelineMap);
+        setUsingFinalPreview(true);
+        if (job.duration_ms) setDurationMs(job.duration_ms);
+      }
       setDirty(false);
     } catch (err) {
       setFinalPreviewStatus("failed");
@@ -389,6 +455,7 @@ export default function ReviewPage() {
     if (!originalVideoUrl) return;
     setVideoUrl(originalVideoUrl);
     setFinalPreviewCaptionsUrl("");
+    setFinalPreviewTimelineMap(null);
     setUsingFinalPreview(false);
   };
 

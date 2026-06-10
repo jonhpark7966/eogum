@@ -238,7 +238,22 @@ export interface FinalPreviewJobResponse {
   error_message: string | null;
   video_url: string | null;
   captions_url: string | null;
+  timeline_map_url: string | null;
   duration_ms: number | null;
+}
+
+export interface FinalPreviewTimelineInterval {
+  source_start_ms: number;
+  source_end_ms: number;
+  requested_duration_ms: number;
+  actual_duration_ms: number;
+  preview_start_ms: number;
+  preview_end_ms: number;
+}
+
+export interface FinalPreviewTimelineMap {
+  version: number;
+  intervals: FinalPreviewTimelineInterval[];
 }
 
 export interface MulticamState {

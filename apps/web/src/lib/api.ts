@@ -33,6 +33,7 @@ export interface ExtraSource {
 
 export interface Project {
   id: string;
+  user_id: string;
   name: string;
   status: string;
   cut_type: string;

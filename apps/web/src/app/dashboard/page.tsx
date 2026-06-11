@@ -6,7 +6,7 @@ import { createClient } from "@/lib/supabase/client";
 import { api, type CreditBalance, type Project } from "@/lib/api";
 import type { MouseEvent } from "react";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Image from "next/image";
 
 function formatDuration(seconds: number): string {
@@ -25,6 +25,12 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; icon: string
 };
 
 type EditIntensity = "light" | "normal" | "heavy";
+type ProjectSettingsCacheEntry = {
+  updated_at: string;
+  settings: Record<string, unknown>;
+};
+
+const PROJECT_DETAIL_CONCURRENCY = 4;
 
 const EDIT_INTENSITY_LABELS: Record<EditIntensity, string> = {
   light: "적게 편집",
@@ -34,6 +40,59 @@ const EDIT_INTENSITY_LABELS: Record<EditIntensity, string> = {
 
 function normalizeEditIntensity(value: unknown): EditIntensity {
   return value === "light" || value === "normal" || value === "heavy" ? value : "normal";
+}
+
+async function hydrateProjectSettings(
+  projectList: Project[],
+  token: string,
+  cache: Map<string, ProjectSettingsCacheEntry>
+): Promise<Project[]> {
+  const activeProjectIds = new Set(projectList.map((project) => project.id));
+  for (const projectId of cache.keys()) {
+    if (!activeProjectIds.has(projectId)) cache.delete(projectId);
+  }
+
+  const hydratedProjects = [...projectList];
+  const detailRequests: { project: Project; index: number }[] = [];
+
+  projectList.forEach((project, index) => {
+    if (project.settings) {
+      cache.set(project.id, {
+        updated_at: project.updated_at,
+        settings: project.settings,
+      });
+      return;
+    }
+
+    const cached = cache.get(project.id);
+    if (cached && cached.updated_at === project.updated_at) {
+      hydratedProjects[index] = { ...project, settings: cached.settings };
+      return;
+    }
+
+    detailRequests.push({ project, index });
+  });
+
+  for (let i = 0; i < detailRequests.length; i += PROJECT_DETAIL_CONCURRENCY) {
+    const chunk = detailRequests.slice(i, i + PROJECT_DETAIL_CONCURRENCY);
+    await Promise.all(
+      chunk.map(async ({ project, index }) => {
+        try {
+          const detail = await api.getProject(token, project.id);
+          cache.set(project.id, {
+            updated_at: project.updated_at,
+            settings: detail.settings,
+          });
+          hydratedProjects[index] = { ...project, settings: detail.settings };
+        } catch (error) {
+          console.warn("Project detail preload failed:", project.id, error);
+          hydratedProjects[index] = project;
+        }
+      })
+    );
+  }
+
+  return hydratedProjects;
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -97,6 +156,7 @@ function ProjectCard({
   retrying,
   deleting,
   onClick,
+  currentUserId,
 }: {
   project: Project;
   onRetry: (e: MouseEvent) => void;
@@ -104,10 +164,16 @@ function ProjectCard({
   retrying: boolean;
   deleting: boolean;
   onClick: () => void;
+  currentUserId: string | null;
 }) {
   const isProcessing = project.status === "processing" || project.status === "queued";
   const isFailed = project.status === "failed";
   const isCompleted = project.status === "completed";
+  const isOwnProject = project.user_id === currentUserId;
+  const ownerShortId = project.user_id.slice(0, 8);
+  const ownerBadgeClass = isOwnProject
+    ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300"
+    : "border-amber-400/20 bg-amber-400/10 text-amber-300";
   const cutTypeLabel = project.cut_type === "subtitle_cut" ? "강의/설명" : "팟캐스트";
   const editIntensity = normalizeEditIntensity(project.settings?.edit_intensity);
   const editIntensityLabel = EDIT_INTENSITY_LABELS[editIntensity];
@@ -144,6 +210,12 @@ function ProjectCard({
           <div className="flex-1 min-w-0">
             <h3 className="font-semibold text-[15px] truncate group-hover:text-white transition-colors">{project.name}</h3>
             <div className="flex flex-wrap items-center gap-3 mt-2 text-xs text-gray-500">
+              <span
+                className={"inline-flex items-center rounded-md border px-2 py-0.5 " + ownerBadgeClass}
+                title={isOwnProject ? "내 프로젝트" : "소유자: " + project.user_id}
+              >
+                {isOwnProject ? "내 프로젝트" : "유저 프로젝트 · " + ownerShortId}
+              </span>
               <span className="inline-flex items-center gap-1">
                 {cutTypeIcon}
                 {cutTypeLabel}
@@ -239,7 +311,9 @@ function EmptyState({ onNew }: { onNew: () => void }) {
 export default function DashboardPage() {
   const router = useRouter();
   const supabase = createClient();
+  const projectSettingsCache = useRef<Map<string, ProjectSettingsCacheEntry>>(new Map());
   const [projects, setProjects] = useState<Project[]>([]);
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [credits, setCredits] = useState<CreditBalance | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -286,23 +360,19 @@ export default function DashboardPage() {
       return;
     }
 
+    setCurrentUserId(session.user.id);
+
     try {
       const token = session.access_token;
       const [projectList, creditBalance] = await Promise.all([
         api.listProjects(token),
         api.getCredits(token),
       ]);
-      const projectsWithSettings = projectList.every((project) => project.settings)
-        ? projectList
-        : await Promise.all(projectList.map(async (project) => {
-            if (project.settings) return project;
-            try {
-              const detail = await api.getProject(token, project.id);
-              return { ...project, settings: detail.settings };
-            } catch {
-              return project;
-            }
-          }));
+      const projectsWithSettings = await hydrateProjectSettings(
+        projectList,
+        token,
+        projectSettingsCache.current
+      );
       setProjects(projectsWithSettings);
       setCredits(creditBalance);
       setError(null);
@@ -412,7 +482,8 @@ export default function DashboardPage() {
                 }}
                 retrying={retryingId === project.id}
                 deleting={deletingId === project.id}
-                onClick={() => router.push(`/projects/${project.id}`)}
+                onClick={() => router.push("/projects/" + project.id)}
+                currentUserId={currentUserId}
               />
             ))}
           </div>

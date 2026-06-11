@@ -119,6 +119,36 @@ function hasScribeV2CacheHit(project: ProjectDetail): boolean {
   }));
 }
 
+type ProjectJob = ProjectDetail["jobs"][number];
+
+const ACTIVE_JOB_STATUSES = new Set(["pending", "queued", "running", "cancel_requested"]);
+
+function isActiveJob(job: ProjectJob): boolean {
+  return ACTIVE_JOB_STATUSES.has(job.status);
+}
+
+function newestJobFirst(a: ProjectJob, b: ProjectJob): number {
+  return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+}
+
+function getVisibleProcessingJobs(project: ProjectDetail): ProjectJob[] {
+  const multicamJobId = project.multicam_state?.job_id;
+  if (multicamJobId) {
+    const multicamJob = project.jobs.find((job) => job.id === multicamJobId);
+    if (multicamJob && isActiveJob(multicamJob)) return [multicamJob];
+  }
+
+  const activeJobs = project.jobs.filter(isActiveJob).sort(newestJobFirst);
+  if (activeJobs.length > 0) return activeJobs;
+
+  if (project.status === "processing" || project.status === "queued") {
+    const latestJob = [...project.jobs].sort(newestJobFirst)[0];
+    return latestJob ? [latestJob] : [];
+  }
+
+  return [];
+}
+
 function multicamLabel(state: MulticamState | undefined, extraCount: number): string {
   const status = state?.status || (extraCount > 0 ? "pending_apply" : "not_applied");
   if (status === "not_applied") return "멀티캠 소스 없음";
@@ -386,6 +416,7 @@ export default function ProjectDetailPage() {
   const canDeleteProject = !isProcessing && !isUploadingExtraSources && !canCancelMulticam;
   const scribeV2CacheHit = hasScribeV2CacheHit(project);
   const showCacheReuseInfo = sourceCacheReused || scribeV2CacheHit;
+  const visibleProcessingJobs = getVisibleProcessingJobs(project);
 
   return (
     <div className="min-h-screen bg-[#030712] text-white dot-grid">
@@ -502,13 +533,13 @@ export default function ProjectDetailPage() {
         )}
 
         {/* ── Processing Status ── */}
-        {isProcessing && (
+        {isProcessing && visibleProcessingJobs.length > 0 && (
           <Section
             title="처리 상태"
             icon={<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M12 2v4" /><path d="M12 18v4" /><path d="M4.93 4.93l2.83 2.83" /><path d="M16.24 16.24l2.83 2.83" /><path d="M2 12h4" /><path d="M18 12h4" /><path d="M4.93 19.07l2.83-2.83" /><path d="M16.24 7.76l2.83-2.83" /></svg>}
           >
             <div className="space-y-4">
-              {project.jobs.map((job) => (
+              {visibleProcessingJobs.map((job) => (
                 <div key={job.id}>
                   <div className="flex justify-between text-sm mb-2">
                     <span className="text-gray-300">{JOB_TYPE_LABELS[job.type] ?? job.type}</span>

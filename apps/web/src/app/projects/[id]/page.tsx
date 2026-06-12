@@ -37,6 +37,7 @@ const JOB_TYPE_LABELS: Record<string, string> = {
   subtitle_cut: "편집 처리",
   podcast_cut: "편집 처리",
   reprocess_multicam: "멀티캠 적용",
+  cut_decision: "컷 결정 재실행",
   final_preview: "완성본 미리보기",
 };
 
@@ -122,6 +123,7 @@ function hasScribeV2CacheHit(project: ProjectDetail): boolean {
 type ProjectJob = ProjectDetail["jobs"][number];
 
 const ACTIVE_JOB_STATUSES = new Set(["pending", "queued", "running", "cancel_requested"]);
+const ARTIFACT_JOB_TYPES = new Set(["subtitle_cut", "podcast_cut", "reprocess_multicam", "cut_decision"]);
 
 function isActiveJob(job: ProjectJob): boolean {
   return ACTIVE_JOB_STATUSES.has(job.status);
@@ -195,6 +197,7 @@ export default function ProjectDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [retrying, setRetrying] = useState(false);
+  const [rerunningCutDecision, setRerunningCutDecision] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [variantModalOpen, setVariantModalOpen] = useState(false);
@@ -265,6 +268,21 @@ export default function ProjectDetailPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "재시도에 실패했습니다");
     } finally { setRetrying(false); }
+  };
+
+  const handleRerunCutDecision = async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    setRerunningCutDecision(true);
+    setError("");
+    try {
+      await api.rerunCutDecision(session.access_token, projectId);
+      await loadProject();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "컷 결정 재실행에 실패했습니다");
+    } finally {
+      setRerunningCutDecision(false);
+    }
   };
 
   const handleDownload = async (fileType: string) => {
@@ -417,6 +435,37 @@ export default function ProjectDetailPage() {
   const scribeV2CacheHit = hasScribeV2CacheHit(project);
   const showCacheReuseInfo = sourceCacheReused || scribeV2CacheHit;
   const visibleProcessingJobs = getVisibleProcessingJobs(project);
+  const latestResultKeys = [...project.jobs]
+    .filter((job) => job.result_r2_keys && ARTIFACT_JOB_TYPES.has(job.type))
+    .sort(newestJobFirst)[0]?.result_r2_keys ?? {};
+  const hasCutDecisionInputs = Boolean(latestResultKeys.project_json);
+  const hasPendingMulticamChanges = project.extra_sources.length > 0 && multicamStatus === "pending_apply";
+  const cutDecisionDisabledReason = isProcessing
+    ? "진행 중인 작업이 끝난 뒤 다시 실행할 수 있습니다"
+    : !hasCutDecisionInputs
+    ? "기존 refined segment 정보가 필요합니다"
+    : hasPendingMulticamChanges
+      ? "등록된 멀티캠 변경사항을 먼저 적용하거나 제거해야 합니다"
+      : canCancelMulticam
+        ? "진행 중인 작업이 있습니다"
+        : "같은 segment/refined segment로 cut decision만 다시 실행";
+  const canRerunCutDecision = !isProcessing
+    && hasCutDecisionInputs
+    && !hasPendingMulticamChanges
+    && !canCancelMulticam
+    && !isUploadingExtraSources
+    && !rerunningCutDecision;
+  const downloadItems = [
+    { key: "source", label: "원본 소스", icon: "📁", desc: "원본 영상 파일" },
+    { key: "fcpxml", label: "FCPXML", icon: "🎬", desc: "Final Cut Pro 프로젝트" },
+    { key: "srt", label: "SRT 자막", icon: "💬", desc: "자막 파일" },
+    { key: "report", label: "편집 리포트", icon: "📄", desc: "편집 보고서 (.md)" },
+    { key: "project_json", label: "프로젝트 JSON", icon: "📦", desc: "avid 프로젝트 파일" },
+    { key: "storyline", label: "스토리라인", icon: "📋", desc: "구조 분석 JSON" },
+    ...(latestResultKeys.llm_io_log
+      ? [{ key: "llm_io_log", label: "LLM 로그", icon: "🧾", desc: "프롬프트/응답 JSONL" }]
+      : []),
+  ];
 
   return (
     <div className="min-h-screen bg-[#030712] text-white dot-grid">
@@ -475,6 +524,14 @@ export default function ProjectDetailPage() {
                 </div>
               </div>
               <div className="flex flex-wrap items-center justify-end gap-2">
+                <button
+                  onClick={handleRerunCutDecision}
+                  disabled={!canRerunCutDecision}
+                  title={cutDecisionDisabledReason}
+                  className="rounded-lg border border-violet-500/20 bg-violet-500/10 px-3 py-1.5 text-xs font-medium text-violet-300 transition hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {rerunningCutDecision ? "재실행 중..." : "컷 결정만 재실행"}
+                </button>
                 {isCompleted && (
                   <button
                     onClick={openVariantModal}
@@ -603,14 +660,7 @@ export default function ProjectDetailPage() {
           >
             {/* Main downloads */}
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-4">
-              {[
-                { key: "source", label: "원본 소스", icon: "📁", desc: "원본 영상 파일" },
-                { key: "fcpxml", label: "FCPXML", icon: "🎬", desc: "Final Cut Pro 프로젝트" },
-                { key: "srt", label: "SRT 자막", icon: "💬", desc: "자막 파일" },
-                { key: "report", label: "편집 리포트", icon: "📄", desc: "편집 보고서 (.md)" },
-                { key: "project_json", label: "프로젝트 JSON", icon: "📦", desc: "avid 프로젝트 파일" },
-                { key: "storyline", label: "스토리라인", icon: "📋", desc: "구조 분석 JSON" },
-              ].map(({ key, label, icon, desc }) => (
+              {downloadItems.map(({ key, label, icon, desc }) => (
                 <button
                   key={key}
                   onClick={() => handleDownload(key)}

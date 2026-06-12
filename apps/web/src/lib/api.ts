@@ -77,6 +77,7 @@ export interface Job {
   created_at: string;
   pipeline_stages: PipelineStage[];
   external_task_ids: Record<string, string>;
+  result_r2_keys: Record<string, string> | null;
 }
 
 export interface CreditBalance {
@@ -428,6 +429,9 @@ export const api = {
 
   retryProject: (token: string, id: string) =>
     apiFetch<Project>(`/projects/${id}/retry`, token, { method: "POST" }),
+
+  rerunCutDecision: (token: string, id: string) =>
+    apiFetch<Project>(`/projects/${id}/cut-decision`, token, { method: "POST" }),
 
   updateExtraSources: (token: string, id: string, extra_sources: ExtraSource[]) =>
     apiFetch<Project>(`/projects/${id}/extra-sources`, token, {

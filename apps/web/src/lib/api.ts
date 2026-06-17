@@ -490,6 +490,12 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  startJunctionPreview: (token: string, projectId: string, payload: EvaluationSavePayload) =>
+    apiFetch<FinalPreviewJobResponse>(`/projects/${projectId}/junction-preview`, token, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
   getFinalPreview: (token: string, projectId: string, jobId: string) =>
     apiFetch<FinalPreviewJobResponse>(`/projects/${projectId}/final-preview/${jobId}`, token),
 

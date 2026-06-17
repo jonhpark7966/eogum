@@ -12,7 +12,7 @@ import {
   type SegmentWithDecision,
 } from "@/lib/api";
 import { useParams, useRouter } from "next/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 // ── Constants ──
 
@@ -92,6 +92,10 @@ function previewMsToSourceMs(previewMs: number, map: FinalPreviewTimelineMap | n
   return intervals[intervals.length - 1].source_end_ms;
 }
 
+function aiActionForSegment(seg: EvalSegment): "keep" | "cut" {
+  return seg.ai?.action === "cut" ? "cut" : "keep";
+}
+
 type ReviewMetadata = Pick<
   EvaluationSavePayload,
   "schema_version" | "review_scope" | "join_strategy"
@@ -136,6 +140,10 @@ export default function ReviewPage() {
   const [finalPreviewCaptionsUrl, setFinalPreviewCaptionsUrl] = useState("");
   const [finalPreviewTimelineMap, setFinalPreviewTimelineMap] =
     useState<FinalPreviewTimelineMap | null>(null);
+  const [showJunctionOnly, setShowJunctionOnly] = useState(false);
+  const [selectedSegmentIndexes, setSelectedSegmentIndexes] = useState<Set<number>>(
+    () => new Set<number>()
+  );
 
   // Load all data
   const loadData = useCallback(async () => {
@@ -240,6 +248,63 @@ export default function ReviewPage() {
       window.clearInterval(interval);
     };
   }, [finalPreviewJobId, finalPreviewStatus, projectId, supabase]);
+
+  const junctionMetadata = useMemo(() => {
+    const indexes = new Set<number>();
+    const roles = new Map<number, Set<"before" | "after">>();
+
+    const addRole = (index: number, role: "before" | "after") => {
+      indexes.add(index);
+      const currentRoles = roles.get(index) ?? new Set<"before" | "after">();
+      currentRoles.add(role);
+      roles.set(index, currentRoles);
+    };
+
+    let i = 0;
+    while (i < segments.length) {
+      if (aiActionForSegment(segments[i]) !== "cut") {
+        i += 1;
+        continue;
+      }
+
+      const cutStart = i;
+      while (i < segments.length && aiActionForSegment(segments[i]) === "cut") {
+        i += 1;
+      }
+
+      const before = segments[cutStart - 1];
+      const after = segments[i];
+      if (
+        before &&
+        after &&
+        aiActionForSegment(before) === "keep" &&
+        aiActionForSegment(after) === "keep"
+      ) {
+        addRole(before.index, "before");
+        addRole(after.index, "after");
+      }
+    }
+
+    return { indexes, roles };
+  }, [segments]);
+
+  const visibleSegments = useMemo(
+    () =>
+      showJunctionOnly
+        ? segments.filter((seg) => junctionMetadata.indexes.has(seg.index))
+        : segments,
+    [junctionMetadata, segments, showJunctionOnly]
+  );
+
+  const selectedSegments = useMemo(
+    () => segments.filter((seg) => selectedSegmentIndexes.has(seg.index)),
+    [segments, selectedSegmentIndexes]
+  );
+
+  const selectedVisibleCount = useMemo(
+    () => visibleSegments.filter((seg) => selectedSegmentIndexes.has(seg.index)).length,
+    [selectedSegmentIndexes, visibleSegments]
+  );
 
   const stopSegmentPlayback = useCallback(() => {
     const video = videoRef.current;
@@ -459,6 +524,61 @@ export default function ReviewPage() {
     setUsingFinalPreview(false);
   };
 
+  const toggleSegmentSelection = (index: number) => {
+    setSelectedSegmentIndexes((prev) => {
+      const next = new Set(prev);
+      if (next.has(index)) {
+        next.delete(index);
+      } else {
+        next.add(index);
+      }
+      return next;
+    });
+  };
+
+  const selectVisibleSegments = () => {
+    setSelectedSegmentIndexes((prev) => {
+      const next = new Set(prev);
+      for (const seg of visibleSegments) {
+        next.add(seg.index);
+      }
+      return next;
+    });
+  };
+
+  const clearSelectedSegments = () => {
+    setSelectedSegmentIndexes(new Set<number>());
+  };
+
+  const exportSelectedSegments = () => {
+    if (selectedSegments.length === 0) return;
+
+    const payload = {
+      project_id: projectId,
+      exported_at: new Date().toISOString(),
+      count: selectedSegments.length,
+      segments: selectedSegments,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `project-${projectId}-selected-segments.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  };
+
+  const junctionLabel = (index: number): string => {
+    const roles = junctionMetadata.roles.get(index);
+    if (!roles) return "연결부";
+    if (roles.has("before") && roles.has("after")) return "연결 전/후";
+    return roles.has("before") ? "연결 전" : "연결 후";
+  };
+
   // Load report
   const loadReport = async () => {
     setLoadingReport(true);
@@ -624,12 +744,60 @@ export default function ReviewPage() {
 
       {/* Stats Bar */}
       <div className="bg-gray-900/80 backdrop-blur border-b border-gray-800">
-        <div className="max-w-4xl mx-auto px-6 py-2 flex gap-6 text-xs text-gray-400">
+        <div className="max-w-4xl mx-auto px-6 py-2 flex flex-wrap items-center gap-x-6 gap-y-2 text-xs text-gray-400">
           <span>전체 <strong className="text-white">{totalSegments}</strong></span>
           <span>리뷰완료 <strong className="text-white">{reviewedCount}</strong></span>
           <span>AI삭제 <strong className="text-red-400">{aiCutCount}</strong></span>
           <span>일치율 <strong className="text-white">{agreePct}%</strong></span>
           <span>미리보기 <strong className="text-white">{formatTime(durationMs)}</strong></span>
+          {showJunctionOnly && (
+            <span>
+              연결부 <strong className="text-cyan-300">{visibleSegments.length}</strong>
+            </span>
+          )}
+          <span>
+            선택 <strong className="text-cyan-300">{selectedSegmentIndexes.size}</strong>
+            {showJunctionOnly && selectedSegmentIndexes.size > 0 && (
+              <span className="text-gray-500"> ({selectedVisibleCount}/{visibleSegments.length})</span>
+            )}
+          </span>
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setShowJunctionOnly((value) => !value)}
+              className={`px-2.5 py-1 rounded text-xs font-medium transition ${
+                showJunctionOnly
+                  ? "bg-cyan-500 text-gray-950 hover:bg-cyan-400"
+                  : "bg-gray-800 text-gray-300 hover:bg-gray-700"
+              }`}
+            >
+              {showJunctionOnly ? "전체 보기" : "연결부만 골라보기"}
+            </button>
+            <button
+              type="button"
+              onClick={selectVisibleSegments}
+              disabled={visibleSegments.length === 0 || selectedVisibleCount === visibleSegments.length}
+              className="px-2.5 py-1 rounded bg-gray-800 text-gray-300 text-xs font-medium transition hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              현재 보기 선택
+            </button>
+            <button
+              type="button"
+              onClick={clearSelectedSegments}
+              disabled={selectedSegmentIndexes.size === 0}
+              className="px-2.5 py-1 rounded bg-gray-800 text-gray-300 text-xs font-medium transition hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              선택 해제
+            </button>
+            <button
+              type="button"
+              onClick={exportSelectedSegments}
+              disabled={selectedSegments.length === 0}
+              className="px-2.5 py-1 rounded bg-white text-gray-950 text-xs font-medium transition hover:bg-gray-200 disabled:bg-gray-800 disabled:text-gray-500 disabled:cursor-not-allowed"
+            >
+              선택 Export
+            </button>
+          </div>
         </div>
       </div>
 
@@ -762,6 +930,7 @@ export default function ReviewPage() {
                     key={d.index}
                     className="bg-gray-800 rounded p-2 text-sm cursor-pointer hover:bg-gray-750"
                     onClick={() => {
+                      setShowJunctionOnly(false);
                       setShowReport(false);
                       setTimeout(() => {
                         const el = segmentRefs.current.get(d.index);
@@ -796,124 +965,144 @@ export default function ReviewPage() {
 
       {/* Segment List */}
       {!showReport && (
-      <main className="max-w-4xl mx-auto px-6 py-4">
-        <div className="space-y-2">
-          {segments.map((seg) => {
-            const isCurrent = seg.index === currentIndex;
-            const aiAction = seg.ai?.action ?? "keep";
-            const disagree =
-              seg.human !== null &&
-              seg.ai !== null &&
-              seg.human.action !== seg.ai.action;
+        <main className="max-w-4xl mx-auto px-6 py-4">
+          {visibleSegments.length === 0 ? (
+            <div className="rounded-lg border border-gray-800 bg-gray-900 px-4 py-8 text-center text-sm text-gray-500">
+              {showJunctionOnly
+                ? "연결부로 볼 segment가 없습니다"
+                : "표시할 segment가 없습니다"}
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {visibleSegments.map((seg) => {
+                const isCurrent = seg.index === currentIndex;
+                const aiAction = aiActionForSegment(seg);
+                const disagree =
+                  seg.human !== null &&
+                  seg.ai !== null &&
+                  seg.human.action !== seg.ai.action;
 
-            return (
-              <div
-                key={seg.index}
-                ref={(el) => {
-                  if (el) segmentRefs.current.set(seg.index, el);
-                }}
-                className={`rounded-lg p-3 transition-all ${
-                  aiAction === "cut"
-                    ? "border-l-4 border-red-500"
-                    : "border-l-4 border-green-500"
-                } ${isCurrent ? "ring-2 ring-blue-500" : ""} ${
-                  disagree ? "bg-amber-900/20" : "bg-gray-900"
-                }`}
-              >
-                {/* Row 1: index, time, play, AI badge */}
-                <div className="flex items-center gap-3 mb-1">
-                  <span className="text-xs text-gray-500 w-8">#{seg.index}</span>
-                  <span className="text-xs text-gray-400 font-mono">
-                    {formatTime(seg.start_ms)}→{formatTime(seg.end_ms)}
-                  </span>
-                  <button
-                    onClick={() => playSegment(seg)}
-                    className="text-blue-400 hover:text-blue-300 text-xs"
-                    title="이 구간 재생"
-                  >
-                    ▶
-                  </button>
-                  <div className="ml-auto flex items-center gap-2">
-                    <span
-                      className={`text-xs px-2 py-0.5 rounded ${
-                        aiAction === "cut"
-                          ? "bg-red-900/50 text-red-300"
-                          : "bg-green-900/50 text-green-300"
-                      }`}
-                    >
-                      AI: {aiAction.toUpperCase()}
-                    </span>
-                    {seg.ai?.reason && (
-                      <span className="text-xs text-gray-500">
-                        {seg.ai.reason}
-                      </span>
-                    )}
-                  </div>
-                </div>
-
-                {/* Row 2: text */}
-                <p className="text-sm text-gray-300 mb-2 pl-8">{seg.text}</p>
-
-                {/* Row 3: human evaluation controls */}
-                <div className="flex items-center gap-2 pl-8 flex-wrap">
-                  <span className="text-xs text-gray-500 mr-1">내 평가:</span>
-                  <button
-                    onClick={() => setHumanAction(seg.index, "keep")}
-                    className={`text-xs px-2 py-1 rounded transition ${
-                      seg.human?.action === "keep"
-                        ? "bg-green-600 text-white"
-                        : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+                return (
+                  <div
+                    key={seg.index}
+                    ref={(el) => {
+                      if (el) segmentRefs.current.set(seg.index, el);
+                    }}
+                    className={`rounded-lg p-3 transition-all ${
+                      aiAction === "cut"
+                        ? "border-l-4 border-red-500"
+                        : "border-l-4 border-green-500"
+                    } ${isCurrent ? "ring-2 ring-blue-500" : ""} ${
+                      disagree ? "bg-amber-900/20" : "bg-gray-900"
                     }`}
                   >
-                    Keep
-                  </button>
-                  <button
-                    onClick={() => setHumanAction(seg.index, "cut")}
-                    className={`text-xs px-2 py-1 rounded transition ${
-                      seg.human?.action === "cut"
-                        ? "bg-red-600 text-white"
-                        : "bg-gray-800 text-gray-400 hover:bg-gray-700"
-                    }`}
-                  >
-                    Cut
-                  </button>
-
-                  {seg.human && (
-                    <>
-                      <select
-                        value={seg.human.reason}
-                        onChange={(e) =>
-                          setHumanReason(seg.index, e.target.value)
-                        }
-                        className="text-xs bg-gray-800 text-gray-300 rounded px-2 py-1 border border-gray-700"
-                      >
-                        <option value="">이유 선택</option>
-                        {(seg.human.action === "cut"
-                          ? CUT_REASONS
-                          : KEEP_REASONS
-                        ).map((r) => (
-                          <option key={r.value} value={r.value}>
-                            {r.label}
-                          </option>
-                        ))}
-                      </select>
+                    {/* Row 1: selection, index, time, play, AI badge */}
+                    <div className="flex items-center gap-3 mb-1">
                       <input
-                        type="text"
-                        value={seg.human.note}
-                        onChange={(e) =>
-                          setHumanNote(seg.index, e.target.value)
-                        }
-                        placeholder="메모"
-                        className="text-xs bg-gray-800 text-gray-300 rounded px-2 py-1 border border-gray-700 flex-1 min-w-[100px]"
+                        type="checkbox"
+                        checked={selectedSegmentIndexes.has(seg.index)}
+                        onChange={() => toggleSegmentSelection(seg.index)}
+                        className="h-4 w-4 shrink-0 rounded border-gray-600 bg-gray-950 accent-cyan-500"
+                        aria-label={`세그먼트 ${seg.index} 선택`}
                       />
-                    </>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </main>
+                      <span className="text-xs text-gray-500 w-8">#{seg.index}</span>
+                      <span className="text-xs text-gray-400 font-mono">
+                        {formatTime(seg.start_ms)}→{formatTime(seg.end_ms)}
+                      </span>
+                      <button
+                        onClick={() => playSegment(seg)}
+                        className="text-blue-400 hover:text-blue-300 text-xs"
+                        title="이 구간 재생"
+                      >
+                        ▶
+                      </button>
+                      {showJunctionOnly && junctionMetadata.indexes.has(seg.index) && (
+                        <span className="text-xs px-1.5 py-0.5 rounded bg-cyan-900/50 text-cyan-300">
+                          {junctionLabel(seg.index)}
+                        </span>
+                      )}
+                      <div className="ml-auto flex items-center gap-2">
+                        <span
+                          className={`text-xs px-2 py-0.5 rounded ${
+                            aiAction === "cut"
+                              ? "bg-red-900/50 text-red-300"
+                              : "bg-green-900/50 text-green-300"
+                          }`}
+                        >
+                          AI: {aiAction.toUpperCase()}
+                        </span>
+                        {seg.ai?.reason && (
+                          <span className="text-xs text-gray-500">
+                            {seg.ai.reason}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Row 2: text */}
+                    <p className="text-sm text-gray-300 mb-2 pl-14">{seg.text}</p>
+
+                    {/* Row 3: human evaluation controls */}
+                    <div className="flex items-center gap-2 pl-14 flex-wrap">
+                      <span className="text-xs text-gray-500 mr-1">내 평가:</span>
+                      <button
+                        onClick={() => setHumanAction(seg.index, "keep")}
+                        className={`text-xs px-2 py-1 rounded transition ${
+                          seg.human?.action === "keep"
+                            ? "bg-green-600 text-white"
+                            : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+                        }`}
+                      >
+                        Keep
+                      </button>
+                      <button
+                        onClick={() => setHumanAction(seg.index, "cut")}
+                        className={`text-xs px-2 py-1 rounded transition ${
+                          seg.human?.action === "cut"
+                            ? "bg-red-600 text-white"
+                            : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+                        }`}
+                      >
+                        Cut
+                      </button>
+
+                      {seg.human && (
+                        <>
+                          <select
+                            value={seg.human.reason}
+                            onChange={(e) =>
+                              setHumanReason(seg.index, e.target.value)
+                            }
+                            className="text-xs bg-gray-800 text-gray-300 rounded px-2 py-1 border border-gray-700"
+                          >
+                            <option value="">이유 선택</option>
+                            {(seg.human.action === "cut"
+                              ? CUT_REASONS
+                              : KEEP_REASONS
+                            ).map((r) => (
+                              <option key={r.value} value={r.value}>
+                                {r.label}
+                              </option>
+                            ))}
+                          </select>
+                          <input
+                            type="text"
+                            value={seg.human.note}
+                            onChange={(e) =>
+                              setHumanNote(seg.index, e.target.value)
+                            }
+                            placeholder="메모"
+                            className="text-xs bg-gray-800 text-gray-300 rounded px-2 py-1 border border-gray-700 flex-1 min-w-[100px]"
+                          />
+                        </>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </main>
       )}
     </div>
   );

@@ -56,6 +56,21 @@ function formatTime(ms: number): string {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
 }
 
+function rawSegmentStartMs(seg: EvalSegment): number {
+  return seg.raw_start_ms ?? seg.start_ms;
+}
+
+function rawSegmentEndMs(seg: EvalSegment): number {
+  return seg.raw_end_ms ?? seg.end_ms;
+}
+
+function formatGap(ms: number | null): string {
+  if (ms === null) return "-";
+  if (ms > 0) return `+${formatTime(ms)}`;
+  if (ms < 0) return `-${formatTime(Math.abs(ms))}`;
+  return "0ms";
+}
+
 function msToMediaTime(ms: number): number {
   return Number((Math.max(0, Math.round(ms)) / 1000).toFixed(3));
 }
@@ -325,6 +340,14 @@ export default function ReviewPage() {
     () => visibleSegments.filter((seg) => selectedSegmentIndexes.has(seg.index)).length,
     [selectedSegmentIndexes, visibleSegments]
   );
+
+  const nextSegmentByIndex = useMemo(() => {
+    const map = new Map<number, EvalSegment | null>();
+    for (let i = 0; i < segments.length; i++) {
+      map.set(segments[i].index, segments[i + 1] ?? null);
+    }
+    return map;
+  }, [segments]);
 
   const stopSegmentPlayback = useCallback(() => {
     const video = videoRef.current;
@@ -673,6 +696,18 @@ export default function ReviewPage() {
   const renderSegmentRow = (seg: EvalSegment) => {
     const isCurrent = seg.index === currentIndex;
     const aiAction = aiActionForSegment(seg);
+    const rawStartMs = rawSegmentStartMs(seg);
+    const rawEndMs = rawSegmentEndMs(seg);
+    const nextSegment = nextSegmentByIndex.get(seg.index) ?? null;
+    const gapMs = nextSegment ? rawSegmentStartMs(nextSegment) - rawEndMs : null;
+    const gapClass =
+      gapMs === null
+        ? "text-gray-600"
+        : gapMs < 0
+          ? "text-amber-400"
+          : gapMs > 0
+            ? "text-cyan-300"
+            : "text-gray-500";
     const disagree =
       seg.human !== null &&
       seg.ai !== null &&
@@ -684,103 +719,131 @@ export default function ReviewPage() {
         ref={(el) => {
           if (el) segmentRefs.current.set(seg.index, el);
         }}
-        className={`rounded-lg p-3 transition-all ${
-          aiAction === "cut"
-            ? "border-l-4 border-red-500"
-            : "border-l-4 border-green-500"
-        } ${isCurrent ? "ring-2 ring-blue-500" : ""} ${
-          disagree ? "bg-amber-900/20" : "bg-gray-900"
-        }`}
+        className="grid grid-cols-1 gap-2 sm:grid-cols-[7.5rem_minmax(0,1fr)] sm:gap-3"
       >
-        <div className="flex items-center gap-3 mb-1">
-          <input
-            type="checkbox"
-            checked={selectedSegmentIndexes.has(seg.index)}
-            onChange={() => toggleSegmentSelection(seg.index)}
-            className="h-4 w-4 shrink-0 rounded border-gray-600 bg-gray-950 accent-cyan-500"
-            aria-label={`세그먼트 ${seg.index} 선택`}
-          />
-          <span className="text-xs text-gray-500 w-8">#{seg.index}</span>
-          <span className="text-xs text-gray-400 font-mono">
-            {formatTime(seg.start_ms)}→{formatTime(seg.end_ms)}
-          </span>
-          <button
-            onClick={() => playSegment(seg)}
-            className="text-blue-400 hover:text-blue-300 text-xs"
-            title="이 구간 재생"
-          >
-            ▶
-          </button>
-          <div className="ml-auto flex items-center gap-2">
-            <span
-              className={`text-xs px-2 py-0.5 rounded ${
-                aiAction === "cut"
-                  ? "bg-red-900/50 text-red-300"
-                  : "bg-green-900/50 text-green-300"
+        <aside
+          className="rounded-md border border-gray-800 bg-gray-950/70 px-3 py-2 font-mono text-[11px] leading-5 text-gray-500 sm:sticky sm:top-28 sm:self-start"
+          title={
+            nextSegment
+              ? `raw segment time, gap to segment #${nextSegment.index}`
+              : "raw segment time"
+          }
+        >
+          <div className="grid grid-cols-3 gap-2 sm:block">
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-sans text-gray-600">S</span>
+              <span>{formatTime(rawStartMs)}</span>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-sans text-gray-600">E</span>
+              <span>{formatTime(rawEndMs)}</span>
+            </div>
+            <div className={`flex items-center justify-between gap-2 ${gapClass}`}>
+              <span className="font-sans text-gray-600">G</span>
+              <span>{formatGap(gapMs)}</span>
+            </div>
+          </div>
+        </aside>
+
+        <div
+          className={`rounded-lg p-3 transition-all ${
+            aiAction === "cut"
+              ? "border-l-4 border-red-500"
+              : "border-l-4 border-green-500"
+          } ${isCurrent ? "ring-2 ring-blue-500" : ""} ${
+            disagree ? "bg-amber-900/20" : "bg-gray-900"
+          }`}
+        >
+          <div className="flex items-center gap-3 mb-1">
+            <input
+              type="checkbox"
+              checked={selectedSegmentIndexes.has(seg.index)}
+              onChange={() => toggleSegmentSelection(seg.index)}
+              className="h-4 w-4 shrink-0 rounded border-gray-600 bg-gray-950 accent-cyan-500"
+              aria-label={`세그먼트 ${seg.index} 선택`}
+            />
+            <span className="text-xs text-gray-500 w-8">#{seg.index}</span>
+            <span className="text-xs text-gray-400 font-mono">
+              {formatTime(seg.start_ms)}→{formatTime(seg.end_ms)}
+            </span>
+            <button
+              onClick={() => playSegment(seg)}
+              className="text-blue-400 hover:text-blue-300 text-xs"
+              title="이 구간 재생"
+            >
+              ▶
+            </button>
+            <div className="ml-auto flex items-center gap-2">
+              <span
+                className={`text-xs px-2 py-0.5 rounded ${
+                  aiAction === "cut"
+                    ? "bg-red-900/50 text-red-300"
+                    : "bg-green-900/50 text-green-300"
+                }`}
+              >
+                AI: {aiAction.toUpperCase()}
+              </span>
+              {seg.ai?.reason && (
+                <span className="text-xs text-gray-500">
+                  {seg.ai.reason}
+                </span>
+              )}
+            </div>
+          </div>
+
+          <p className="text-sm text-gray-300 mb-2 pl-14">{seg.text}</p>
+
+          <div className="flex items-center gap-2 pl-14 flex-wrap">
+            <span className="text-xs text-gray-500 mr-1">내 평가:</span>
+            <button
+              onClick={() => setHumanAction(seg.index, "keep")}
+              className={`text-xs px-2 py-1 rounded transition ${
+                seg.human?.action === "keep"
+                  ? "bg-green-600 text-white"
+                  : "bg-gray-800 text-gray-400 hover:bg-gray-700"
               }`}
             >
-              AI: {aiAction.toUpperCase()}
-            </span>
-            {seg.ai?.reason && (
-              <span className="text-xs text-gray-500">
-                {seg.ai.reason}
-              </span>
+              Keep
+            </button>
+            <button
+              onClick={() => setHumanAction(seg.index, "cut")}
+              className={`text-xs px-2 py-1 rounded transition ${
+                seg.human?.action === "cut"
+                  ? "bg-red-600 text-white"
+                  : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+              }`}
+            >
+              Cut
+            </button>
+
+            {seg.human && (
+              <>
+                <select
+                  value={seg.human.reason}
+                  onChange={(e) =>
+                    setHumanReason(seg.index, e.target.value)
+                  }
+                  className="text-xs bg-gray-800 text-gray-300 rounded px-2 py-1 border border-gray-700"
+                >
+                  <option value="">이유 선택</option>
+                  {(seg.human.action === "cut" ? CUT_REASONS : KEEP_REASONS).map((r) => (
+                    <option key={r.value} value={r.value}>
+                      {r.label}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  type="text"
+                  value={seg.human.note}
+                  onChange={(e) =>
+                    setHumanNote(seg.index, e.target.value)
+                  }
+                  placeholder="메모"
+                  className="text-xs bg-gray-800 text-gray-300 rounded px-2 py-1 border border-gray-700 flex-1 min-w-[100px]"
+                />
+              </>
             )}
           </div>
-        </div>
-
-        <p className="text-sm text-gray-300 mb-2 pl-14">{seg.text}</p>
-
-        <div className="flex items-center gap-2 pl-14 flex-wrap">
-          <span className="text-xs text-gray-500 mr-1">내 평가:</span>
-          <button
-            onClick={() => setHumanAction(seg.index, "keep")}
-            className={`text-xs px-2 py-1 rounded transition ${
-              seg.human?.action === "keep"
-                ? "bg-green-600 text-white"
-                : "bg-gray-800 text-gray-400 hover:bg-gray-700"
-            }`}
-          >
-            Keep
-          </button>
-          <button
-            onClick={() => setHumanAction(seg.index, "cut")}
-            className={`text-xs px-2 py-1 rounded transition ${
-              seg.human?.action === "cut"
-                ? "bg-red-600 text-white"
-                : "bg-gray-800 text-gray-400 hover:bg-gray-700"
-            }`}
-          >
-            Cut
-          </button>
-
-          {seg.human && (
-            <>
-              <select
-                value={seg.human.reason}
-                onChange={(e) =>
-                  setHumanReason(seg.index, e.target.value)
-                }
-                className="text-xs bg-gray-800 text-gray-300 rounded px-2 py-1 border border-gray-700"
-              >
-                <option value="">이유 선택</option>
-                {(seg.human.action === "cut" ? CUT_REASONS : KEEP_REASONS).map((r) => (
-                  <option key={r.value} value={r.value}>
-                    {r.label}
-                  </option>
-                ))}
-              </select>
-              <input
-                type="text"
-                value={seg.human.note}
-                onChange={(e) =>
-                  setHumanNote(seg.index, e.target.value)
-                }
-                placeholder="메모"
-                className="text-xs bg-gray-800 text-gray-300 rounded px-2 py-1 border border-gray-700 flex-1 min-w-[100px]"
-              />
-            </>
-          )}
         </div>
       </div>
     );

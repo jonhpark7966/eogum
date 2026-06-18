@@ -164,6 +164,7 @@ export default function ReviewPage() {
   const [finalPreviewTimelineMap, setFinalPreviewTimelineMap] =
     useState<FinalPreviewTimelineMap | null>(null);
   const [showJunctionOnly, setShowJunctionOnly] = useState(false);
+  const [gapFilterInputMs, setGapFilterInputMs] = useState("");
   const [selectedSegmentIndexes, setSelectedSegmentIndexes] = useState<Set<number>>(
     () => new Set<number>()
   );
@@ -323,13 +324,57 @@ export default function ReviewPage() {
     return { indexes, pairs };
   }, [segments]);
 
-  const visibleSegments = useMemo(
-    () =>
-      showJunctionOnly
-        ? segments.filter((seg) => junctionMetadata.indexes.has(seg.index))
-        : segments,
-    [junctionMetadata, segments, showJunctionOnly]
+  const nextSegmentByIndex = useMemo(() => {
+    const map = new Map<number, EvalSegment | null>();
+    for (let i = 0; i < segments.length; i++) {
+      map.set(segments[i].index, segments[i + 1] ?? null);
+    }
+    return map;
+  }, [segments]);
+
+  const rawGapByIndex = useMemo(() => {
+    const map = new Map<number, number | null>();
+    for (const seg of segments) {
+      const next = nextSegmentByIndex.get(seg.index) ?? null;
+      map.set(seg.index, next ? rawSegmentStartMs(next) - rawSegmentEndMs(seg) : null);
+    }
+    return map;
+  }, [nextSegmentByIndex, segments]);
+
+  const gapFilterMs = useMemo(() => {
+    const trimmed = gapFilterInputMs.trim();
+    if (!trimmed) return null;
+    const value = Number(trimmed);
+    if (!Number.isFinite(value) || value < 0) return null;
+    return Math.round(value);
+  }, [gapFilterInputMs]);
+
+  const visibleSegments = useMemo(() => {
+    const baseSegments = showJunctionOnly
+      ? segments.filter((seg) => junctionMetadata.indexes.has(seg.index))
+      : segments;
+
+    if (gapFilterMs === null) return baseSegments;
+    return baseSegments.filter((seg) => {
+      const gap = rawGapByIndex.get(seg.index);
+      return gap !== null && gap !== undefined && gap <= gapFilterMs;
+    });
+  }, [gapFilterMs, junctionMetadata, rawGapByIndex, segments, showJunctionOnly]);
+
+  const visibleSegmentIndexes = useMemo(
+    () => new Set(visibleSegments.map((seg) => seg.index)),
+    [visibleSegments]
   );
+
+  const visibleJunctionPairs = useMemo(() => {
+    if (gapFilterMs === null) return junctionMetadata.pairs;
+    return junctionMetadata.pairs.filter(
+      (pair) =>
+        visibleSegmentIndexes.has(pair.before.index) ||
+        visibleSegmentIndexes.has(pair.after.index) ||
+        pair.cutSegments.some((seg) => visibleSegmentIndexes.has(seg.index))
+    );
+  }, [gapFilterMs, junctionMetadata.pairs, visibleSegmentIndexes]);
 
   const selectedSegments = useMemo(
     () => segments.filter((seg) => selectedSegmentIndexes.has(seg.index)),
@@ -340,14 +385,6 @@ export default function ReviewPage() {
     () => visibleSegments.filter((seg) => selectedSegmentIndexes.has(seg.index)).length,
     [selectedSegmentIndexes, visibleSegments]
   );
-
-  const nextSegmentByIndex = useMemo(() => {
-    const map = new Map<number, EvalSegment | null>();
-    for (let i = 0; i < segments.length; i++) {
-      map.set(segments[i].index, segments[i + 1] ?? null);
-    }
-    return map;
-  }, [segments]);
 
   const stopSegmentPlayback = useCallback(() => {
     const video = videoRef.current;
@@ -699,7 +736,7 @@ export default function ReviewPage() {
     const rawStartMs = rawSegmentStartMs(seg);
     const rawEndMs = rawSegmentEndMs(seg);
     const nextSegment = nextSegmentByIndex.get(seg.index) ?? null;
-    const gapMs = nextSegment ? rawSegmentStartMs(nextSegment) - rawEndMs : null;
+    const gapMs = rawGapByIndex.get(seg.index) ?? null;
     const gapClass =
       gapMs === null
         ? "text-gray-600"
@@ -998,13 +1035,44 @@ export default function ReviewPage() {
               연결부 <strong className="text-cyan-300">{junctionMetadata.pairs.length}</strong>
             </span>
           )}
+          {gapFilterMs !== null && (
+            <span>
+              G검색 <strong className="text-cyan-300">{visibleSegments.length}</strong>
+            </span>
+          )}
           <span>
             선택 <strong className="text-cyan-300">{selectedSegmentIndexes.size}</strong>
-            {showJunctionOnly && selectedSegmentIndexes.size > 0 && (
+            {(showJunctionOnly || gapFilterMs !== null) && selectedSegmentIndexes.size > 0 && (
               <span className="text-gray-500"> ({selectedVisibleCount}/{visibleSegments.length})</span>
             )}
           </span>
           <div className="ml-auto flex flex-wrap items-center gap-2">
+            <label
+              className="flex h-7 items-center gap-1 rounded border border-gray-800 bg-gray-950/70 px-2 text-xs"
+              title="원본 segment gap이 입력값 이하인 segment만 표시"
+            >
+              <span className="font-mono text-gray-500">G &le;</span>
+              <input
+                type="number"
+                min="0"
+                step="10"
+                value={gapFilterInputMs}
+                onChange={(event) => setGapFilterInputMs(event.target.value)}
+                placeholder="ms"
+                aria-label="원본 Gap 최대값(ms)"
+                className="h-6 w-16 bg-transparent text-right font-mono text-cyan-200 outline-none placeholder:text-gray-600"
+              />
+              <span className="text-gray-600">ms</span>
+            </label>
+            {gapFilterInputMs && (
+              <button
+                type="button"
+                onClick={() => setGapFilterInputMs("")}
+                className="px-2.5 py-1 rounded bg-gray-800 text-gray-300 text-xs font-medium transition hover:bg-gray-700"
+              >
+                G 해제
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setShowJunctionOnly((value) => !value)}
@@ -1224,9 +1292,13 @@ export default function ReviewPage() {
               <div className="rounded-lg border border-gray-800 bg-gray-900 px-4 py-8 text-center text-sm text-gray-500">
                 검토할 연결부가 없습니다
               </div>
+            ) : visibleJunctionPairs.length === 0 ? (
+              <div className="rounded-lg border border-gray-800 bg-gray-900 px-4 py-8 text-center text-sm text-gray-500">
+                G 조건에 맞는 연결부가 없습니다
+              </div>
             ) : (
               <div className="space-y-4">
-                {junctionMetadata.pairs.map((pair) => {
+                {visibleJunctionPairs.map((pair) => {
                   const firstCut = pair.cutSegments[0];
                   const lastCut = pair.cutSegments[pair.cutSegments.length - 1];
                   const cutLabel = firstCut && lastCut
@@ -1268,7 +1340,7 @@ export default function ReviewPage() {
             )
           ) : visibleSegments.length === 0 ? (
             <div className="rounded-lg border border-gray-800 bg-gray-900 px-4 py-8 text-center text-sm text-gray-500">
-              표시할 segment가 없습니다
+              {gapFilterMs === null ? "표시할 segment가 없습니다" : "G 조건에 맞는 segment가 없습니다"}
             </div>
           ) : (
             <div className="space-y-2">

@@ -132,8 +132,6 @@ export default function ReviewPage() {
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const segmentRefs = useRef<Map<number, HTMLDivElement>>(new Map());
-  const playEndRef = useRef<number | null>(null);
-  const playFrameRef = useRef<number | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -275,7 +273,6 @@ export default function ReviewPage() {
   }, [finalPreviewJobId, finalPreviewStatus, previewJobKind, projectId, supabase]);
 
   const junctionMetadata = useMemo(() => {
-    const indexes = new Set<number>();
     const pairs: Array<{
       id: string;
       before: EvalSegment;
@@ -306,8 +303,6 @@ export default function ReviewPage() {
         decisionActionForSegment(before) === "keep" &&
         decisionActionForSegment(after) === "keep"
       ) {
-        indexes.add(before.index);
-        indexes.add(after.index);
         pairs.push({
           id: `${before.index}-${after.index}-${cutStart}`,
           before,
@@ -321,7 +316,7 @@ export default function ReviewPage() {
       }
     }
 
-    return { indexes, pairs };
+    return { pairs };
   }, [segments]);
 
   const nextSegmentByIndex = useMemo(() => {
@@ -349,32 +344,37 @@ export default function ReviewPage() {
     return Math.round(value);
   }, [gapFilterInputMs]);
 
-  const visibleSegments = useMemo(() => {
-    const baseSegments = showJunctionOnly
-      ? segments.filter((seg) => junctionMetadata.indexes.has(seg.index))
-      : segments;
+  const visibleJunctionPairs = useMemo(() => {
+    if (gapFilterMs === null) return junctionMetadata.pairs;
+    return junctionMetadata.pairs.filter((pair) => {
+      const startGap = rawGapByIndex.get(pair.before.index);
+      const endGap = rawGapByIndex.get(pair.after.index);
+      return [startGap, endGap].some(
+        (gap) => gap !== null && gap !== undefined && gap <= gapFilterMs
+      );
+    });
+  }, [gapFilterMs, junctionMetadata.pairs, rawGapByIndex]);
 
-    if (gapFilterMs === null) return baseSegments;
-    return baseSegments.filter((seg) => {
+  const visibleJunctionSegmentIndexes = useMemo(() => {
+    const indexes = new Set<number>();
+    for (const pair of visibleJunctionPairs) {
+      indexes.add(pair.before.index);
+      indexes.add(pair.after.index);
+    }
+    return indexes;
+  }, [visibleJunctionPairs]);
+
+  const visibleSegments = useMemo(() => {
+    if (showJunctionOnly) {
+      return segments.filter((seg) => visibleJunctionSegmentIndexes.has(seg.index));
+    }
+
+    if (gapFilterMs === null) return segments;
+    return segments.filter((seg) => {
       const gap = rawGapByIndex.get(seg.index);
       return gap !== null && gap !== undefined && gap <= gapFilterMs;
     });
-  }, [gapFilterMs, junctionMetadata, rawGapByIndex, segments, showJunctionOnly]);
-
-  const visibleSegmentIndexes = useMemo(
-    () => new Set(visibleSegments.map((seg) => seg.index)),
-    [visibleSegments]
-  );
-
-  const visibleJunctionPairs = useMemo(() => {
-    if (gapFilterMs === null) return junctionMetadata.pairs;
-    return junctionMetadata.pairs.filter(
-      (pair) =>
-        visibleSegmentIndexes.has(pair.before.index) ||
-        visibleSegmentIndexes.has(pair.after.index) ||
-        pair.cutSegments.some((seg) => visibleSegmentIndexes.has(seg.index))
-    );
-  }, [gapFilterMs, junctionMetadata.pairs, visibleSegmentIndexes]);
+  }, [gapFilterMs, rawGapByIndex, segments, showJunctionOnly, visibleJunctionSegmentIndexes]);
 
   const selectedSegments = useMemo(
     () => segments.filter((seg) => selectedSegmentIndexes.has(seg.index)),
@@ -389,44 +389,6 @@ export default function ReviewPage() {
   const stopSegmentPlayback = useCallback(() => {
     const video = videoRef.current;
     if (video) video.pause();
-    playEndRef.current = null;
-    if (playFrameRef.current !== null) {
-      window.cancelAnimationFrame(playFrameRef.current);
-      playFrameRef.current = null;
-    }
-  }, []);
-
-  const scheduleSegmentPlaybackMonitor = useCallback(() => {
-    if (playFrameRef.current !== null) {
-      window.cancelAnimationFrame(playFrameRef.current);
-      playFrameRef.current = null;
-    }
-
-    const tick = () => {
-      const video = videoRef.current;
-      const endMs = playEndRef.current;
-      if (!video || endMs === null || video.paused || video.ended) {
-        playFrameRef.current = null;
-        return;
-      }
-
-      if (mediaTimeToMs(video) >= endMs) {
-        stopSegmentPlayback();
-        return;
-      }
-
-      playFrameRef.current = window.requestAnimationFrame(tick);
-    };
-
-    playFrameRef.current = window.requestAnimationFrame(tick);
-  }, [stopSegmentPlayback]);
-
-  useEffect(() => {
-    return () => {
-      if (playFrameRef.current !== null) {
-        window.cancelAnimationFrame(playFrameRef.current);
-      }
-    };
   }, []);
 
   // Video timeupdate → highlight current segment
@@ -439,11 +401,6 @@ export default function ReviewPage() {
       const currentSourceMs = usingFinalPreview
         ? previewMsToSourceMs(currentMs, finalPreviewTimelineMap)
         : currentMs;
-
-      // Stop at segment end if playing a specific segment
-      if (playEndRef.current !== null && currentMs >= playEndRef.current) {
-        stopSegmentPlayback();
-      }
 
       // Find current segment
       let found = -1;
@@ -467,7 +424,7 @@ export default function ReviewPage() {
 
     video.addEventListener("timeupdate", onTimeUpdate);
     return () => video.removeEventListener("timeupdate", onTimeUpdate);
-  }, [segments, currentIndex, stopSegmentPlayback, usingFinalPreview, finalPreviewTimelineMap]);
+  }, [segments, currentIndex, usingFinalPreview, finalPreviewTimelineMap]);
 
   // Play segment
   const playSegment = (seg: EvalSegment) => {
@@ -475,19 +432,13 @@ export default function ReviewPage() {
     if (!video) return;
     stopSegmentPlayback();
     const sourceStartMs = Math.round(seg.start_ms);
-    const sourceEndMs = Math.round(seg.end_ms);
     const startMs = usingFinalPreview
       ? sourceMsToPreviewMs(sourceStartMs, finalPreviewTimelineMap)
       : sourceStartMs;
-    const endMs = usingFinalPreview
-      ? sourceMsToPreviewMs(sourceEndMs, finalPreviewTimelineMap)
-      : sourceEndMs;
-    if (startMs === null || endMs === null) return;
+    if (startMs === null) return;
     video.currentTime = msToMediaTime(startMs);
-    playEndRef.current = Math.max(startMs + 1, endMs);
     setCurrentIndex(seg.index);
     const playPromise = video.play();
-    scheduleSegmentPlaybackMonitor();
     if (playPromise) {
       playPromise.catch(() => {
         stopSegmentPlayback();
@@ -1049,7 +1000,7 @@ export default function ReviewPage() {
           <div className="ml-auto flex flex-wrap items-center gap-2">
             <label
               className="flex h-7 items-center gap-1 rounded border border-gray-800 bg-gray-950/70 px-2 text-xs"
-              title="원본 segment gap이 입력값 이하인 segment만 표시"
+              title="전체 보기에서는 segment gap, 연결부 보기에서는 Start/End Segment gap이 입력값 이하인 항목만 표시"
             >
               <span className="font-mono text-gray-500">G &le;</span>
               <input
@@ -1059,7 +1010,7 @@ export default function ReviewPage() {
                 value={gapFilterInputMs}
                 onChange={(event) => setGapFilterInputMs(event.target.value)}
                 placeholder="ms"
-                aria-label="원본 Gap 최대값(ms)"
+                aria-label="Gap 최대값(ms)"
                 className="h-6 w-16 bg-transparent text-right font-mono text-cyan-200 outline-none placeholder:text-gray-600"
               />
               <span className="text-gray-600">ms</span>

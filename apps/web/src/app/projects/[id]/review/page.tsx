@@ -71,6 +71,13 @@ function formatGap(ms: number | null): string {
   return "0ms";
 }
 
+function gapClassForMs(ms: number | null): string {
+  if (ms === null) return "text-gray-600";
+  if (ms < 0) return "text-amber-400";
+  if (ms > 0) return "text-cyan-300";
+  return "text-gray-500";
+}
+
 function msToMediaTime(ms: number): number {
   return Number((Math.max(0, Math.round(ms)) / 1000).toFixed(3));
 }
@@ -121,6 +128,10 @@ type ReviewMetadata = Pick<
   EvaluationSavePayload,
   "schema_version" | "review_scope" | "join_strategy"
 >;
+
+type SegmentRowOptions = {
+  showPreviousGap?: boolean;
+};
 
 // ── Component ──
 
@@ -323,6 +334,14 @@ export default function ReviewPage() {
     const map = new Map<number, EvalSegment | null>();
     for (let i = 0; i < segments.length; i++) {
       map.set(segments[i].index, segments[i + 1] ?? null);
+    }
+    return map;
+  }, [segments]);
+
+  const previousSegmentByIndex = useMemo(() => {
+    const map = new Map<number, EvalSegment | null>();
+    for (let i = 0; i < segments.length; i++) {
+      map.set(segments[i].index, segments[i - 1] ?? null);
     }
     return map;
   }, [segments]);
@@ -681,21 +700,23 @@ export default function ReviewPage() {
   const isPreviewRendering = finalPreviewStatus === "pending" || finalPreviewStatus === "running";
 
 
-  const renderSegmentRow = (seg: EvalSegment) => {
+  const renderSegmentRow = (seg: EvalSegment, options: SegmentRowOptions = {}) => {
     const isCurrent = seg.index === currentIndex;
     const aiAction = aiActionForSegment(seg);
     const rawStartMs = rawSegmentStartMs(seg);
     const rawEndMs = rawSegmentEndMs(seg);
+    const showPreviousGap = options.showPreviousGap ?? false;
+    const previousSegment = previousSegmentByIndex.get(seg.index) ?? null;
     const nextSegment = nextSegmentByIndex.get(seg.index) ?? null;
+    const previousGapMs = previousSegment ? rawGapByIndex.get(previousSegment.index) ?? null : null;
     const gapMs = rawGapByIndex.get(seg.index) ?? null;
-    const gapClass =
-      gapMs === null
-        ? "text-gray-600"
-        : gapMs < 0
-          ? "text-amber-400"
-          : gapMs > 0
-            ? "text-cyan-300"
-            : "text-gray-500";
+    const previousGapClass = gapClassForMs(previousGapMs);
+    const gapClass = gapClassForMs(gapMs);
+    const timingTitle = [
+      "raw segment time",
+      showPreviousGap && previousSegment ? `previous gap from segment #${previousSegment.index}` : null,
+      nextSegment ? `gap to segment #${nextSegment.index}` : null,
+    ].filter(Boolean).join(", ");
     const disagree =
       seg.human !== null &&
       seg.ai !== null &&
@@ -711,13 +732,15 @@ export default function ReviewPage() {
       >
         <aside
           className="rounded-md border border-gray-800 bg-gray-950/70 px-3 py-2 font-mono text-[11px] leading-5 text-gray-500 sm:sticky sm:top-28 sm:self-start"
-          title={
-            nextSegment
-              ? `raw segment time, gap to segment #${nextSegment.index}`
-              : "raw segment time"
-          }
+          title={timingTitle}
         >
-          <div className="grid grid-cols-3 gap-2 sm:block">
+          <div className={showPreviousGap ? "grid grid-cols-2 gap-x-4 gap-y-1 sm:block" : "grid grid-cols-3 gap-2 sm:block"}>
+            {showPreviousGap && (
+              <div className={`flex items-center justify-between gap-2 ${previousGapClass}`}>
+                <span className="font-sans text-gray-600">PG</span>
+                <span>{formatGap(previousGapMs)}</span>
+              </div>
+            )}
             <div className="flex items-center justify-between gap-2">
               <span className="font-sans text-gray-600">S</span>
               <span>{formatTime(rawStartMs)}</span>
@@ -1281,8 +1304,8 @@ export default function ReviewPage() {
                         </p>
                       </div>
                       <div className="space-y-2">
-                        {renderSegmentRow(pair.before)}
-                        {renderSegmentRow(pair.after)}
+                        {renderSegmentRow(pair.before, { showPreviousGap: true })}
+                        {renderSegmentRow(pair.after, { showPreviousGap: true })}
                       </div>
                     </section>
                   );

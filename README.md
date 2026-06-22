@@ -13,7 +13,7 @@
 - [docs/backend-testing-strategy.md](/home/jonhpark/workspace/eogum/docs/backend-testing-strategy.md): 백엔드 테스트 전략
 - [docs/backend-refactoring-roadmap.md](/home/jonhpark/workspace/eogum/docs/backend-refactoring-roadmap.md): 백엔드 리팩터링 순서
 - [docs/avid-integration-spec.md](/home/jonhpark/workspace/eogum/docs/avid-integration-spec.md): `avid` 연동 상위 명세
-- [docs/avid-submodule-layout.md](/home/jonhpark/workspace/eogum/docs/avid-submodule-layout.md): `avid` submodule 목표 구조와 참조 규칙
+- [docs/avid-runtime-layout.md](/home/jonhpark/workspace/eogum/docs/avid-runtime-layout.md): `avid` sibling checkout 구조와 참조 규칙
 - [docs/avid-cli-spec.md](/home/jonhpark/workspace/eogum/docs/avid-cli-spec.md): `avid-cli` 명령 명세
 - [docs/infra-setup.md](/home/jonhpark/workspace/eogum/docs/infra-setup.md): 현재 코드 기준 인프라 셋업
 
@@ -25,27 +25,27 @@ eogum/
   apps/web
   docs
   supabase
-  third_party/auto-video-edit   # 목표 구조 기준 git submodule
 ```
 
-문서와 리팩터링 설계는 `third_party/auto-video-edit` 경로를 기준으로 한다.
-현재 실제 submodule pointer 가 아직 추가되기 전이라면, 관련 문서는 목표 구조 문서로 읽으면 된다.
-현재 backend 코드는 submodule 경로를 우선 사용하되, 실제 submodule 이 아직 없으면 legacy sibling repo 경로로만 한시적으로 fallback 할 수 있다.
+`avid` 런타임은 Eogum 저장소 밖의 sibling checkout 을 기준으로 한다.
 
-## Git 과 Submodule 운영 규칙
+```text
+workspace/
+  eogum/
+  auto-video-edit/
+    apps/backend/.venv/bin/avid-cli
+```
 
-- 이 저장소는 `third_party/auto-video-edit` submodule 사용을 전제로 문서화한다.
-- clone 시에는 `git clone --recurse-submodules <repo-url>` 를 사용한다.
-- 기존 clone 에서는 `git submodule update --init --recursive` 를 먼저 실행한다.
-- pull 이후에도 `git submodule update --init --recursive` 로 기록된 submodule commit 을 맞춘다.
-- submodule 변경은 항상 의도적으로 review 해야 하므로 `git diff --submodule` 로 확인한다.
-- `avid` 코드를 수정했다면 먼저 submodule 저장소에서 commit/push 하고, 그 다음 부모 저장소에서 submodule pointer 업데이트를 별도 commit 으로 남긴다.
-- 부모 저장소와 submodule 변경을 무심코 한 commit 에 섞지 않는다.
-- submodule 안에서 장기 작업을 할 때 detached HEAD 상태로 오래 작업하지 않는다. 필요한 branch 를 checkout 한 뒤 수정한다.
+## Git 운영 규칙
+
+- `eogum` 과 `auto-video-edit` 는 별도 repository 로 관리한다.
+- `eogum` 은 `auto-video-edit` 의 Python 모듈을 직접 import 하지 않고 `avid-cli` 만 subprocess 로 실행한다.
+- `avid` 코드를 수정했다면 `/home/jonhpark/workspace/auto-video-edit` 에서 별도 commit 으로 관리한다.
+- `eogum` 쪽 변경과 `avid` 쪽 변경은 commit 을 분리해 추적한다.
 
 ## `avid` 사용 원칙
 
 - `eogum` 백엔드는 `avid` Python 모듈을 직접 import 하지 않는다.
 - `eogum` 백엔드는 `avid-cli` 를 명시적으로 subprocess 로 실행한다.
-- 어떤 바이너리를 어떤 경로에서 어떻게 호출할지는 [docs/avid-submodule-layout.md](/home/jonhpark/workspace/eogum/docs/avid-submodule-layout.md)에 적힌 규칙을 따른다.
+- 어떤 바이너리를 어떤 경로에서 어떻게 호출할지는 [docs/avid-runtime-layout.md](/home/jonhpark/workspace/eogum/docs/avid-runtime-layout.md)에 적힌 규칙을 따른다.
 - 어떤 명령을 어떤 인자와 출력 형식으로 기대하는지는 [docs/avid-cli-spec.md](/home/jonhpark/workspace/eogum/docs/avid-cli-spec.md)를 source of truth 로 삼는다.

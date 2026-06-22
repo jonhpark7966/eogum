@@ -1,6 +1,6 @@
 # eogum ↔ avid Follow-up Plan
 
-> 최종 갱신: 2026-03-15
+> 최종 갱신: 2026-06-11
 > 범위: `apps/api`, `apps/web`
 > 목적: 현재 `avid-cli` 표면과 `eogum` 소비 코드를 다시 맞추고, human review 재연결 전에 위험 구간을 정리한다.
 
@@ -16,8 +16,8 @@
 현재 `avid` 는 별도 HTTP 서버로 서빙되지 않는다.
 
 - `eogum` API 서버가 [avid.py](/home/jonhpark/workspace/eogum/apps/api/src/eogum/services/avid.py) 에서 로컬 `avid-cli` subprocess 를 호출한다.
-- 실행 대상은 submodule 안의 `avid-cli` 다.
-  - `third_party/auto-video-edit/apps/backend/.venv/bin/avid-cli`
+- 실행 대상은 sibling `auto-video-edit` checkout 의 `avid-cli` 다.
+  - `/home/jonhpark/workspace/auto-video-edit/apps/backend/.venv/bin/avid-cli`
 - `eogum` 이 직접 HTTP로 붙는 외부 서비스는 `Chalna` 뿐이다.
 - 결과물은 `avid-cli` 가 로컬 temp dir에 쓴 뒤, `eogum` 이 R2로 업로드하고 presigned URL로 다시 사용자에게 제공한다.
 

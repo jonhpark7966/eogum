@@ -15,7 +15,7 @@
 관련 문서:
 
 - [docs/avid-integration-spec.md](/home/jonhpark/workspace/eogum/docs/avid-integration-spec.md)
-- [docs/avid-submodule-layout.md](/home/jonhpark/workspace/eogum/docs/avid-submodule-layout.md)
+- [docs/avid-runtime-layout.md](/home/jonhpark/workspace/eogum/docs/avid-runtime-layout.md)
 - [docs/avid-cli-spec.md](/home/jonhpark/workspace/eogum/docs/avid-cli-spec.md)
 
 ## 2. 현재 병목 지점

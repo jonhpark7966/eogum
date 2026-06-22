@@ -18,24 +18,23 @@
 ## 2. 먼저 볼 문서
 
 - [docs/avid-integration-spec.md](/home/jonhpark/workspace/eogum/docs/avid-integration-spec.md)
-- [docs/avid-submodule-layout.md](/home/jonhpark/workspace/eogum/docs/avid-submodule-layout.md)
+- [docs/avid-runtime-layout.md](/home/jonhpark/workspace/eogum/docs/avid-runtime-layout.md)
 - [docs/avid-cli-spec.md](/home/jonhpark/workspace/eogum/docs/avid-cli-spec.md)
-- [third_party/auto-video-edit/apps/backend/TESTING.md](/home/jonhpark/workspace/eogum/third_party/auto-video-edit/apps/backend/TESTING.md)
-- [third_party/auto-video-edit/apps/backend/TEST_DATA_GUIDE.md](/home/jonhpark/workspace/eogum/third_party/auto-video-edit/apps/backend/TEST_DATA_GUIDE.md)
+- [/home/jonhpark/workspace/auto-video-edit/apps/backend/TESTING.md](/home/jonhpark/workspace/auto-video-edit/apps/backend/TESTING.md)
+- [/home/jonhpark/workspace/auto-video-edit/apps/backend/TEST_DATA_GUIDE.md](/home/jonhpark/workspace/auto-video-edit/apps/backend/TEST_DATA_GUIDE.md)
 
 ## 3. 검증 순서
 
-### 3.1 avid submodule 상태 확인
+### 3.1 avid runtime 상태 확인
 
 ```bash
-git submodule status
-third_party/auto-video-edit/apps/backend/.venv/bin/avid-cli version --json
-third_party/auto-video-edit/apps/backend/.venv/bin/avid-cli doctor --json
+/home/jonhpark/workspace/auto-video-edit/apps/backend/.venv/bin/avid-cli version --json
+/home/jonhpark/workspace/auto-video-edit/apps/backend/.venv/bin/avid-cli doctor --json
 ```
 
 확인할 것:
 
-- submodule 이 기대 커밋을 가리키는지
+- sibling `auto-video-edit` checkout 이 기대 branch/commit 을 가리키는지
 - `avid-cli` 자체가 실행되는지
 
 ### 3.2 API 서버 기동
@@ -144,7 +143,7 @@ eogum-api
 - R2
 - Resend
 - Chalna
-- `third_party/auto-video-edit/apps/backend/.venv/bin/avid-cli`
+- `/home/jonhpark/workspace/auto-video-edit/apps/backend/.venv/bin/avid-cli`
 - provider CLI (`claude`, `codex`)
 - source media 1개 또는 multicam source 2개
 

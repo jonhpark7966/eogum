@@ -1,6 +1,6 @@
 # 어검이 기대하는 avid CLI 명령 명세
 
-> 최종 갱신: 2026-03-14
+> 최종 갱신: 2026-06-11
 > 범위: `eogum` 백엔드가 호출하는 `avid-cli`
 > 상태: 현재 운영 명세. deprecated command 는 별도 표기한다.
 
@@ -20,11 +20,11 @@
 
 실행 파일:
 
-- `AVID_BIN=/path/to/eogum/third_party/auto-video-edit/apps/backend/.venv/bin/avid-cli`
+- `AVID_BIN=/home/jonhpark/workspace/auto-video-edit/apps/backend/.venv/bin/avid-cli`
 
 실행 디렉터리:
 
-- `cwd=/path/to/eogum/third_party/auto-video-edit/apps/backend`
+- `cwd=/home/jonhpark/workspace/auto-video-edit/apps/backend`
 
 ### 2.2 종료 규칙
 

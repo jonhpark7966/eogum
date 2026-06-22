@@ -5,9 +5,8 @@ from pydantic_settings import BaseSettings
 
 
 def _default_avid_backend_root() -> Path:
-    submodule_root = Path("/home/jonhpark/workspace/eogum/third_party/auto-video-edit/apps/backend")
-    legacy_root = Path("/home/jonhpark/workspace/auto-video-edit/apps/backend")
-    return submodule_root if submodule_root.exists() else legacy_root
+    eogum_root = Path(__file__).resolve().parents[4]
+    return eogum_root.parent / "auto-video-edit" / "apps" / "backend"
 
 
 def _default_yt_dlp_bin() -> Path:
@@ -29,6 +28,8 @@ class Settings(BaseSettings):
     supabase_url: str
     supabase_service_key: str
     supabase_jwt_secret: str = ""  # Not needed for ES256 (JWKS used instead)
+    admin_user_ids: str = ""
+    admin_emails: str = ""
 
     # Cloudflare R2
     r2_account_id: str = ""
@@ -40,12 +41,12 @@ class Settings(BaseSettings):
     # AVID
     avid_backend_root: Path | None = None
     avid_bin: Path | None = None
-    avid_cli_path: Path | None = None  # Legacy fallback while local envs migrate.
+    avid_cli_path: Path | None = None  # Deprecated. Use AVID_BACKEND_ROOT/AVID_BIN.
     avid_temp_dir: Path = Path("/tmp/eogum")
     avid_output_dir: Path = Path("/tmp/eogum/outputs")
     avid_provider: str = "codex"
-    avid_provider_model: str | None = "gpt-5.4"
-    avid_provider_effort: str | None = "medium"
+    avid_provider_model: str | None = "gpt-5.5"
+    avid_provider_effort: str | None = "xhigh"
 
     # Chalna
     chalna_url: str = "http://localhost:7861"
@@ -70,7 +71,7 @@ class Settings(BaseSettings):
 
     @property
     def resolved_avid_backend_root(self) -> Path:
-        return self.avid_backend_root or self.avid_cli_path or _default_avid_backend_root()
+        return self.avid_backend_root or _default_avid_backend_root()
 
     @property
     def resolved_avid_bin(self) -> Path:

@@ -1,6 +1,6 @@
 # 어검 avid 연동 명세
 
-> 최종 갱신: 2026-03-14
+> 최종 갱신: 2026-06-11
 > 범위: `eogum` 백엔드와 `avid` 엔진 사이의 인터페이스
 > 상태: 현재 운영 기준 문서
 
@@ -12,7 +12,7 @@
 
 - `eogum` 백엔드는 `avid-cli` 를 subprocess 로 실행한다.
 - `eogum` 백엔드는 `avid.*` Python 모듈을 직접 import 하지 않는다.
-- `avid` 소스는 `third_party/auto-video-edit` submodule 로 고정한다.
+- `avid` 런타임은 sibling checkout 인 `/home/jonhpark/workspace/auto-video-edit` 로 고정한다.
 - 초기 편집 workflow 와 후처리 workflow 모두 `avid-cli` 명령 조합으로만 실행한다.
 
 ## 2. 책임 경계
@@ -63,8 +63,8 @@
 
 현재 코드는 아래 현실을 갖고 있다.
 
-- submodule pointer 는 이미 저장소에 추가돼 있다
-- 일부 로컬 환경은 여전히 `AVID_CLI_PATH` legacy fallback 에 의존할 수 있다
+- `AVID_BACKEND_ROOT` 와 `AVID_BIN` 은 sibling `auto-video-edit` checkout 을 가리킨다
+- `AVID_CLI_PATH` 는 deprecated 이며 경로 결정 기준으로 사용하지 않는다
 - `eogum` 초기 workflow 는 아직 provider 선택을 유연하게 노출하지 않는다
 - deprecated `reexport` 는 남아 있지만 새 경로의 기준 명령이 아니다
 
@@ -72,7 +72,7 @@
 
 ## 5. 세부 문서
 
-- [docs/avid-submodule-layout.md](/home/jonhpark/workspace/eogum/docs/avid-submodule-layout.md)
+- [docs/avid-runtime-layout.md](/home/jonhpark/workspace/eogum/docs/avid-runtime-layout.md)
 - [docs/avid-cli-spec.md](/home/jonhpark/workspace/eogum/docs/avid-cli-spec.md)
 - [docs/backend-module-map.md](/home/jonhpark/workspace/eogum/docs/backend-module-map.md)
 - [docs/backend-testing-strategy.md](/home/jonhpark/workspace/eogum/docs/backend-testing-strategy.md)

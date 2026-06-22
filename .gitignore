@@ -11,3 +11,8 @@ __pycache__/
 dist/
 build/
 codex-review-logs/
+third_party/auto-video-edit/
+/outputs/
+/tmp/
+/supabase/.temp/
+/package-lock.json

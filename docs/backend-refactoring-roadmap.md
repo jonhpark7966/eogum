@@ -1,6 +1,6 @@
 # 어검 백엔드 리팩터링 로드맵
 
-> 최종 갱신: 2026-03-14
+> 최종 갱신: 2026-06-11
 > 범위: `apps/api`
 > 전제: 프론트엔드 개선은 뒤로 미루고, 백엔드 단독 운영 가능성을 먼저 높인다.
 
@@ -10,14 +10,14 @@
 2. 모듈 분리와 수동 workflow 검증 문서 정리를 같은 단계에서 진행한다.
 3. 순수 로직 추출이 먼저고, 폴더 이동은 그 다음이다.
 4. 프론트 요구가 아니라 백엔드 상태 정합성과 운영 가능성을 기준으로 우선순위를 정한다.
-5. `avid` 연동은 최종적으로 CLI-only + submodule 구조로 수렴한다.
+5. `avid` 연동은 CLI-only + sibling runtime 구조를 기준으로 한다.
 
 ## 2. 단계별 계획
 
 현재 진행 메모:
 
 - Phase 1의 핵심 토대는 이미 들어갔다.
-  - submodule + CLI-only 호출
+  - sibling runtime + CLI-only 호출
   - split command 후처리 경로
   - manual offset API 노출
 - Phase 2의 핵심 토대도 이미 들어갔다.
@@ -32,14 +32,14 @@
 - [docs/backend-module-map.md](/home/jonhpark/workspace/eogum/docs/backend-module-map.md)
 - [docs/backend-testing-strategy.md](/home/jonhpark/workspace/eogum/docs/backend-testing-strategy.md)
 - [docs/avid-integration-spec.md](/home/jonhpark/workspace/eogum/docs/avid-integration-spec.md)
-- [docs/avid-submodule-layout.md](/home/jonhpark/workspace/eogum/docs/avid-submodule-layout.md)
+- [docs/avid-runtime-layout.md](/home/jonhpark/workspace/eogum/docs/avid-runtime-layout.md)
 - [docs/avid-cli-spec.md](/home/jonhpark/workspace/eogum/docs/avid-cli-spec.md)
 - 이 로드맵 문서
 
 완료 기준:
 
 - 백엔드 모듈 경계와 순서가 문서로 합의됨
-- `avid` submodule 경로와 CLI 명세가 문서로 고정됨
+- `avid` sibling runtime 경로와 CLI 명세가 문서로 고정됨
 - 프론트 작업이 현재 범위 밖임이 명시됨
 
 ### Phase 1. avid CLI-only 경계 정리
@@ -47,7 +47,7 @@
 목표:
 
 - `eogum` 이 `avid` Python 모듈을 직접 import 하지 않도록 만든다.
-- `avid` 를 submodule + CLI 명세 기반 외부 엔진으로 고정한다.
+- `avid` 를 sibling runtime + CLI 명세 기반 외부 엔진으로 고정한다.
 
 현재 대상:
 
@@ -209,7 +209,7 @@
 
 ## 5. 추천 실제 작업 순서
 
-1. `avid-submodule-layout` / `avid-cli-spec` 기준으로 backend adapter 정리
+1. `avid-runtime-layout` / `avid-cli-spec` 기준으로 backend adapter 정리
 2. split command 기준 후처리 경로 정리
 3. `evaluations.metrics` 추출
 4. `processing.report_parser` 추출

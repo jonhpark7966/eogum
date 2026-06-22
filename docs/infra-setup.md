@@ -1,12 +1,12 @@
 # 어검 인프라 설정 가이드
 
-> 기준 코드: 2026-03-12
+> 기준 코드: 2026-06-11
 > 대상: Supabase + Cloudflare R2 + FastAPI API + Next.js Web
 
 이 문서는 현재 코드 기준 셋업 문서다.
-`avid` 를 submodule + CLI-only 구조로 옮기는 목표 문서는 아래를 본다.
+`avid` sibling runtime + CLI-only 구조 문서는 아래를 본다.
 
-- [docs/avid-submodule-layout.md](/home/jonhpark/workspace/eogum/docs/avid-submodule-layout.md)
+- [docs/avid-runtime-layout.md](/home/jonhpark/workspace/eogum/docs/avid-runtime-layout.md)
 - [docs/avid-cli-spec.md](/home/jonhpark/workspace/eogum/docs/avid-cli-spec.md)
 
 ## 1. 사전 준비
@@ -191,7 +191,7 @@ cp .env.example .env
 추가로 `AVID_BACKEND_ROOT` / `AVID_BIN` 이 가리키는 avid backend 에서 아래가 동작해야 한다.
 
 ```bash
-cd /path/to/eogum/third_party/auto-video-edit/apps/backend
+cd /home/jonhpark/workspace/auto-video-edit/apps/backend
 source .venv/bin/activate
 avid-cli --help
 avid-cli version --json
@@ -200,7 +200,7 @@ avid-cli doctor --provider codex --json
 
 `transcript-overview`, `subtitle-cut`, `podcast-cut` 단계는 현재
 `AVID_PROVIDER`, `AVID_PROVIDER_MODEL`, `AVID_PROVIDER_EFFORT` 설정을 따른다.
-기본 예시는 `codex / gpt-5.4 / medium` 이다.
+기본 예시는 `codex / gpt-5.5 / xhigh` 이다.
 
 중요:
 

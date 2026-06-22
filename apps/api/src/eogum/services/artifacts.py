@@ -2,7 +2,9 @@
 
 from typing import Any
 
-ARTIFACT_JOB_TYPES = ["subtitle_cut", "podcast_cut", "reprocess_multicam"]
+from eogum.services.database import execute_with_retry
+
+ARTIFACT_JOB_TYPES = ["subtitle_cut", "podcast_cut", "reprocess_multicam", "cut_decision"]
 
 
 def get_latest_artifact_job(
@@ -27,7 +29,10 @@ def get_latest_artifact_job(
     if user_id is not None:
         query = query.eq("user_id", user_id)
     query = query.order("created_at", desc=True).limit(1)
-    result = query.execute()
+    result = execute_with_retry(
+        lambda: query.execute(),
+        operation_name=f"jobs.select.latest_artifact project_id={project_id}",
+    )
     row = result.data[0] if result.data else None
     if not row or not row.get("result_r2_keys"):
         return None

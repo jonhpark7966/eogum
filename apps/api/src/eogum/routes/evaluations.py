@@ -10,7 +10,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from eogum.auth import get_user_id
+from eogum.auth import CurrentUser, get_current_user
 from eogum.config import settings
 from eogum.models.schemas import (
     ConfusionMatrix,
@@ -29,7 +29,7 @@ from eogum.services import avid
 from eogum.services.artifacts import get_latest_artifact_job
 from eogum.services.database import get_db
 from eogum.services.final_preview_cache import (
-    decision_hash,
+    final_preview_decision_hash,
     preview_cache_paths,
     preview_cache_ready,
 )
@@ -43,28 +43,52 @@ router = APIRouter(prefix="/projects/{project_id}", tags=["evaluations"])
 STREAM_CHUNK_SIZE = 1024 * 1024
 
 
+def _project_access_query(db, current_user: CurrentUser, select: str = "*"):
+    query = db.table("projects").select(select)
+    if not current_user.is_admin:
+        query = query.eq("user_id", current_user.id)
+    return query
+
+
+def _get_accessible_project(db, project_id: str, current_user: CurrentUser, select: str = "*") -> dict:
+    project = _project_access_query(db, current_user, select).eq("id", project_id).single().execute()
+    if not project.data:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+    return project.data
+
+
 def _api_public_base(request: Request) -> str:
     if settings.api_public_url:
         return settings.api_public_url.rstrip("/")
     return f"{str(request.base_url).rstrip('/')}/api/v1"
 
 
-def _local_preview_urls(request: Request, project_id: str, job_id: str, token: str) -> tuple[str, str]:
+def _local_preview_urls(request: Request, project_id: str, job_id: str, token: str) -> tuple[str, str, str]:
     base = _api_public_base(request)
     quoted_token = quote(token, safe="")
     path = f"{base}/projects/{project_id}/final-preview/{job_id}"
-    return f"{path}/video?token={quoted_token}", f"{path}/captions?token={quoted_token}"
+    return (
+        f"{path}/video?token={quoted_token}",
+        f"{path}/captions?token={quoted_token}",
+        f"{path}/timeline-map?token={quoted_token}",
+    )
 
 
 def _response_from_final_preview_job(job: dict, request: Request, project_id: str) -> FinalPreviewJobResponse:
     result_keys = job.get("result_r2_keys") or {}
     video_url = None
     captions_url = None
+    timeline_map_url = None
 
     cache_token = result_keys.get("cache_token")
     hash_value = result_keys.get("decision_hash")
     if cache_token and hash_value and preview_cache_ready(project_id, hash_value):
-        video_url, captions_url = _local_preview_urls(request, project_id, job["id"], cache_token)
+        video_url, captions_url, timeline_map_url = _local_preview_urls(
+            request,
+            project_id,
+            job["id"],
+            cache_token,
+        )
     else:
         preview_key = result_keys.get("final_preview")
         if preview_key:
@@ -77,6 +101,7 @@ def _response_from_final_preview_job(job: dict, request: Request, project_id: st
         error_message=job.get("error_message"),
         video_url=video_url,
         captions_url=captions_url,
+        timeline_map_url=timeline_map_url,
         duration_ms=result_keys.get("duration_ms"),
     )
 
@@ -100,7 +125,7 @@ def _find_completed_cached_preview_job(db, project_id: str, user_id: str, hash_v
     return None
 
 
-def _verify_cached_preview_job(project_id: str, job_id: str, token: str) -> tuple[Path, Path]:
+def _verify_cached_preview_job(project_id: str, job_id: str, token: str) -> tuple[Path, Path, Path]:
     db = get_db()
     job = (
         db.table("jobs")
@@ -121,10 +146,10 @@ def _verify_cached_preview_job(project_id: str, job_id: str, token: str) -> tupl
     if not expected_token or not hash_value or token != expected_token:
         raise HTTPException(status_code=403, detail="미리보기 접근 토큰이 유효하지 않습니다")
 
-    video_path, captions_path = preview_cache_paths(project_id, hash_value)
-    if not video_path.is_file() or not captions_path.is_file():
+    video_path, captions_path, timeline_map_path = preview_cache_paths(project_id, hash_value)
+    if not video_path.is_file() or not captions_path.is_file() or not timeline_map_path.is_file():
         raise HTTPException(status_code=404, detail="미리보기 캐시 파일을 찾을 수 없습니다")
-    return video_path, captions_path
+    return video_path, captions_path, timeline_map_path
 
 
 def _iter_file_range(path: Path, start: int, end: int):
@@ -192,6 +217,110 @@ def _normalize_evaluation_payload(segments_value) -> dict:
     return {"segments": segments_value or []}
 
 
+
+
+def _effective_segment_action(segment: dict) -> str:
+    human = segment.get("human")
+    if isinstance(human, dict) and human.get("action") in {"keep", "cut"}:
+        return human["action"]
+    ai = segment.get("ai")
+    if isinstance(ai, dict) and ai.get("action") == "cut":
+        return "cut"
+    return "keep"
+
+
+def _segment_index(segment: dict) -> int | None:
+    try:
+        return int(segment.get("index"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _junction_preview_pairs(segments: list[dict]) -> list[dict]:
+    pairs: list[dict] = []
+    i = 0
+    while i < len(segments):
+        if _effective_segment_action(segments[i]) != "cut":
+            i += 1
+            continue
+
+        cut_start = i
+        cut_segments = []
+        while i < len(segments) and _effective_segment_action(segments[i]) == "cut":
+            cut_segments.append(segments[i])
+            i += 1
+
+        before = segments[cut_start - 1] if cut_start > 0 else None
+        after = segments[i] if i < len(segments) else None
+        if not before or not after:
+            continue
+        if _effective_segment_action(before) != "keep" or _effective_segment_action(after) != "keep":
+            continue
+
+        before_index = _segment_index(before)
+        after_index = _segment_index(after)
+        if before_index is None or after_index is None:
+            continue
+
+        cut_indices = [index for index in (_segment_index(segment) for segment in cut_segments) if index is not None]
+        cut_duration_ms = 0
+        for segment in cut_segments:
+            try:
+                cut_duration_ms += max(0, int(segment.get("end_ms")) - int(segment.get("start_ms")))
+            except (TypeError, ValueError):
+                continue
+        pairs.append({
+            "before_index": before_index,
+            "after_index": after_index,
+            "cut_indices": cut_indices,
+            "cut_count": len(cut_segments),
+            "cut_duration_ms": cut_duration_ms,
+        })
+    return pairs
+
+
+def _build_junction_preview_payload(payload: dict) -> tuple[dict, list[dict]]:
+    segments = payload.get("segments") or []
+    if not isinstance(segments, list):
+        raise HTTPException(status_code=400, detail="segments must be a list")
+
+    pairs = _junction_preview_pairs(segments)
+    if not pairs:
+        raise HTTPException(status_code=400, detail="검토할 연결부가 없습니다")
+
+    keep_indices = {
+        index
+        for pair in pairs
+        for index in (pair["before_index"], pair["after_index"])
+    }
+    synthetic_segments = []
+    for segment in segments:
+        segment_copy = dict(segment)
+        segment_index = _segment_index(segment_copy)
+        action = "keep" if segment_index in keep_indices else "cut"
+        ai = dict(segment_copy.get("ai") or {})
+        ai.update({
+            "action": action,
+            "reason": "junction_preview",
+            "confidence": 1.0,
+            "note": "synthetic decision for junction-only preview",
+        })
+        segment_copy["ai"] = ai
+        segment_copy["human"] = None
+        synthetic_segments.append(segment_copy)
+
+    synthetic_payload = dict(payload)
+    synthetic_payload["review_scope"] = "junction_preview"
+    synthetic_payload["segments"] = synthetic_segments
+    stats = dict(synthetic_payload.get("stats") or {})
+    stats["junction_preview"] = {
+        "pair_count": len(pairs),
+        "pairs": pairs,
+    }
+    synthetic_payload["stats"] = stats
+    return synthetic_payload, pairs
+
+
 def _evaluation_response_from_row(row: dict) -> EvaluationResponse:
     payload = _normalize_evaluation_payload(row.get("segments"))
     extra_payload = {
@@ -216,31 +345,22 @@ def _evaluation_response_from_row(row: dict) -> EvaluationResponse:
     )
 
 
-def _get_completed_job(db, project_id: str, user_id: str):
-    """Get the latest completed job for a project, verifying ownership."""
-    project = (
-        db.table("projects")
-        .select("id, user_id")
-        .eq("id", project_id)
-        .eq("user_id", user_id)
-        .single()
-        .execute()
-    )
-    if not project.data:
-        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+def _get_completed_job(db, project_id: str, current_user: CurrentUser, project_select: str = "id, user_id"):
+    """Get the latest completed job for a project, verifying access."""
+    project_data = _get_accessible_project(db, project_id, current_user, project_select)
 
-    job = get_latest_artifact_job(db, project_id, select="result_r2_keys")
+    job = get_latest_artifact_job(db, project_id, user_id=project_data["user_id"], select="result_r2_keys")
     if not job:
         raise HTTPException(status_code=404, detail="완료된 작업이 없습니다")
 
-    return job["result_r2_keys"]
+    return job["result_r2_keys"], project_data
 
 
 @router.get("/segments", response_model=SegmentsResponse)
-def get_segments(project_id: str, user_id: str = Depends(get_user_id)):
+def get_segments(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """Get engine-native review segments from avid-cli."""
     db = get_db()
-    r2_keys = _get_completed_job(db, project_id, user_id)
+    r2_keys, _ = _get_completed_job(db, project_id, current_user)
 
     project_json_key = r2_keys.get("project_json")
     if not project_json_key:
@@ -270,25 +390,21 @@ def get_segments(project_id: str, user_id: str = Depends(get_user_id)):
 
 
 @router.get("/video-url", response_model=VideoUrlResponse)
-def get_video_url(project_id: str, user_id: str = Depends(get_user_id)):
+def get_video_url(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """Get presigned streaming URL for the preview video."""
     db = get_db()
-    r2_keys = _get_completed_job(db, project_id, user_id)
+    r2_keys, project_data = _get_completed_job(
+        db,
+        project_id,
+        current_user,
+        "id, user_id, source_duration_seconds, source_r2_key",
+    )
 
     preview_key = r2_keys.get("preview")
-
-    # Get project info (duration + source fallback)
-    project = (
-        db.table("projects")
-        .select("source_duration_seconds, source_r2_key")
-        .eq("id", project_id)
-        .single()
-        .execute()
-    )
-    duration_ms = (project.data.get("source_duration_seconds") or 0) * 1000
+    duration_ms = (project_data.get("source_duration_seconds") or 0) * 1000
 
     # Fall back to source video if no preview exists
-    stream_key = preview_key or project.data.get("source_r2_key")
+    stream_key = preview_key or project_data.get("source_r2_key")
     if not stream_key:
         raise HTTPException(status_code=404, detail="프리뷰 영상이 없습니다")
 
@@ -297,27 +413,18 @@ def get_video_url(project_id: str, user_id: str = Depends(get_user_id)):
 
 
 @router.get("/evaluation", response_model=EvaluationResponse)
-def get_evaluation(project_id: str, user_id: str = Depends(get_user_id)):
-    """Get existing evaluation for this project by the current user."""
+def get_evaluation(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    """Get existing evaluation for this project owner."""
     db = get_db()
 
-    # Verify project ownership
-    project = (
-        db.table("projects")
-        .select("id, user_id")
-        .eq("id", project_id)
-        .eq("user_id", user_id)
-        .single()
-        .execute()
-    )
-    if not project.data:
-        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+    project_data = _get_accessible_project(db, project_id, current_user, "id, user_id")
+    owner_user_id = project_data["user_id"]
 
     result = (
         db.table("evaluations")
         .select("*")
         .eq("project_id", project_id)
-        .eq("evaluator_id", user_id)
+        .eq("evaluator_id", owner_user_id)
         .limit(1)
         .execute()
     )
@@ -366,24 +473,13 @@ def _save_evaluation_payload(db, project_id: str, user_id: str, payload: dict) -
 def save_evaluation(
     project_id: str,
     req: EvaluationSave,
-    user_id: str = Depends(get_user_id),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
-    """Save or update evaluation (upsert on project_id + evaluator_id)."""
+    """Save or update evaluation (upsert on project_id + owner evaluator_id)."""
     db = get_db()
 
-    # Verify project ownership
-    project = (
-        db.table("projects")
-        .select("id, user_id")
-        .eq("id", project_id)
-        .eq("user_id", user_id)
-        .single()
-        .execute()
-    )
-    if not project.data:
-        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
-
-    return _save_evaluation_payload(db, project_id, user_id, req.model_dump())
+    project_data = _get_accessible_project(db, project_id, current_user, "id, user_id")
+    return _save_evaluation_payload(db, project_id, project_data["user_id"], req.model_dump())
 
 
 @router.post("/final-preview", response_model=FinalPreviewJobResponse)
@@ -391,26 +487,18 @@ def start_final_preview(
     project_id: str,
     req: FinalPreviewRequest,
     request: Request,
-    user_id: str = Depends(get_user_id),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     db = get_db()
 
-    project = (
-        db.table("projects")
-        .select("id, user_id, source_duration_seconds")
-        .eq("id", project_id)
-        .eq("user_id", user_id)
-        .single()
-        .execute()
-    )
-    if not project.data:
-        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+    project_data = _get_accessible_project(db, project_id, current_user, "id, user_id, source_duration_seconds")
+    owner_user_id = project_data["user_id"]
 
     payload = req.model_dump()
-    _save_evaluation_payload(db, project_id, user_id, payload)
-    hash_value = decision_hash(payload)
+    _save_evaluation_payload(db, project_id, owner_user_id, payload)
+    hash_value = final_preview_decision_hash(payload)
 
-    cached_job = _find_completed_cached_preview_job(db, project_id, user_id, hash_value)
+    cached_job = _find_completed_cached_preview_job(db, project_id, owner_user_id, hash_value)
     if cached_job:
         return _response_from_final_preview_job(cached_job, request, project_id)
 
@@ -418,7 +506,7 @@ def start_final_preview(
         db.table("jobs")
         .insert({
             "project_id": project_id,
-            "user_id": user_id,
+            "user_id": owner_user_id,
             "type": "final_preview",
             "status": "pending",
             "progress": 0,
@@ -435,20 +523,72 @@ def start_final_preview(
         job_id=job["id"],
         status=job["status"],
         progress=job["progress"],
-        duration_ms=(project.data.get("source_duration_seconds") or 0) * 1000,
+        duration_ms=(project_data.get("source_duration_seconds") or 0) * 1000,
+    )
+
+
+@router.post("/junction-preview", response_model=FinalPreviewJobResponse)
+def start_junction_preview(
+    project_id: str,
+    req: FinalPreviewRequest,
+    request: Request,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    db = get_db()
+
+    project_data = _get_accessible_project(db, project_id, current_user, "id, user_id, source_duration_seconds")
+    owner_user_id = project_data["user_id"]
+
+    payload = req.model_dump()
+    junction_payload, pairs = _build_junction_preview_payload(payload)
+    hash_value = final_preview_decision_hash({
+        "preview_kind": "junction",
+        "payload": junction_payload,
+    })
+
+    cached_job = _find_completed_cached_preview_job(db, project_id, owner_user_id, hash_value)
+    if cached_job:
+        return _response_from_final_preview_job(cached_job, request, project_id)
+
+    job = (
+        db.table("jobs")
+        .insert({
+            "project_id": project_id,
+            "user_id": owner_user_id,
+            "type": "final_preview",
+            "status": "pending",
+            "progress": 0,
+            "input_payload": junction_payload,
+            "result_r2_keys": {
+                "decision_hash": hash_value,
+                "preview_kind": "junction",
+                "junction_pairs": pairs,
+            },
+        })
+        .execute()
+        .data[0]
+    )
+    enqueue_final_preview(project_id, job["id"])
+    return FinalPreviewJobResponse(
+        job_id=job["id"],
+        status=job["status"],
+        progress=job["progress"],
+        duration_ms=(project_data.get("source_duration_seconds") or 0) * 1000,
     )
 
 
 @router.get("/final-preview/{job_id}", response_model=FinalPreviewJobResponse)
-def get_final_preview(project_id: str, job_id: str, request: Request, user_id: str = Depends(get_user_id)):
+def get_final_preview(project_id: str, job_id: str, request: Request, current_user: CurrentUser = Depends(get_current_user)):
     db = get_db()
+
+    project_data = _get_accessible_project(db, project_id, current_user, "id, user_id")
 
     job = (
         db.table("jobs")
         .select("*")
         .eq("id", job_id)
         .eq("project_id", project_id)
-        .eq("user_id", user_id)
+        .eq("user_id", project_data["user_id"])
         .eq("type", "final_preview")
         .maybe_single()
         .execute()
@@ -466,7 +606,7 @@ def stream_final_preview_video(
     request: Request,
     token: str = Query(...),
 ):
-    video_path, _ = _verify_cached_preview_job(project_id, job_id, token)
+    video_path, _, _ = _verify_cached_preview_job(project_id, job_id, token)
     return _stream_cached_file(request, video_path, "video/mp4")
 
 
@@ -477,21 +617,34 @@ def stream_final_preview_captions(
     request: Request,
     token: str = Query(...),
 ):
-    _, captions_path = _verify_cached_preview_job(project_id, job_id, token)
+    _, captions_path, _ = _verify_cached_preview_job(project_id, job_id, token)
     return _stream_cached_file(request, captions_path, "text/vtt; charset=utf-8")
 
 
+@router.get("/final-preview/{job_id}/timeline-map")
+def stream_final_preview_timeline_map(
+    project_id: str,
+    job_id: str,
+    request: Request,
+    token: str = Query(...),
+):
+    _, _, timeline_map_path = _verify_cached_preview_job(project_id, job_id, token)
+    return _stream_cached_file(request, timeline_map_path, "application/json; charset=utf-8")
+
+
 @router.get("/eval-report", response_model=EvalReportResponse)
-def get_eval_report(project_id: str, user_id: str = Depends(get_user_id)):
+def get_eval_report(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """Compare AI decisions vs human ground truth and produce a report."""
     db = get_db()
+
+    project_data = _get_accessible_project(db, project_id, current_user, "id, user_id")
 
     # Get evaluation
     eval_result = (
         db.table("evaluations")
         .select("*")
         .eq("project_id", project_id)
-        .eq("evaluator_id", user_id)
+        .eq("evaluator_id", project_data["user_id"])
         .limit(1)
         .execute()
     )

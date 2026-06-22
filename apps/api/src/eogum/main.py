@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from eogum.config import settings
-from eogum.routes import credits, downloads, evaluations, health, projects, upload, youtube
+from eogum.routes import credits, downloads, evaluations, health, projects, sources, upload, youtube
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -14,49 +14,31 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Recover stuck projects on startup
-    from eogum.services.database import get_db
-    from eogum.services.job_runner import enqueue, enqueue_reprocess
-
-    db = get_db()
-    stuck = (
-        db.table("projects")
-        .select("id, status")
-        .in_("status", ["queued", "processing"])
-        .execute()
+    from eogum.services.job_runner import (
+        recover_stuck_final_previews,
+        recover_stuck_projects,
+        start_stuck_project_sweeper,
     )
-    for p in stuck.data:
-        logger.info("Recovering stuck project: %s (was %s)", p["id"], p["status"])
-        latest_incomplete = (
-            db.table("jobs")
-            .select("id, type, status")
-            .eq("project_id", p["id"])
-            .in_("status", ["running", "pending"])
-            .order("created_at", desc=True)
-            .limit(1)
-            .maybe_single()
-            .execute()
-        )
-        if latest_incomplete.data and latest_incomplete.data["type"] == "reprocess_multicam":
-            db.table("jobs").update({
-                "status": "pending",
-                "progress": 0,
-                "error_message": None,
-            }).eq("id", latest_incomplete.data["id"]).execute()
-            db.table("projects").update({"status": "processing"}).eq("id", p["id"]).execute()
-            enqueue_reprocess(p["id"], latest_incomplete.data["id"])
-            continue
 
-        # Only delete incomplete initial jobs (not completed ones)
-        db.table("jobs").delete().eq("project_id", p["id"]).in_("status", ["running", "pending"]).execute()
-        db.table("edit_reports").delete().eq("project_id", p["id"]).execute()
-        db.table("projects").update({"status": "queued"}).eq("id", p["id"]).execute()
-        enqueue(p["id"])
+    try:
+        recovered = recover_stuck_projects(recover_running=True)
+        if recovered:
+            logger.info("Recovered %d stuck project(s) on startup", recovered)
+    except Exception:
+        logger.exception("Startup stuck project recovery failed")
 
-    if stuck.data:
-        logger.info("Recovered %d stuck project(s)", len(stuck.data))
+    try:
+        recovered_previews = recover_stuck_final_previews(recover_running=True)
+        if recovered_previews:
+            logger.info("Recovered %d stuck final-preview job(s) on startup", recovered_previews)
+    except Exception:
+        logger.exception("Startup final-preview recovery failed")
 
-    yield
+    sweeper_stop = start_stuck_project_sweeper(interval_seconds=60)
+    try:
+        yield
+    finally:
+        sweeper_stop.set()
 
 app = FastAPI(
     title="어검 (eogum) API",
@@ -81,6 +63,7 @@ app.add_middleware(
 app.include_router(health.router, prefix="/api/v1")
 app.include_router(upload.router, prefix="/api/v1")
 app.include_router(projects.router, prefix="/api/v1")
+app.include_router(sources.router, prefix="/api/v1")
 app.include_router(credits.router, prefix="/api/v1")
 app.include_router(downloads.router, prefix="/api/v1")
 app.include_router(evaluations.router, prefix="/api/v1")

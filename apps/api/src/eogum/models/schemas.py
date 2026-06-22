@@ -27,6 +27,13 @@ class UpdateExtraSourcesRequest(BaseModel):
     extra_sources: list[ExtraSourceItem]
 
 
+class UpdateMulticamSettingsRequest(BaseModel):
+    multicam_switching: str | None = None
+    multicam_source_labels: dict[str, dict] | None = None
+    speaker_source_map: dict[str, str] | None = None
+    audio_source_key: str | None = None
+
+
 # ── Projects ──
 class ProjectCreate(BaseModel):
     name: str
@@ -36,17 +43,25 @@ class ProjectCreate(BaseModel):
     source_filename: str
     source_duration_seconds: int
     source_size_bytes: int
+    source_sha256: str | None = None
     settings: dict = {}
+
+
+class ProjectVariantCreate(BaseModel):
+    edit_intensity: str
+    name: str | None = None
 
 
 class ProjectResponse(BaseModel):
     id: str
+    user_id: str
     name: str
     status: str
     cut_type: str
     language: str
     source_filename: str | None
     source_duration_seconds: int | None
+    source_sha256: str | None = None
     extra_sources: list[dict] = []
     multicam_state: dict = {}
     created_at: datetime
@@ -61,6 +76,18 @@ class ProjectDetailResponse(ProjectResponse):
     report: "EditReportResponse | None" = None
 
 
+# ── Source Cache ──
+class SourceLookupRequest(BaseModel):
+    sha256: str
+    size_bytes: int
+
+
+class SourceLookupResponse(BaseModel):
+    hit: bool
+    r2_key: str | None = None
+    source_asset_id: str | None = None
+
+
 # ── Jobs ──
 class JobResponse(BaseModel):
     id: str
@@ -73,6 +100,7 @@ class JobResponse(BaseModel):
     created_at: datetime
     pipeline_stages: list[dict] = []
     external_task_ids: dict = {}
+    processing_metadata: dict = {}
     result_r2_keys: dict | None = None
 
 
@@ -128,6 +156,7 @@ class ReviewSegment(EnginePayloadModel):
     raw_start_ms: int | None = None
     raw_end_ms: int | None = None
     text: str
+    speaker: str | None = None
     ai: AiDecision | None = None
     human: HumanDecision | None = None
 
@@ -193,6 +222,7 @@ class FinalPreviewJobResponse(BaseModel):
     error_message: str | None = None
     video_url: str | None = None
     captions_url: str | None = None
+    timeline_map_url: str | None = None
     duration_ms: int | None = None
 
 

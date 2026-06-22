@@ -136,6 +136,38 @@ def download_file(r2_key: str, local_path: str) -> str:
     return local_path
 
 
+def object_exists(r2_key: str) -> bool:
+    """Return whether an object currently exists in the configured R2 bucket."""
+    client = get_r2_client()
+    try:
+        client.head_object(Bucket=settings.r2_bucket_name, Key=r2_key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        status_code = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if code in {"404", "NoSuchKey", "NotFound"} or status_code == 404:
+            return False
+        raise
+    return True
+
+
+def copy_object(source_r2_key: str, destination_r2_key: str, content_type: str | None = None) -> str:
+    """Copy an object inside the configured R2 bucket."""
+    client = get_r2_client()
+    extra_args = {}
+    if content_type:
+        extra_args = {
+            "ContentType": content_type,
+            "MetadataDirective": "REPLACE",
+        }
+    client.copy_object(
+        Bucket=settings.r2_bucket_name,
+        Key=destination_r2_key,
+        CopySource={"Bucket": settings.r2_bucket_name, "Key": source_r2_key},
+        **extra_args,
+    )
+    return destination_r2_key
+
+
 def upload_file(local_path: str, r2_key: str, content_type: str = "application/octet-stream") -> str:
     """Upload local file to R2."""
     client = get_r2_client()

@@ -1,4 +1,4 @@
-"""Sequential job runner for processing video projects."""
+"""Lane-based job runner for processing video projects."""
 
 import json
 import logging
@@ -6,17 +6,17 @@ import hashlib
 import subprocess
 import threading
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
 from eogum.config import settings
-from eogum.services import avid, chalna, credit, email, r2
+from eogum.services import avid, chalna, credit, email, r2, scribe_v2_cache, source_cache
 from eogum.services.artifacts import get_latest_artifact_job
-from eogum.services.database import get_db
+from eogum.services.database import execute_with_retry, get_db
 from eogum.services.final_preview_cache import (
-    decision_hash,
+    final_preview_decision_hash,
     new_cache_token,
     preview_cache_key,
     preview_cache_paths,
@@ -26,55 +26,307 @@ from eogum.services.final_preview_cache import (
 
 logger = logging.getLogger(__name__)
 
-_queue: deque[dict[str, str | None]] = deque()
-_running = False
+_job_lanes = ("project", "cut_decision", "final_preview")
+_queues: dict[str, deque[dict[str, str | None]]] = {lane: deque() for lane in _job_lanes}
+_running_lanes: dict[str, bool] = {lane: False for lane in _job_lanes}
 _lock = threading.Lock()
+_initial_job_types = {"subtitle_cut", "podcast_cut"}
+_incomplete_job_statuses = ["queued", "pending", "running"]
+_stale_running_after = timedelta(hours=6)
 
 
-def enqueue(project_id: str) -> None:
+def enqueue(project_id: str, job_id: str) -> None:
     """Add project to processing queue."""
-    _queue.append({"kind": "initial", "project_id": project_id, "job_id": None})
-    _maybe_start_worker()
+    _enqueue("initial", project_id, job_id)
 
 
 def enqueue_reprocess(project_id: str, job_id: str) -> None:
     """Add reprocess task to queue."""
-    _queue.append({"kind": "reprocess", "project_id": project_id, "job_id": job_id})
-    _maybe_start_worker()
+    _enqueue("reprocess", project_id, job_id)
+
+
+def enqueue_cut_decision(project_id: str, job_id: str) -> None:
+    """Add cut-decision-only task to queue."""
+    _enqueue("cut_decision", project_id, job_id)
 
 
 def enqueue_final_preview(project_id: str, job_id: str) -> None:
     """Add final-preview render task to queue."""
-    _queue.append({"kind": "final_preview", "project_id": project_id, "job_id": job_id})
-    _maybe_start_worker()
+    _enqueue("final_preview", project_id, job_id)
 
 
-def _maybe_start_worker() -> None:
-    global _running
+def _lane_for_kind(kind: str) -> str:
+    if kind == "cut_decision":
+        return "cut_decision"
+    if kind == "final_preview":
+        return "final_preview"
+    return "project"
+
+
+def _enqueue(kind: str, project_id: str, job_id: str | None) -> None:
+    lane = _lane_for_kind(kind)
+    _queues[lane].append({"kind": kind, "project_id": project_id, "job_id": job_id})
+    _maybe_start_worker(lane)
+
+
+def _maybe_start_worker(lane: str) -> None:
     with _lock:
-        if _running:
+        if _running_lanes[lane]:
             return
-        _running = True
-    thread = threading.Thread(target=_worker_loop, daemon=True)
+        _running_lanes[lane] = True
+    thread = threading.Thread(target=_worker_loop, args=(lane,), daemon=True)
     thread.start()
 
 
-def _worker_loop() -> None:
-    global _running
-    while _queue:
-        item = _queue.popleft()
+def _worker_loop(lane: str) -> None:
+    queue = _queues[lane]
+    while queue:
+        item = queue.popleft()
         project_id = item["project_id"]
         try:
             if item["kind"] == "reprocess":
                 _reprocess_project(project_id, item["job_id"])
+            elif item["kind"] == "cut_decision":
+                _cut_decision_project(project_id, item["job_id"])
             elif item["kind"] == "final_preview":
                 _render_final_preview(project_id, item["job_id"])
             else:
-                _process_project(project_id)
+                _process_project(project_id, item["job_id"])
         except Exception:
             logger.exception("Fatal error processing project %s", project_id)
+    restart = False
     with _lock:
-        _running = False
+        if queue:
+            restart = True
+        else:
+            _running_lanes[lane] = False
+    if restart:
+        threading.Thread(target=_worker_loop, args=(lane,), daemon=True).start()
+
+
+def create_initial_job(db, project: dict) -> dict:
+    """Create the durable queue record for an initial project run."""
+    project_settings = project.get("settings") or {}
+    job = db.table("jobs").insert({
+        "project_id": project["id"],
+        "user_id": project["user_id"],
+        "type": project["cut_type"],
+        "status": "pending",
+        "progress": 0,
+        "pipeline_stages": _initial_pipeline_stages(
+            use_llm_segmentation=_bool_project_setting(
+                project_settings,
+                "use_llm_segmentation",
+                default=True,
+            ),
+            use_llm_refinement=_bool_project_setting(
+                project_settings,
+                "use_llm_refinement",
+                default=True,
+            ),
+        ),
+        "external_task_ids": {},
+    }).execute().data[0]
+    return job
+
+
+def create_cut_decision_job(db, project: dict) -> dict:
+    """Create the durable queue record for rerunning edit decisions only."""
+    job = db.table("jobs").insert({
+        "project_id": project["id"],
+        "user_id": project["user_id"],
+        "type": "cut_decision",
+        "status": "pending",
+        "progress": 0,
+        "pipeline_stages": _cut_decision_pipeline_stages(),
+        "external_task_ids": {},
+    }).execute().data[0]
+    return job
+
+
+def recover_stuck_projects(*, recover_running: bool = False) -> int:
+    """Requeue projects whose durable job state and project status diverged."""
+    db = get_db()
+    stuck = (
+        db.table("projects")
+        .select("*")
+        .in_("status", ["queued", "processing"])
+        .execute()
+    )
+
+    recovered = 0
+    for project in stuck.data or []:
+        try:
+            if _recover_stuck_project(db, project, recover_running=recover_running):
+                recovered += 1
+        except Exception:
+            logger.exception("Failed to recover stuck project %s", project.get("id"))
+    return recovered
+
+
+def recover_stuck_final_previews(*, recover_running: bool = False) -> int:
+    """Requeue final-preview jobs that were left behind by a process restart."""
+    db = get_db()
+    jobs = (
+        db.table("jobs")
+        .select("id, project_id, status, started_at, created_at")
+        .eq("type", "final_preview")
+        .in_("status", _incomplete_job_statuses)
+        .order("created_at")
+        .execute()
+        .data
+        or []
+    )
+
+    recovered = 0
+    for job in jobs:
+        try:
+            if job["status"] == "running" and not _should_recover_running_job(job, recover_running):
+                continue
+            db.table("jobs").update({
+                "status": "pending",
+                "progress": 0,
+                "error_message": None,
+                "started_at": None,
+                "completed_at": None,
+            }).eq("id", job["id"]).execute()
+            enqueue_final_preview(job["project_id"], job["id"])
+            recovered += 1
+            logger.info(
+                "Requeued stuck final-preview job %s for project %s",
+                job["id"],
+                job["project_id"],
+            )
+        except Exception:
+            logger.exception("Failed to recover final-preview job %s", job.get("id"))
+    return recovered
+
+
+def start_stuck_project_sweeper(interval_seconds: int = 60) -> threading.Event:
+    """Start a background sweeper for orphaned queued jobs."""
+    stop_event = threading.Event()
+
+    def _loop() -> None:
+        while not stop_event.wait(interval_seconds):
+            try:
+                recovered = recover_stuck_projects(recover_running=False)
+                if recovered:
+                    logger.info("Recovered %d stuck project(s)", recovered)
+                recovered_previews = recover_stuck_final_previews(recover_running=False)
+                if recovered_previews:
+                    logger.info("Recovered %d stuck final-preview job(s)", recovered_previews)
+            except Exception:
+                logger.exception("Stuck job sweeper failed")
+
+    thread = threading.Thread(target=_loop, daemon=True)
+    thread.start()
+    return stop_event
+
+
+def _recover_stuck_project(db, project: dict, *, recover_running: bool) -> bool:
+    project_id = project["id"]
+    latest = (
+        db.table("jobs")
+        .select("id, type, status, started_at, created_at")
+        .eq("project_id", project_id)
+        .in_("status", _incomplete_job_statuses)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    job = latest.data[0] if latest.data else None
+
+    if not job:
+        if project["status"] != "queued":
+            db.table("projects").update({"status": "queued"}).eq("id", project_id).execute()
+        job = create_initial_job(db, project)
+        enqueue(project_id, job["id"])
+        logger.info("Created missing pending job %s for stuck project %s", job["id"], project_id)
+        return True
+
+    job_type = job["type"]
+    if job["status"] == "running" and not _should_recover_running_job(job, recover_running):
+        return False
+
+    if job_type == "reprocess_multicam":
+        db.table("jobs").update({
+            "status": "pending",
+            "progress": 0,
+            "error_message": None,
+            "started_at": None,
+            "completed_at": None,
+        }).eq("id", job["id"]).execute()
+        db.table("projects").update({"status": "processing"}).eq("id", project_id).execute()
+        enqueue_reprocess(project_id, job["id"])
+        logger.info("Requeued stuck reprocess job %s for project %s", job["id"], project_id)
+        return True
+
+    if job_type == "cut_decision":
+        db.table("jobs").update({
+            "status": "pending",
+            "progress": 0,
+            "error_message": None,
+            "started_at": None,
+            "completed_at": None,
+            "result_r2_keys": None,
+            "pipeline_stages": _cut_decision_pipeline_stages(),
+            "external_task_ids": {},
+        }).eq("id", job["id"]).execute()
+        db.table("projects").update({"status": "processing"}).eq("id", project_id).execute()
+        enqueue_cut_decision(project_id, job["id"])
+        logger.info("Requeued stuck cut-decision job %s for project %s", job["id"], project_id)
+        return True
+
+    if job_type in _initial_job_types:
+        db.table("jobs").update({
+            "status": "pending",
+            "progress": 0,
+            "error_message": None,
+            "started_at": None,
+            "completed_at": None,
+            "result_r2_keys": None,
+            "pipeline_stages": _initial_pipeline_stages(
+                use_llm_segmentation=_bool_project_setting(
+                    project.get("settings") or {},
+                    "use_llm_segmentation",
+                    default=True,
+                ),
+                use_llm_refinement=_bool_project_setting(
+                    project.get("settings") or {},
+                    "use_llm_refinement",
+                    default=True,
+                ),
+            ),
+            "external_task_ids": {},
+        }).eq("id", job["id"]).execute()
+        db.table("projects").update({"status": "queued"}).eq("id", project_id).execute()
+        enqueue(project_id, job["id"])
+        logger.info("Requeued stuck initial job %s for project %s", job["id"], project_id)
+        return True
+
+    return False
+
+
+def _should_recover_running_job(job: dict, recover_running: bool) -> bool:
+    if recover_running:
+        return True
+    started_at = _parse_datetime(job.get("started_at") or job.get("created_at"))
+    if not started_at:
+        return False
+    return datetime.now(timezone.utc) - started_at > _stale_running_after
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 def _mark_initial_project_failure(db, project_id: str, *, job_id: str | None, error_message: str) -> None:
@@ -85,14 +337,13 @@ def _mark_initial_project_failure(db, project_id: str, *, job_id: str | None, er
             db.table("jobs")
             .select("id")
             .eq("project_id", project_id)
-            .in_("status", ["running", "pending"])
+            .in_("status", _incomplete_job_statuses)
             .order("created_at", desc=True)
             .limit(1)
-            .maybe_single()
             .execute()
         )
         if latest_incomplete.data:
-            resolved_job_id = latest_incomplete.data["id"]
+            resolved_job_id = latest_incomplete.data[0]["id"]
 
     if resolved_job_id:
         db.table("jobs").update({
@@ -104,45 +355,55 @@ def _mark_initial_project_failure(db, project_id: str, *, job_id: str | None, er
     db.table("projects").update({"status": "failed"}).eq("id", project_id).execute()
 
 
-def _process_project(project_id: str) -> None:
+def _process_project(project_id: str, job_id: str | None) -> None:
+    if not job_id:
+        raise RuntimeError("initial job_id is required")
+
     db = get_db()
     temp_dir = settings.avid_temp_dir / project_id
     project = None
     user_id = None
     user_email = None
     duration = 0
-    job_id = None
     credits_held = False
 
     try:
+        claimed = (
+            db.table("jobs")
+            .update({
+                "status": "running",
+                "progress": 0,
+                "error_message": None,
+                "started_at": "now()",
+            })
+            .eq("id", job_id)
+            .eq("project_id", project_id)
+            .in_("status", ["queued", "pending"])
+            .execute()
+        )
+        if not claimed.data:
+            logger.info("Initial job %s for project %s was already claimed or finished", job_id, project_id)
+            return
+
+        db.table("projects").update({"status": "processing"}).eq("id", project_id).execute()
+
         # Load project
         project = db.table("projects").select("*").eq("id", project_id).single().execute().data
         user_id = project["user_id"]
         duration = project["source_duration_seconds"]
 
-        # Get user email
-        db.table("profiles").select("id, display_name").eq("id", user_id).single().execute()
-        auth_user = db.auth.admin.get_user_by_id(user_id)
-        user_email = auth_user.user.email
-
-        # Update project status
-        db.table("projects").update({"status": "processing"}).eq("id", project_id).execute()
-
-        # Create job record
-        job = db.table("jobs").insert({
-            "project_id": project_id,
-            "user_id": user_id,
-            "type": project["cut_type"],
-            "status": "running",
-            "pipeline_stages": _initial_pipeline_stages(),
-            "external_task_ids": {},
-        }).execute().data[0]
-        job_id = job["id"]
+        # Email lookup is best effort. Notification failures must not block processing.
+        try:
+            auth_user = db.auth.admin.get_user_by_id(user_id)
+            user_email = auth_user.user.email
+        except Exception:
+            logger.exception("Failed to resolve user email for project %s", project_id)
 
         # Ensure temp dirs
         temp_dir.mkdir(parents=True, exist_ok=True)
         output_dir = temp_dir / "output"
         output_dir.mkdir(exist_ok=True)
+        llm_log_path = output_dir / "llm_io.jsonl"
 
         # 1. Hold credits
         credit.hold_credits(user_id, duration, job_id)
@@ -154,12 +415,18 @@ def _process_project(project_id: str) -> None:
         _update_progress(db, job_id, 5)
 
         r2.download_file(project["source_r2_key"], source_path)
+        source_sha256 = _register_source_identity(
+            db,
+            project_id=project_id,
+            project=project,
+            source_path=source_path,
+        )
 
         # 2.5. Download extra sources (multicam)
         extra_source_paths: list[str] = []
+        used_extra_names: set[str] = set()
         for i, es in enumerate(project.get("extra_sources") or []):
-            ext = Path(es["filename"]).suffix
-            local_path = str(temp_dir / f"extra_{i}{ext}")
+            local_path = str(_local_extra_source_path(temp_dir, es, i, used_extra_names))
             r2.download_file(es["r2_key"], local_path)
             extra_source_paths.append(local_path)
 
@@ -178,34 +445,43 @@ def _process_project(project_id: str) -> None:
             "use_llm_segmentation",
             default=True,
         )
-        srt_path = chalna.transcribe_to_srt(
-            source_path,
-            language=project["language"],
-            output_dir=str(temp_dir),
-            context=transcription_context,
-            diarize=_bool_project_setting(project_settings, "diarize", default=True),
-            tag_audio_events=_bool_project_setting(
-                project_settings,
-                "tag_audio_events",
-                default=True,
-            ),
-            num_speakers=_optional_int_project_setting(project_settings, "num_speakers"),
-            use_llm_segmentation=use_llm_segmentation,
-            use_llm_refinement=use_llm_refinement,
-            on_status=lambda payload: _update_chalna_pipeline_status(
-                db,
-                job_id,
-                {
-                    **payload,
-                    "use_llm_segmentation": use_llm_segmentation,
-                    "use_llm_refinement": use_llm_refinement,
-                },
-            ),
+        transcription_result = _download_reused_transcription_srt(
+            db,
+            job_id=job_id,
+            project_settings=project_settings,
+            output_dir=temp_dir,
         )
+        if transcription_result is None:
+            transcription_result = _transcribe_with_scribe_v2_cache(
+                db,
+                job_id=job_id,
+                project=project,
+                source_path=source_path,
+                output_dir=temp_dir,
+                source_sha256=source_sha256,
+                language=project["language"],
+                transcription_context=transcription_context,
+                diarize=_bool_project_setting(project_settings, "diarize", default=True),
+                tag_audio_events=_bool_project_setting(project_settings, "tag_audio_events", default=True),
+                num_speakers=_optional_int_project_setting(project_settings, "num_speakers"),
+                use_llm_segmentation=use_llm_segmentation,
+                use_llm_refinement=use_llm_refinement,
+                bypass_llm_segmentation_cache=_bool_project_setting(
+                    project_settings,
+                    "bypass_llm_segmentation_cache",
+                    default=False,
+                ),
+                llm_log_path=llm_log_path,
+            )
+        srt_path = transcription_result.srt_path
         _update_progress(db, job_id, 30)
 
         # 4. Transcript overview (Pass 1)
-        storyline_path = avid.transcript_overview(srt_path, output_path=str(output_dir / "storyline.json"))
+        storyline_path = avid.transcript_overview(
+            srt_path,
+            output_path=str(output_dir / "storyline.json"),
+            llm_log_path=str(llm_log_path),
+        )
         _update_progress(db, job_id, 50)
 
         # 5. Cut (Pass 2)
@@ -215,9 +491,12 @@ def _process_project(project_id: str) -> None:
             srt_path=srt_path,
             context_path=storyline_path,
             output_dir=str(output_dir),
+            final=True,
             extra_sources=extra_source_paths or None,
-            target_duration_minutes=_output_target_duration_minutes(project),
+            edit_intensity=_output_edit_intensity(project),
+            llm_log_path=str(llm_log_path),
         )
+        result_paths["storyline"] = storyline_path
         _update_progress(db, job_id, 75)
 
         # 5.5. Generate low-quality preview for review page
@@ -235,6 +514,9 @@ def _process_project(project_id: str) -> None:
             result_paths["preview"] = preview_path
         except Exception:
             logger.warning("Preview generation failed for project %s, skipping", project_id)
+
+        if llm_log_path.exists() and llm_log_path.stat().st_size > 0:
+            result_paths["llm_io_log"] = str(llm_log_path)
 
         # 6. Upload results to R2
         r2_keys = {}
@@ -258,6 +540,7 @@ def _process_project(project_id: str) -> None:
             "status": "completed",
             "progress": 100,
             "result_r2_keys": r2_keys,
+            "processing_metadata": transcription_result.processing_metadata,
             "completed_at": "now()",
         }).eq("id", job_id).execute()
         db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
@@ -296,17 +579,9 @@ def _process_project(project_id: str) -> None:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def _output_target_duration_minutes(project: dict) -> int | None:
-    target = (project.get("settings") or {}).get("output_target_duration_minutes")
-    if target is None or isinstance(target, bool):
-        return None
-    try:
-        target_minutes = int(target)
-    except (TypeError, ValueError):
-        return None
-    if target_minutes not in {20, 40, 60}:
-        return None
-    return target_minutes
+def _output_edit_intensity(project: dict) -> str:
+    value = (project.get("settings") or {}).get("edit_intensity")
+    return value if value in {"light", "normal", "heavy"} else "normal"
 
 
 def _resolve_extra_source_offsets(extra_sources: list[dict]) -> list[int] | None:
@@ -319,6 +594,26 @@ def _resolve_extra_source_offsets(extra_sources: list[dict]) -> list[int] | None
     if not all(offset is not None for offset in offsets):
         raise ValueError("manual offset 을 사용할 때는 모든 extra source 에 offset_ms 를 지정해야 합니다")
     return [int(offset) for offset in offsets]
+
+
+def _local_extra_source_path(
+    temp_dir: Path,
+    extra_source: dict,
+    index: int,
+    used_names: set[str],
+) -> Path:
+    filename = Path(extra_source.get("filename") or f"extra_{index}.mp4").name
+    if not filename:
+        filename = f"extra_{index}.mp4"
+
+    candidate = filename
+    if candidate in used_names:
+        stem = Path(filename).stem or f"extra_{index}"
+        suffix = Path(filename).suffix
+        candidate = f"{stem}_{index}{suffix}"
+
+    used_names.add(candidate)
+    return temp_dir / candidate
 
 
 def _project_json_has_extra_sources(project_json_path: Path) -> bool:
@@ -347,7 +642,10 @@ def _extra_sources_hash(extra_sources: list[dict]) -> str | None:
 
 
 def _is_job_canceled(db, job_id: str) -> bool:
-    row = db.table("jobs").select("status").eq("id", job_id).maybe_single().execute()
+    row = execute_with_retry(
+        lambda: db.table("jobs").select("status").eq("id", job_id).maybe_single().execute(),
+        operation_name=f"jobs.select.cancel_status job_id={job_id}",
+    )
     return bool(row.data and row.data.get("status") in {"cancel_requested", "canceled"})
 
 
@@ -357,10 +655,84 @@ def _raise_if_canceled(db, job_id: str) -> None:
 
 
 def _update_multicam_state(db, project_id: str, **updates) -> None:
-    project = db.table("projects").select("multicam_state").eq("id", project_id).maybe_single().execute()
+    project = execute_with_retry(
+        lambda: db.table("projects").select("multicam_state").eq("id", project_id).maybe_single().execute(),
+        operation_name=f"projects.select.multicam_state project_id={project_id}",
+    )
     state = dict(project.data.get("multicam_state") or {}) if project.data else {}
     state.update(updates)
-    db.table("projects").update({"multicam_state": state}).eq("id", project_id).execute()
+    execute_with_retry(
+        lambda: db.table("projects").update({"multicam_state": state}).eq("id", project_id).execute(),
+        operation_name=f"projects.update.multicam_state project_id={project_id}",
+    )
+
+
+def _multicam_settings_payload(project: dict) -> dict[str, object] | None:
+    settings_value = project.get("settings") or {}
+    if not isinstance(settings_value, dict):
+        return None
+
+    payload: dict[str, object] = {}
+    switching = settings_value.get("multicam_switching")
+    if switching in {"none", "follow_speaker", "conservative_follow_speaker"}:
+        payload["switching"] = str(switching)
+
+    audio_source_key = settings_value.get("audio_source_key")
+    if isinstance(audio_source_key, str) and audio_source_key:
+        payload["audio_source_key"] = audio_source_key
+
+    speaker_source_map = settings_value.get("speaker_source_map")
+    if isinstance(speaker_source_map, dict) and speaker_source_map:
+        payload["speaker_source_map"] = {
+            str(speaker): str(source_key)
+            for speaker, source_key in speaker_source_map.items()
+            if source_key is not None
+        }
+
+    return payload or None
+
+
+def _multicam_export_options(project: dict, temp_dir: Path) -> dict[str, str]:
+    payload = _multicam_settings_payload(project)
+    if not payload:
+        return {}
+
+    options: dict[str, str] = {}
+    switching = payload.get("switching")
+    if isinstance(switching, str):
+        options["multicam_switching"] = switching
+
+    audio_source_key = payload.get("audio_source_key")
+    if isinstance(audio_source_key, str):
+        options["audio_source_key"] = audio_source_key
+
+    speaker_source_map = payload.get("speaker_source_map")
+    if isinstance(speaker_source_map, dict) and speaker_source_map:
+        speaker_map_path = temp_dir / "speaker_source_map.json"
+        speaker_map_path.write_text(
+            json.dumps(speaker_source_map, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        options["speaker_source_map_path"] = str(speaker_map_path)
+
+    return options
+
+
+def _write_multicam_settings_to_project_json(project_json_path: Path, project: dict) -> None:
+    payload = _multicam_settings_payload(project)
+    if not payload:
+        return
+
+    data = json.loads(project_json_path.read_text(encoding="utf-8"))
+    current = data.get("multicam_settings")
+    data["multicam_settings"] = {
+        **(current if isinstance(current, dict) else {}),
+        **payload,
+    }
+    project_json_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _plan_reprocess_steps(
@@ -387,7 +759,10 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
         raise RuntimeError("reprocess job_id is required")
 
     db = get_db()
-    project = db.table("projects").select("*").eq("id", project_id).single().execute().data
+    project = execute_with_retry(
+        lambda: db.table("projects").select("*").eq("id", project_id).single().execute(),
+        operation_name=f"projects.select.reprocess project_id={project_id}",
+    ).data
     user_id = project["user_id"]
 
     def cancel_check() -> bool:
@@ -396,25 +771,50 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
     try:
         _raise_if_canceled(db, job_id)
     except JobCanceled:
-        db.table("jobs").update({
-            "status": "canceled",
-            "progress": 0,
-            "completed_at": "now()",
-        }).eq("id", job_id).execute()
-        db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
+        execute_with_retry(
+            lambda: db.table("jobs").update({
+                "status": "canceled",
+                "progress": 0,
+                "completed_at": "now()",
+            }).eq("id", job_id).execute(),
+            operation_name=f"jobs.update.canceled job_id={job_id}",
+        )
+        execute_with_retry(
+            lambda: db.table("projects").update({"status": "completed"}).eq("id", project_id).execute(),
+            operation_name=f"projects.update.completed project_id={project_id}",
+        )
         _update_multicam_state(db, project_id, status="canceled", job_id=job_id)
         return
 
-    db.table("projects").update({"status": "processing"}).eq("id", project_id).execute()
-    db.table("jobs").update({
-        "status": "running",
-        "progress": 5,
-        "error_message": None,
-    }).eq("id", job_id).execute()
-    _update_multicam_state(db, project_id, status="running", job_id=job_id, error=None)
+    claimed = execute_with_retry(
+        lambda: (
+            db.table("jobs")
+            .update({
+                "status": "running",
+                "progress": 5,
+                "error_message": None,
+                "started_at": "now()",
+                "completed_at": None,
+            })
+            .eq("id", job_id)
+            .eq("project_id", project_id)
+            .in_("status", ["queued", "pending"])
+            .execute()
+        ),
+        operation_name=f"jobs.claim.reprocess job_id={job_id} project_id={project_id}",
+    )
+    if not claimed.data:
+        logger.info("Reprocess job %s for project %s was already claimed or finished", job_id, project_id)
+        return
 
     temp_dir = settings.avid_temp_dir / f"multicam_{project_id}"
     try:
+        execute_with_retry(
+            lambda: db.table("projects").update({"status": "processing"}).eq("id", project_id).execute(),
+            operation_name=f"projects.update.processing project_id={project_id}",
+        )
+        _update_multicam_state(db, project_id, status="running", job_id=job_id, error=None)
+
         _raise_if_canceled(db, job_id)
         temp_dir.mkdir(parents=True, exist_ok=True)
         output_dir = temp_dir / "output"
@@ -439,13 +839,16 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
         stored_project_json = json.loads(project_json_bytes.decode("utf-8"))
         current_project_has_extra_sources = len(stored_project_json.get("source_files") or []) > 1
 
-        eval_result = (
-            db.table("evaluations")
-            .select("segments")
-            .eq("project_id", project_id)
-            .eq("evaluator_id", user_id)
-            .limit(1)
-            .execute()
+        eval_result = execute_with_retry(
+            lambda: (
+                db.table("evaluations")
+                .select("segments")
+                .eq("project_id", project_id)
+                .eq("evaluator_id", user_id)
+                .limit(1)
+                .execute()
+            ),
+            operation_name=f"evaluations.select.segments project_id={project_id}",
         )
         evaluation_payload = eval_result.data[0]["segments"] if eval_result.data else None
         if isinstance(evaluation_payload, dict):
@@ -482,9 +885,9 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
             _raise_if_canceled(db, job_id)
             source_path = str(local_source_path)
 
+            used_extra_names: set[str] = set()
             for i, es in enumerate(project["extra_sources"]):
-                ext = Path(es["filename"]).suffix
-                local_path = temp_dir / f"extra_{i}{ext}"
+                local_path = _local_extra_source_path(temp_dir, es, i, used_extra_names)
                 _raise_if_canceled(db, job_id)
                 r2.download_file(es["r2_key"], str(local_path))
                 _raise_if_canceled(db, job_id)
@@ -496,7 +899,11 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
             current_project_has_extra_sources=_project_json_has_extra_sources(working_project_json),
         )
 
-        db.table("jobs").update({"progress": 25}).eq("id", job_id).execute()
+        execute_with_retry(
+            lambda: db.table("jobs").update({"progress": 25}).eq("id", job_id).execute(),
+            operation_name=f"jobs.update.progress25 job_id={job_id}",
+        )
+        sync_diagnostics_path = None
 
         if "apply-evaluation" in steps:
             eval_output = temp_dir / "01_eval_applied.project.avid.json"
@@ -524,6 +931,7 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
             )
             _raise_if_canceled(db, job_id)
             working_project_json = Path(payload["artifacts"]["project_json"])
+            sync_diagnostics_path = (payload.get("artifacts") or {}).get("sync_diagnostics")
             logger.info("Rebuilt multicam via avid-cli: %s", payload)
         elif "clear-extra-sources" in steps:
             clear_output = temp_dir / "02_cleared.project.avid.json"
@@ -537,14 +945,19 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
             working_project_json = Path(payload["artifacts"]["project_json"])
             logger.info("Cleared extra sources via avid-cli: %s", payload)
 
-        db.table("jobs").update({"progress": 70}).eq("id", job_id).execute()
+        execute_with_retry(
+            lambda: db.table("jobs").update({"progress": 70}).eq("id", job_id).execute(),
+            operation_name=f"jobs.update.progress70 job_id={job_id}",
+        )
 
         _raise_if_canceled(db, job_id)
+        _write_multicam_settings_to_project_json(working_project_json, project)
         payload = avid.export_project(
             project_json_path=str(working_project_json),
             output_dir=str(output_dir),
-            content_mode="cut" if eval_segments else "disabled",
+            content_mode="cut",
             is_canceled=cancel_check,
+            **_multicam_export_options(project, temp_dir),
         )
         _raise_if_canceled(db, job_id)
         artifacts = payload.get("artifacts") or {}
@@ -570,7 +983,6 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
             r2.upload_file(str(srt_path), srt_r2_key, "text/plain")
             new_r2_keys["srt"] = srt_r2_key
 
-        sync_diagnostics_path = artifacts.get("sync_diagnostics")
         if sync_diagnostics_path:
             sync_path = Path(sync_diagnostics_path)
             sync_r2_key = f"results/{project_id}/{sync_path.name}"
@@ -580,44 +992,241 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
         elif "sync_diagnostics" in new_r2_keys:
             new_r2_keys.pop("sync_diagnostics", None)
 
-        db.table("jobs").update({
-            "status": "completed",
-            "progress": 100,
-            "result_r2_keys": new_r2_keys,
-            "completed_at": "now()",
-        }).eq("id", job_id).execute()
+        execute_with_retry(
+            lambda: db.table("jobs").update({
+                "status": "completed",
+                "progress": 100,
+                "result_r2_keys": new_r2_keys,
+                "completed_at": "now()",
+            }).eq("id", job_id).execute(),
+            operation_name=f"jobs.update.completed job_id={job_id}",
+        )
         applied_hash = _extra_sources_hash(project.get("extra_sources") or [])
-        db.table("projects").update({
-            "status": "completed",
-            "multicam_state": {
-                **(project.get("multicam_state") or {}),
-                "status": "applied" if has_extra_sources else "not_applied",
-                "desired_sources_hash": applied_hash,
-                "applied_sources_hash": applied_hash,
-                "source_count": len(project.get("extra_sources") or []),
-                "job_id": job_id,
-                "applied_at": datetime.now(timezone.utc).isoformat(),
-                "error": None,
-            },
-        }).eq("id", project_id).execute()
+        execute_with_retry(
+            lambda: db.table("projects").update({
+                "status": "completed",
+                "multicam_state": {
+                    **(project.get("multicam_state") or {}),
+                    "status": "applied" if has_extra_sources else "not_applied",
+                    "desired_sources_hash": applied_hash,
+                    "applied_sources_hash": applied_hash,
+                    "source_count": len(project.get("extra_sources") or []),
+                    "job_id": job_id,
+                    "applied_at": datetime.now(timezone.utc).isoformat(),
+                    "error": None,
+                },
+            }).eq("id", project_id).execute(),
+            operation_name=f"projects.update.reprocess_completed project_id={project_id}",
+        )
         logger.info("Reprocess completed for project %s", project_id)
     except (JobCanceled, avid.AvidCommandCanceled):
         logger.info("Project reprocess canceled for project %s", project_id)
+        try:
+            execute_with_retry(
+                lambda: db.table("jobs").update({
+                    "status": "canceled",
+                    "completed_at": "now()",
+                }).eq("id", job_id).execute(),
+                operation_name=f"jobs.update.reprocess_canceled job_id={job_id}",
+            )
+            execute_with_retry(
+                lambda: db.table("projects").update({"status": "completed"}).eq("id", project_id).execute(),
+                operation_name=f"projects.update.reprocess_canceled project_id={project_id}",
+            )
+            _update_multicam_state(db, project_id, status="canceled", job_id=job_id, error=None)
+        except Exception:
+            logger.exception("Failed to persist reprocess cancellation state for project %s job %s", project_id, job_id)
+    except Exception as exc:
+        logger.exception("Project reprocess failed for project %s", project_id)
+        try:
+            execute_with_retry(
+                lambda: db.table("jobs").update({
+                    "status": "failed",
+                    "error_message": str(exc)[:1000],
+                    "completed_at": "now()",
+                }).eq("id", job_id).execute(),
+                operation_name=f"jobs.update.reprocess_failed job_id={job_id}",
+            )
+            execute_with_retry(
+                lambda: db.table("projects").update({"status": "reprocess_failed"}).eq("id", project_id).execute(),
+                operation_name=f"projects.update.reprocess_failed project_id={project_id}",
+            )
+            _update_multicam_state(db, project_id, status="failed", job_id=job_id, error=str(exc)[:1000])
+        except Exception:
+            logger.exception("Failed to persist reprocess failure state for project %s job %s", project_id, job_id)
+        raise
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _format_srt_timestamp(ms: int) -> str:
+    ms = max(0, int(ms))
+    hours = ms // 3_600_000
+    minutes = (ms % 3_600_000) // 60_000
+    seconds = (ms % 60_000) // 1000
+    millis = ms % 1000
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
+def _write_transcription_srt_from_project_json(project_json_path: Path, output_path: Path) -> None:
+    project_data = json.loads(project_json_path.read_text(encoding="utf-8"))
+    transcription = project_data.get("transcription") or {}
+    segments = transcription.get("segments") or []
+
+    lines: list[str] = []
+    cue_index = 1
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        text = str(segment.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            start_ms = int(round(float(segment.get("start_ms"))))
+            end_ms = int(round(float(segment.get("end_ms"))))
+        except (TypeError, ValueError):
+            continue
+        if end_ms <= start_ms:
+            continue
+
+        lines.extend([
+            str(cue_index),
+            f"{_format_srt_timestamp(start_ms)} --> {_format_srt_timestamp(end_ms)}",
+            text,
+            "",
+        ])
+        cue_index += 1
+
+    if not lines:
+        raise RuntimeError("프로젝트 JSON에 재사용할 transcription segment가 없습니다")
+    output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _cut_decision_project(project_id: str, job_id: str | None) -> None:
+    import shutil
+
+    if not job_id:
+        raise RuntimeError("cut decision job_id is required")
+
+    db = get_db()
+    temp_dir = settings.avid_temp_dir / f"cut_decision_{project_id}_{job_id[:8]}"
+    previous_project_status = "completed"
+
+    try:
+        claimed = (
+            db.table("jobs")
+            .update({
+                "status": "running",
+                "progress": 0,
+                "error_message": None,
+                "started_at": "now()",
+                "completed_at": None,
+                "pipeline_stages": _cut_decision_pipeline_stages("reuse_segments", 1),
+            })
+            .eq("id", job_id)
+            .eq("project_id", project_id)
+            .in_("status", ["queued", "pending"])
+            .execute()
+        )
+        if not claimed.data:
+            logger.info("Cut decision job %s for project %s was already claimed or finished", job_id, project_id)
+            return
+
+        project = db.table("projects").select("*").eq("id", project_id).single().execute().data
+        if not project:
+            raise RuntimeError("프로젝트를 찾을 수 없습니다")
+        previous_project_status = str(project.get("status") or "completed")
+        db.table("projects").update({"status": "processing"}).eq("id", project_id).execute()
+
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = temp_dir / "output"
+        output_dir.mkdir(exist_ok=True)
+
+        completed_job = get_latest_artifact_job(db, project_id, select="id, result_r2_keys, type, created_at")
+        if not completed_job:
+            raise RuntimeError("완료된 기준 산출물이 없습니다")
+
+        base_r2_keys = dict(completed_job["result_r2_keys"])
+        project_json_key = base_r2_keys.get("project_json")
+        if not project_json_key:
+            raise RuntimeError("프로젝트 JSON이 없어 cut decision만 다시 실행할 수 없습니다")
+
+        local_project_json = temp_dir / "input.project.avid.json"
+        r2.download_file(project_json_key, str(local_project_json))
+        srt_path = temp_dir / "source.refined.srt"
+        _write_transcription_srt_from_project_json(local_project_json, srt_path)
+
+        storyline_path: Path | None = None
+        storyline_key = base_r2_keys.get("storyline")
+        if storyline_key:
+            storyline_path = temp_dir / "storyline.json"
+            r2.download_file(storyline_key, str(storyline_path))
+
+        source_r2_key = project.get("source_r2_key")
+        if not source_r2_key:
+            raise RuntimeError("원본 소스 정보가 없어 cut decision을 다시 실행할 수 없습니다")
+        source_ext = Path(project.get("source_filename") or "source.mp4").suffix or ".mp4"
+        source_path = temp_dir / f"source{source_ext}"
+        r2.download_file(source_r2_key, str(source_path))
+
+        extra_source_paths: list[str] = []
+        used_extra_names: set[str] = set()
+        for i, extra_source in enumerate(project.get("extra_sources") or []):
+            local_extra_path = _local_extra_source_path(temp_dir, extra_source, i, used_extra_names)
+            r2.download_file(extra_source["r2_key"], str(local_extra_path))
+            extra_source_paths.append(str(local_extra_path))
+
+        _update_cut_decision_progress(db, job_id, 25, "edit_decision", 1)
+
+        llm_log_path = output_dir / "llm_io.jsonl"
+        cut_fn = avid.subtitle_cut if project["cut_type"] == "subtitle_cut" else avid.podcast_cut
+        result_paths = cut_fn(
+            source_path=str(source_path),
+            srt_path=str(srt_path),
+            context_path=str(storyline_path) if storyline_path else None,
+            output_dir=str(output_dir),
+            final=True,
+            extra_sources=extra_source_paths or None,
+            edit_intensity=_output_edit_intensity(project),
+            llm_log_path=str(llm_log_path),
+        )
+        if llm_log_path.exists() and llm_log_path.stat().st_size > 0:
+            result_paths["llm_io_log"] = str(llm_log_path)
+
+        _update_cut_decision_progress(db, job_id, 75, "upload_results", 1)
+
+        new_r2_keys = dict(base_r2_keys)
+        for key, local_path in result_paths.items():
+            content_type = _guess_content_type(key)
+            r2_key = f"results/{project_id}/cut_decision_{job_id[:8]}_{Path(local_path).name}"
+            r2.upload_file(local_path, r2_key, content_type)
+            new_r2_keys[key] = r2_key
+        if "sync_diagnostics" not in result_paths:
+            new_r2_keys.pop("sync_diagnostics", None)
+
+        if "report" in result_paths:
+            report_text = Path(result_paths["report"]).read_text(encoding="utf-8")
+            db.table("edit_reports").delete().eq("project_id", project_id).execute()
+            _save_report(db, project_id, int(project.get("source_duration_seconds") or 0), report_text)
+
         db.table("jobs").update({
-            "status": "canceled",
+            "status": "completed",
+            "progress": 100,
+            "pipeline_stages": _cut_decision_pipeline_stages(completed=True),
+            "result_r2_keys": new_r2_keys,
             "completed_at": "now()",
         }).eq("id", job_id).execute()
         db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
-        _update_multicam_state(db, project_id, status="canceled", job_id=job_id, error=None)
+        logger.info("Cut decision rerun completed for project %s", project_id)
     except Exception as exc:
-        logger.exception("Project reprocess failed for project %s", project_id)
+        logger.exception("Cut decision rerun failed for project %s", project_id)
         db.table("jobs").update({
             "status": "failed",
             "error_message": str(exc)[:1000],
+            "pipeline_stages": _cut_decision_pipeline_stages("edit_decision", failed=True),
             "completed_at": "now()",
         }).eq("id", job_id).execute()
-        db.table("projects").update({"status": "reprocess_failed"}).eq("id", project_id).execute()
-        _update_multicam_state(db, project_id, status="failed", job_id=job_id, error=str(exc)[:1000])
+        db.table("projects").update({"status": previous_project_status}).eq("id", project_id).execute()
         raise
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -633,19 +1242,56 @@ def _fcpxml_time_seconds(value: str | None) -> float:
     return float(raw)
 
 
+def _multicam_angle_offsets(root: ET.Element) -> dict[str, dict[str, float]]:
+    offsets_by_media: dict[str, dict[str, float]] = {}
+    for media in root.findall("./resources/media"):
+        media_id = media.get("id")
+        multicam = media.find("multicam")
+        if not media_id or multicam is None:
+            continue
+
+        angle_offsets: dict[str, float] = {}
+        for angle in multicam.findall("mc-angle"):
+            angle_id = angle.get("angleID")
+            angle_clip = angle.find("asset-clip")
+            if not angle_id or angle_clip is None:
+                continue
+            angle_offsets[angle_id] = _fcpxml_time_seconds(angle_clip.get("offset"))
+        offsets_by_media[media_id] = angle_offsets
+    return offsets_by_media
+
+
+def _source_start_seconds_from_clip(
+    clip: ET.Element,
+    multicam_offsets: dict[str, dict[str, float]],
+) -> float:
+    start = _fcpxml_time_seconds(clip.get("start"))
+    if clip.tag != "mc-clip":
+        return start
+
+    mc_source = clip.find("mc-source")
+    angle_id = mc_source.get("angleID") if mc_source is not None else None
+    if not angle_id:
+        return start
+
+    angle_offsets = multicam_offsets.get(clip.get("ref") or "", {})
+    return max(0.0, start - angle_offsets.get(angle_id, 0.0))
+
+
 def _primary_intervals_from_fcpxml(fcpxml_path: Path) -> list[tuple[float, float]]:
     root = ET.parse(fcpxml_path).getroot()
     spine = root.find("./library/event/project/sequence/spine")
     if spine is None:
         return []
 
+    multicam_offsets = _multicam_angle_offsets(root)
     intervals: list[tuple[float, float]] = []
     for clip in list(spine):
-        if clip.tag != "asset-clip" or clip.get("lane") is not None:
+        if clip.tag not in {"asset-clip", "mc-clip"} or clip.get("lane") is not None:
             continue
         if clip.get("enabled") == "0":
             continue
-        start = _fcpxml_time_seconds(clip.get("start"))
+        start = _source_start_seconds_from_clip(clip, multicam_offsets)
         duration = _fcpxml_time_seconds(clip.get("duration"))
         if duration > 0:
             intervals.append((start, duration))
@@ -673,7 +1319,28 @@ def _has_audio_stream(source_path: Path) -> bool:
     return result.returncode == 0 and bool(result.stdout.strip())
 
 
-def _render_intervals(source_path: Path, intervals: list[tuple[float, float]], output_path: Path) -> None:
+def _probe_duration_ms(path: Path) -> int:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe duration failed for {path}: {result.stderr[-500:]}")
+    return int(round(float(result.stdout.strip()) * 1000))
+
+
+def _render_intervals(source_path: Path, intervals: list[tuple[float, float]], output_path: Path) -> dict:
     """Render keep intervals without building one large ffmpeg filter graph.
 
     A single trim/atrim/concat graph keeps many decoded streams alive at once and
@@ -686,6 +1353,8 @@ def _render_intervals(source_path: Path, intervals: list[tuple[float, float]], o
     has_audio = _has_audio_stream(source_path)
 
     segment_paths: list[Path] = []
+    manifest_intervals: list[dict] = []
+    preview_cursor_ms = 0
     for index, (start, duration) in enumerate(intervals):
         if duration <= 0:
             continue
@@ -729,6 +1398,19 @@ def _render_intervals(source_path: Path, intervals: list[tuple[float, float]], o
                 f"final preview segment render failed at interval {index + 1}/{len(intervals)} "
                 f"(start={start:.3f}s, duration={duration:.3f}s): {result.stderr[-1000:]}"
             )
+        actual_duration_ms = _probe_duration_ms(segment_path)
+        source_start_ms = int(round(start * 1000))
+        requested_duration_ms = int(round(duration * 1000))
+        source_end_ms = source_start_ms + requested_duration_ms
+        manifest_intervals.append({
+            "source_start_ms": source_start_ms,
+            "source_end_ms": source_end_ms,
+            "requested_duration_ms": requested_duration_ms,
+            "actual_duration_ms": actual_duration_ms,
+            "preview_start_ms": preview_cursor_ms,
+            "preview_end_ms": preview_cursor_ms + actual_duration_ms,
+        })
+        preview_cursor_ms += actual_duration_ms
         segment_paths.append(segment_path)
 
     if not segment_paths:
@@ -761,6 +1443,7 @@ def _render_intervals(source_path: Path, intervals: list[tuple[float, float]], o
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
     if result.returncode != 0:
         raise RuntimeError(f"final preview concat failed: {result.stderr[-1000:]}")
+    return {"version": 1, "intervals": manifest_intervals}
 
 
 def _burn_subtitles(input_path: Path, srt_path: Path | None, output_path: Path) -> None:
@@ -812,6 +1495,69 @@ def _write_webvtt_from_srt(srt_path: Path | None, output_path: Path) -> None:
     output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
+def _format_webvtt_time(ms: int | float) -> str:
+    total_ms = max(0, int(round(ms)))
+    hours = total_ms // 3_600_000
+    minutes = (total_ms % 3_600_000) // 60_000
+    seconds = (total_ms % 60_000) // 1000
+    millis = total_ms % 1000
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
+
+
+def _write_final_preview_webvtt_from_source_segments(
+    applied_project_json: Path,
+    render_manifest: dict,
+    output_path: Path,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    project_data = json.loads(applied_project_json.read_text(encoding="utf-8"))
+    transcription = project_data.get("transcription") or {}
+    source_segments = transcription.get("segments") or []
+    render_intervals = render_manifest.get("intervals") or []
+
+    lines = ["WEBVTT", ""]
+    cue_index = 1
+    for segment in source_segments:
+        try:
+            cue_start_ms = int(segment.get("start_ms"))
+            cue_end_ms = int(segment.get("end_ms"))
+        except (TypeError, ValueError):
+            continue
+        text = str(segment.get("text") or "").strip()
+        if not text or cue_end_ms <= cue_start_ms:
+            continue
+
+        for interval in render_intervals:
+            source_start_ms = int(interval.get("source_start_ms") or 0)
+            source_end_ms = int(interval.get("source_end_ms") or 0)
+            requested_duration_ms = int(interval.get("requested_duration_ms") or 0)
+            actual_duration_ms = int(interval.get("actual_duration_ms") or 0)
+            preview_start_ms = int(interval.get("preview_start_ms") or 0)
+            if source_end_ms <= source_start_ms or requested_duration_ms <= 0 or actual_duration_ms <= 0:
+                continue
+
+            overlap_start_ms = max(cue_start_ms, source_start_ms)
+            overlap_end_ms = min(cue_end_ms, source_end_ms)
+            if overlap_end_ms <= overlap_start_ms:
+                continue
+
+            scale = actual_duration_ms / requested_duration_ms
+            mapped_start_ms = preview_start_ms + (overlap_start_ms - source_start_ms) * scale
+            mapped_end_ms = preview_start_ms + (overlap_end_ms - source_start_ms) * scale
+            if mapped_end_ms <= mapped_start_ms:
+                mapped_end_ms = mapped_start_ms + 1
+
+            lines.append(str(cue_index))
+            lines.append(
+                f"{_format_webvtt_time(mapped_start_ms)} --> {_format_webvtt_time(mapped_end_ms)}"
+            )
+            lines.append(text)
+            lines.append("")
+            cue_index += 1
+
+    output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
 def _get_cached_source_video(project: dict, temp_dir: Path) -> Path:
     source_ext = Path(project.get("source_filename") or "source.mp4").suffix or ".mp4"
     cached_path = source_cache_path(project["source_r2_key"], source_ext)
@@ -840,6 +1586,32 @@ def _render_final_preview(project_id: str, job_id: str | None) -> None:
             raise RuntimeError("final preview job not found")
         if job["status"] == "canceled":
             return
+        if job["status"] == "completed":
+            logger.info("Final preview job %s for project %s is already completed", job_id, project_id)
+            return
+
+        claimed = (
+            db.table("jobs")
+            .update({
+                "status": "running",
+                "progress": 0,
+                "error_message": None,
+                "started_at": "now()",
+                "completed_at": None,
+            })
+            .eq("id", job_id)
+            .eq("project_id", project_id)
+            .in_("status", ["queued", "pending"])
+            .execute()
+        )
+        if not claimed.data:
+            logger.info(
+                "Final preview job %s for project %s was already claimed or finished",
+                job_id,
+                project_id,
+            )
+            return
+        logger.info("Rendering final preview job %s for project %s", job_id, project_id)
 
         project = db.table("projects").select("*").eq("id", project_id).single().execute().data
         if not project:
@@ -847,9 +1619,12 @@ def _render_final_preview(project_id: str, job_id: str | None) -> None:
 
         evaluation_payload = job.get("input_payload") or {}
         existing_result_keys = job.get("result_r2_keys") or {}
-        hash_value = existing_result_keys.get("decision_hash") or decision_hash(evaluation_payload)
+        hash_value = existing_result_keys.get("decision_hash") or final_preview_decision_hash(evaluation_payload)
         cache_token = existing_result_keys.get("cache_token") or new_cache_token()
-        cache_video_path, cache_captions_path = preview_cache_paths(project_id, hash_value)
+        cache_video_path, cache_captions_path, cache_timeline_map_path = preview_cache_paths(
+            project_id,
+            hash_value,
+        )
 
         if preview_cache_ready(project_id, hash_value):
             db.table("jobs").update({
@@ -908,32 +1683,44 @@ def _render_final_preview(project_id: str, job_id: str | None) -> None:
             output_dir=str(output_dir),
             silence_mode="cut",
             content_mode="cut",
+            **_multicam_export_options(project, temp_dir),
         )
         artifacts = export_payload.get("artifacts") or {}
         fcpxml_path = Path(artifacts["fcpxml"])
-        srt_path = Path(artifacts["srt"]) if artifacts.get("srt") else None
         intervals = _primary_intervals_from_fcpxml(fcpxml_path)
         if not intervals:
             raise RuntimeError("미리보기로 렌더링할 keep 구간이 없습니다")
-        duration_ms = int(sum(duration for _, duration in intervals) * 1000)
         db.table("jobs").update({"progress": 50}).eq("id", job_id).execute()
 
         source_path = _get_cached_source_video(project, temp_dir)
 
         no_subs_path = output_dir / "final_preview_no_subs.mp4"
-        _render_intervals(source_path, intervals, no_subs_path)
+        render_manifest = _render_intervals(source_path, intervals, no_subs_path)
+        duration_ms = int((render_manifest.get("intervals") or [])[-1]["preview_end_ms"])
         db.table("jobs").update({"progress": 80}).eq("id", job_id).execute()
 
         captions_tmp_path = output_dir / "captions.vtt"
-        _write_webvtt_from_srt(srt_path, captions_tmp_path)
+        _write_final_preview_webvtt_from_source_segments(
+            applied_project_json,
+            render_manifest,
+            captions_tmp_path,
+        )
+        timeline_map_tmp_path = output_dir / "timeline_map.json"
+        timeline_map_tmp_path.write_text(
+            json.dumps(render_manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
         cache_video_path.parent.mkdir(parents=True, exist_ok=True)
         video_tmp_path = cache_video_path.with_suffix(".mp4.tmp")
         captions_cache_tmp_path = cache_captions_path.with_suffix(".vtt.tmp")
+        timeline_map_cache_tmp_path = cache_timeline_map_path.with_suffix(".json.tmp")
         shutil.move(str(no_subs_path), str(video_tmp_path))
         shutil.move(str(captions_tmp_path), str(captions_cache_tmp_path))
+        shutil.move(str(timeline_map_tmp_path), str(timeline_map_cache_tmp_path))
         video_tmp_path.replace(cache_video_path)
         captions_cache_tmp_path.replace(cache_captions_path)
+        timeline_map_cache_tmp_path.replace(cache_timeline_map_path)
 
         db.table("jobs").update({
             "status": "completed",
@@ -958,6 +1745,324 @@ def _render_final_preview(project_id: str, job_id: str | None) -> None:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def _register_source_identity(
+    db,
+    *,
+    project_id: str,
+    project: dict,
+    source_path: str,
+) -> str:
+    path = Path(source_path)
+    source_sha256 = source_cache.sha256_file(path)
+    source_size_bytes = path.stat().st_size
+    expected_sha256 = project.get("source_sha256")
+    if expected_sha256 and expected_sha256 != source_sha256:
+        raise RuntimeError("업로드된 원본 파일 해시가 프로젝트 생성 시 계산한 값과 다릅니다")
+
+    db.table("projects").update({
+        "source_sha256": source_sha256,
+        "source_size_bytes": source_size_bytes,
+    }).eq("id", project_id).execute()
+    project["source_sha256"] = source_sha256
+    project["source_size_bytes"] = source_size_bytes
+
+    source_cache.upsert_source_asset(
+        db,
+        sha256=source_sha256,
+        size_bytes=source_size_bytes,
+        r2_key=project["source_r2_key"],
+        filename=project.get("source_filename"),
+        duration_seconds=project.get("source_duration_seconds"),
+    )
+    return source_sha256
+
+
+def _transcribe_with_scribe_v2_cache(
+    db,
+    *,
+    job_id: str,
+    project: dict,
+    source_path: str,
+    output_dir: Path,
+    source_sha256: str,
+    language: str,
+    transcription_context: str | None,
+    diarize: bool,
+    tag_audio_events: bool,
+    num_speakers: int | None,
+    use_llm_segmentation: bool,
+    use_llm_refinement: bool,
+    bypass_llm_segmentation_cache: bool,
+    llm_log_path: Path | None = None,
+) -> chalna.TranscriptionSrtResult:
+    source = Path(source_path)
+    source_size_bytes = int(project.get("source_size_bytes") or source.stat().st_size)
+    cache_params = scribe_v2_cache.ScribeV2CacheParams(
+        source_sha256=source_sha256,
+        source_size_bytes=source_size_bytes,
+        language=language or "",
+        diarize=diarize,
+        num_speakers=num_speakers,
+        tag_audio_events=tag_audio_events,
+    )
+    cache_key = scribe_v2_cache.build_scribe_v2_cache_key(cache_params)
+    raw_json_local = output_dir / "source.scribe.raw.json"
+    raw_srt_local = output_dir / "source.scribe.raw.srt"
+
+    entry = scribe_v2_cache.get_cache_entry(db, cache_key)
+    cache_owner = False
+    if entry and entry.get("status") == "completed":
+        _download_completed_scribe_cache(db, entry, raw_json_local, raw_srt_local)
+        _write_scribe_cache_pipeline_status(
+            db,
+            job_id,
+            use_llm_segmentation=use_llm_segmentation,
+            use_llm_refinement=use_llm_refinement,
+            detail="동일 파일 raw Scribe V2 캐시 사용",
+            completed=True,
+        )
+    elif entry and entry.get("status") == "running":
+        _write_scribe_cache_pipeline_status(
+            db,
+            job_id,
+            use_llm_segmentation=use_llm_segmentation,
+            use_llm_refinement=use_llm_refinement,
+            detail="동일 파일 raw Scribe V2 캐시 생성 대기 중",
+            completed=False,
+        )
+        entry = scribe_v2_cache.wait_for_running_entry(db, cache_key=cache_key)
+        if entry.get("status") != "completed":
+            raise RuntimeError(entry.get("error_message") or "Scribe V2 cache generation failed")
+        _download_completed_scribe_cache(db, entry, raw_json_local, raw_srt_local)
+    elif entry and entry.get("status") == "failed":
+        raise RuntimeError(entry.get("error_message") or "Scribe V2 cache entry is failed")
+    else:
+        cache_owner = scribe_v2_cache.create_running_entry(
+            db,
+            cache_key=cache_key,
+            params=cache_params,
+        ) is not None
+        if not cache_owner:
+            entry = scribe_v2_cache.wait_for_running_entry(db, cache_key=cache_key)
+            if entry.get("status") != "completed":
+                raise RuntimeError(entry.get("error_message") or "Scribe V2 cache generation failed")
+            _download_completed_scribe_cache(db, entry, raw_json_local, raw_srt_local)
+
+    if cache_owner:
+        try:
+            raw_result = chalna.transcribe_raw_scribe_to_files(
+                source_path,
+                language=language,
+                output_dir=str(output_dir),
+                diarize=diarize,
+                tag_audio_events=tag_audio_events,
+                num_speakers=num_speakers,
+                on_status=lambda payload: _update_chalna_pipeline_status(
+                    db,
+                    job_id,
+                    {
+                        **payload,
+                        "use_llm_segmentation": False,
+                        "use_llm_refinement": False,
+                    },
+                ),
+            )
+            raw_json_key = scribe_v2_cache.raw_json_r2_key(cache_key)
+            raw_srt_key = scribe_v2_cache.raw_srt_r2_key(cache_key)
+            r2.upload_file(raw_result.raw_json_path, raw_json_key, "application/json")
+            r2.upload_file(raw_result.raw_srt_path, raw_srt_key, "text/plain")
+            scribe_v2_cache.mark_cache_completed(
+                db,
+                cache_key=cache_key,
+                raw_json_key=raw_json_key,
+                raw_srt_key=raw_srt_key,
+                external_task_id=raw_result.external_task_id,
+            )
+            raw_json_local = Path(raw_result.raw_json_path)
+            raw_srt_local = Path(raw_result.raw_srt_path)
+        except Exception as exc:
+            scribe_v2_cache.mark_cache_failed(db, cache_key=cache_key, error_message=str(exc))
+            raise
+
+    if not use_llm_segmentation and not use_llm_refinement:
+        output_path = output_dir / "source.srt"
+        output_path.write_text(raw_srt_local.read_text(encoding="utf-8"), encoding="utf-8")
+        _write_scribe_cache_pipeline_status(
+            db,
+            job_id,
+            use_llm_segmentation=False,
+            use_llm_refinement=False,
+            detail="raw Scribe V2 결과 사용",
+            completed=True,
+        )
+        return chalna.TranscriptionSrtResult(
+            srt_path=str(output_path),
+            external_task_id="",
+            metadata={"segmentation_source": "heuristic"},
+            segmentation_log=[],
+            processing_metadata={
+                "segmentation_source": "heuristic",
+                "segmentation_mode": "heuristic",
+                "segmentation_label": "Heuristic",
+                "fallback": False,
+                "cache_hit": False,
+                "cache_bypassed": False,
+            },
+        )
+
+    return chalna.transcribe_from_scribe_response_to_srt(
+        source_path,
+        str(raw_json_local),
+        language=language,
+        output_dir=str(output_dir),
+        context=transcription_context,
+        diarize=diarize,
+        tag_audio_events=tag_audio_events,
+        num_speakers=num_speakers,
+        use_llm_segmentation=use_llm_segmentation,
+        use_llm_refinement=use_llm_refinement,
+        bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
+        llm_log_path=str(llm_log_path) if llm_log_path else None,
+        on_status=lambda payload: _update_chalna_pipeline_status(
+            db,
+            job_id,
+            {
+                **payload,
+                "use_llm_segmentation": use_llm_segmentation,
+                "use_llm_refinement": use_llm_refinement,
+            },
+        ),
+    )
+
+
+def _download_completed_scribe_cache(
+    db,
+    entry: dict,
+    raw_json_local: Path,
+    raw_srt_local: Path,
+) -> None:
+    raw_json_key = entry.get("raw_json_r2_key")
+    raw_srt_key = entry.get("raw_srt_r2_key")
+    if not raw_json_key or not raw_srt_key:
+        raise RuntimeError("Scribe V2 cache entry is completed but missing raw artifacts")
+    r2.download_file(raw_json_key, str(raw_json_local))
+    r2.download_file(raw_srt_key, str(raw_srt_local))
+    scribe_v2_cache.record_cache_hit(db, entry)
+
+
+def _download_reused_transcription_srt(
+    db,
+    *,
+    job_id: str,
+    project_settings: dict,
+    output_dir: Path,
+) -> chalna.TranscriptionSrtResult | None:
+    srt_key = project_settings.get("reused_transcription_srt_r2_key")
+    if not isinstance(srt_key, str) or not srt_key:
+        return None
+
+    srt_path = output_dir / "source.srt"
+    try:
+        r2.download_file(srt_key, str(srt_path))
+    except Exception:
+        logger.exception("Failed to reuse transcription SRT %s for job %s", srt_key, job_id)
+        _write_reused_transcription_pipeline_status(
+            db,
+            job_id,
+            status="running",
+            progress=1,
+            detail="기존 자막 재사용 실패, Scribe cache 경로 사용",
+        )
+        return None
+
+    _write_reused_transcription_pipeline_status(
+        db,
+        job_id,
+        status="completed",
+        progress=100,
+        detail="부모 프로젝트의 LLM-refined SRT를 사용",
+    )
+    logger.info(
+        "Reused transcription SRT for job %s from project %s job %s",
+        job_id,
+        project_settings.get("reused_transcription_from_project_id"),
+        project_settings.get("reused_transcription_from_job_id"),
+    )
+    return chalna.TranscriptionSrtResult(
+        srt_path=str(srt_path),
+        external_task_id="",
+        metadata={"segmentation_source": "reused"},
+        segmentation_log=[],
+        processing_metadata={
+            "segmentation_source": "reused",
+            "segmentation_mode": "reused_srt",
+            "segmentation_label": "Reused SRT",
+            "fallback": False,
+            "cache_hit": False,
+            "cache_bypassed": False,
+            "reused_from_project_id": project_settings.get("reused_transcription_from_project_id"),
+            "reused_from_job_id": project_settings.get("reused_transcription_from_job_id"),
+        },
+    )
+
+
+def _write_reused_transcription_pipeline_status(
+    db,
+    job_id: str,
+    *,
+    status: str,
+    progress: int,
+    detail: str,
+) -> None:
+    stages = _initial_pipeline_stages(use_llm_refinement=False)
+    stages[0].update({
+        "status": "completed",
+        "progress": 100,
+        "detail": "미디어 검증 완료",
+    })
+    stages[1].update({
+        "id": "reused_transcription_srt",
+        "label": "기존 자막 재사용",
+        "status": status,
+        "progress": progress,
+        "detail": detail,
+    })
+    db.table("jobs").update({
+        "pipeline_stages": stages,
+        "progress": 30 if status == "completed" else 10,
+    }).eq("id", job_id).execute()
+
+
+def _write_scribe_cache_pipeline_status(
+    db,
+    job_id: str,
+    *,
+    use_llm_segmentation: bool,
+    use_llm_refinement: bool,
+    detail: str,
+    completed: bool,
+) -> None:
+    stages = _initial_pipeline_stages(
+        use_llm_segmentation=use_llm_segmentation,
+        use_llm_refinement=use_llm_refinement,
+    )
+    stages[0].update({
+        "status": "completed",
+        "progress": 100,
+        "detail": "미디어 검증 완료",
+    })
+    stages[1].update({
+        "label": "Scribe V2 cache",
+        "status": "completed" if completed else "running",
+        "progress": 100 if completed else 1,
+        "detail": detail,
+    })
+    db.table("jobs").update({
+        "pipeline_stages": stages,
+        "progress": 30 if completed else 10,
+    }).eq("id", job_id).execute()
+
+
 def _update_progress(db, job_id: str, progress: int) -> None:
     db.table("jobs").update({"progress": progress}).eq("id", job_id).execute()
 
@@ -977,6 +2082,77 @@ def _optional_int_project_setting(settings_value: dict, key: str) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _cut_decision_pipeline_stages(
+    current_stage: str | None = None,
+    stage_progress: int = 0,
+    *,
+    failed: bool = False,
+    completed: bool = False,
+) -> list[dict[str, object]]:
+    definitions = [
+        (
+            "reuse_segments",
+            "기존 segment/refine 재사용",
+            "저장된 refined segment 확인 대기 중",
+            "저장된 refined segment 확인 중",
+            "저장된 refined segment 재사용",
+        ),
+        (
+            "edit_decision",
+            "Cut decision 재실행",
+            "cut decision 생성 대기 중",
+            "cut decision 생성 중",
+            "cut decision 생성 완료",
+        ),
+        (
+            "upload_results",
+            "결과 저장",
+            "새 편집 결과 저장 대기 중",
+            "새 편집 결과 저장 중",
+            "새 편집 결과 저장 완료",
+        ),
+    ]
+    current_index = next(
+        (index for index, item in enumerate(definitions) if item[0] == current_stage),
+        -1,
+    )
+    stages: list[dict[str, object]] = []
+    for index, (stage_id, label, pending_detail, running_detail, completed_detail) in enumerate(definitions):
+        stage: dict[str, object] = {
+            "id": stage_id,
+            "label": label,
+            "status": "pending",
+            "progress": 0,
+            "detail": pending_detail,
+        }
+        if completed or (current_index >= 0 and index < current_index):
+            stage.update({"status": "completed", "progress": 100, "detail": completed_detail})
+        elif current_stage == stage_id:
+            if failed:
+                stage.update({"status": "failed", "progress": max(1, stage_progress), "detail": "처리 실패"})
+            else:
+                stage.update({
+                    "status": "running",
+                    "progress": max(1, min(100, int(stage_progress))),
+                    "detail": running_detail,
+                })
+        stages.append(stage)
+    return stages
+
+
+def _update_cut_decision_progress(
+    db,
+    job_id: str,
+    progress: int,
+    current_stage: str,
+    stage_progress: int,
+) -> None:
+    db.table("jobs").update({
+        "progress": progress,
+        "pipeline_stages": _cut_decision_pipeline_stages(current_stage, stage_progress),
+    }).eq("id", job_id).execute()
 
 
 def _initial_pipeline_stages(
@@ -1089,9 +2265,24 @@ def _build_chalna_pipeline_stages(payload: dict[str, object]) -> list[dict[str, 
         if (use_llm_segmentation if isinstance(use_llm_segmentation, bool) else True)
         else "Scribe V2 전사 완료"
     )
+    transcribing_entry = latest.get("transcribing")
+    segmentation_enabled = use_llm_segmentation if isinstance(use_llm_segmentation, bool) else True
+    if (
+        isinstance(transcribing_entry, dict)
+        and transcribing_entry.get("cache_hit") is True
+        and transcribing_entry.get("source") == "provided_scribe_response"
+    ):
+        if segmentation_enabled:
+            stages[1]["label"] = "Scribe V2 cache + LLM segmentation"
+            transcribing_running_detail = "캐시된 raw Scribe V2 결과로 자막 구간 나누기 진행 중"
+            transcribing_completed_detail = "동일 파일 raw Scribe V2 캐시 사용 및 자막 구간 나누기 완료"
+        else:
+            stages[1]["label"] = "Scribe V2 cache"
+            transcribing_running_detail = "캐시된 raw Scribe V2 결과 사용 중"
+            transcribing_completed_detail = "동일 파일 raw Scribe V2 캐시 사용"
     _apply_stage(
         stages[1],
-        latest.get("transcribing"),
+        transcribing_entry,
         running=current_stage == "transcribing",
         completed=current_rank > 1 or "refining" in latest or status == "completed",
         failed=status == "failed" and current_stage == "transcribing",
@@ -1227,6 +2418,7 @@ def _guess_content_type(key: str) -> str:
         "project_json": "application/json",
         "storyline": "application/json",
         "sync_diagnostics": "application/json",
+        "llm_io_log": "application/x-ndjson",
         "preview": "video/mp4",
     }
     return types.get(key, "application/octet-stream")

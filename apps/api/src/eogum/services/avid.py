@@ -32,13 +32,24 @@ def _apply_provider_args(args: list[str]) -> list[str]:
     return updated
 
 
-def _build_avid_env() -> dict[str, str]:
+def _llm_log_env(llm_log_path: str | None, stage: str) -> dict[str, str] | None:
+    if not llm_log_path:
+        return None
+    return {
+        "AVID_LLM_IO_LOG_PATH": llm_log_path,
+        "AVID_LLM_IO_STAGE": stage,
+    }
+
+
+def _build_avid_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
     avid_bin_dir = str(settings.resolved_avid_bin.parent)
     current_path = env.get("PATH", "")
     env["PATH"] = f"{avid_bin_dir}:{current_path}" if current_path else avid_bin_dir
     env["HOME"] = env.get("HOME") or str(Path.home())
     env["CHALNA_API_URL"] = settings.chalna_url
+    if extra_env:
+        env.update({key: value for key, value in extra_env.items() if value is not None})
     return env
 
 
@@ -46,6 +57,7 @@ def _run_avid(
     args: list[str],
     timeout: int = 3600,
     is_canceled: Callable[[], bool] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run an avid-cli command."""
     cmd = [str(settings.resolved_avid_bin)] + args
@@ -61,7 +73,7 @@ def _run_avid(
             stderr=stderr_file,
             text=True,
             start_new_session=True,
-            env=_build_avid_env(),
+            env=_build_avid_env(extra_env),
         )
         deadline = time.monotonic() + timeout
 
@@ -125,11 +137,12 @@ def _run_avid_json(
     args: list[str],
     timeout: int = 3600,
     is_canceled: Callable[[], bool] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     if "--json" not in args:
         args = [*args, "--json"]
 
-    result = _run_avid(args, timeout=timeout, is_canceled=is_canceled)
+    result = _run_avid(args, timeout=timeout, is_canceled=is_canceled, extra_env=extra_env)
     stdout = result.stdout.strip()
 
     try:
@@ -206,13 +219,21 @@ def transcribe(source_path: str, language: str = "ko", output_dir: str | None = 
     return _artifact(payload, "srt")
 
 
-def transcript_overview(srt_path: str, output_path: str | None = None) -> str:
+def transcript_overview(
+    srt_path: str,
+    output_path: str | None = None,
+    llm_log_path: str | None = None,
+) -> str:
     """Run avid transcript-overview (Pass 1). Returns path to storyline.json."""
     args = _apply_provider_args(["transcript-overview", srt_path])
     if output_path:
         args += ["-o", output_path]
 
-    payload = _run_avid_json(args, timeout=1800)
+    payload = _run_avid_json(
+        args,
+        timeout=1800,
+        extra_env=_llm_log_env(llm_log_path, "transcript_overview"),
+    )
     return _artifact(payload, "storyline")
 
 
@@ -223,7 +244,8 @@ def subtitle_cut(
     output_dir: str | None = None,
     final: bool = False,
     extra_sources: list[str] | None = None,
-    target_duration_minutes: int | None = None,
+    edit_intensity: str = "normal",
+    llm_log_path: str | None = None,
 ) -> dict[str, str]:
     """Run avid subtitle-cut (Pass 2). Returns result paths dict."""
     args = _apply_provider_args(["subtitle-cut", source_path, "--srt", srt_path])
@@ -233,12 +255,15 @@ def subtitle_cut(
         args += ["-d", output_dir]
     if final:
         args += ["--final"]
-    if target_duration_minutes is not None:
-        args += ["--target-duration-minutes", str(target_duration_minutes)]
+    args += ["--edit-intensity", edit_intensity]
     for src in extra_sources or []:
         args += ["--extra-source", src]
 
-    payload = _run_avid_json(args, timeout=1800)
+    payload = _run_avid_json(
+        args,
+        timeout=1800,
+        extra_env=_llm_log_env(llm_log_path, "edit_decision"),
+    )
     return {key: str(value) for key, value in (payload.get("artifacts") or {}).items()}
 
 
@@ -249,7 +274,8 @@ def podcast_cut(
     output_dir: str | None = None,
     final: bool = False,
     extra_sources: list[str] | None = None,
-    target_duration_minutes: int | None = None,
+    edit_intensity: str = "normal",
+    llm_log_path: str | None = None,
 ) -> dict[str, str]:
     """Run avid podcast-cut (Pass 2). Returns result paths dict."""
     args = _apply_provider_args(["podcast-cut", source_path])
@@ -261,12 +287,15 @@ def podcast_cut(
         args += ["-d", output_dir]
     if final:
         args += ["--final"]
-    if target_duration_minutes is not None:
-        args += ["--target-duration-minutes", str(target_duration_minutes)]
+    args += ["--edit-intensity", edit_intensity]
     for src in extra_sources or []:
         args += ["--extra-source", src]
 
-    payload = _run_avid_json(args, timeout=1800)
+    payload = _run_avid_json(
+        args,
+        timeout=1800,
+        extra_env=_llm_log_env(llm_log_path, "edit_decision"),
+    )
     return {key: str(value) for key, value in (payload.get("artifacts") or {}).items()}
 
 
@@ -326,6 +355,9 @@ def export_project(
     output_path: str | None = None,
     silence_mode: str = "cut",
     content_mode: str = "disabled",
+    multicam_switching: str | None = None,
+    speaker_source_map_path: str | None = None,
+    audio_source_key: str | None = None,
     is_canceled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     args = [
@@ -337,6 +369,12 @@ def export_project(
     ]
     if output_path:
         args += ["-o", output_path]
+    if multicam_switching:
+        args += ["--multicam-switching", multicam_switching]
+    if speaker_source_map_path:
+        args += ["--speaker-source-map", speaker_source_map_path]
+    if audio_source_key:
+        args += ["--audio-source-key", audio_source_key]
     return _run_avid_json(args, timeout=3600, is_canceled=is_canceled)
 
 

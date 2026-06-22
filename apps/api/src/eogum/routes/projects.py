@@ -1,26 +1,46 @@
 import json
 import hashlib
 import logging
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from eogum.auth import get_user_id
+from eogum.auth import CurrentUser, get_current_user, get_user_id
 from eogum.models.schemas import (
     ProjectCreate,
     ProjectDetailResponse,
     ProjectResponse,
+    ProjectVariantCreate,
     UpdateExtraSourcesRequest,
+    UpdateMulticamSettingsRequest,
 )
 from eogum.services.artifacts import get_latest_artifact_job
 from eogum.services.credit import get_balance
 from eogum.services.database import get_db
-from eogum.services.job_runner import enqueue, enqueue_reprocess
-from eogum.services.r2 import delete_objects, download_to_bytes
+from eogum.services.job_runner import (
+    create_cut_decision_job,
+    create_initial_job,
+    enqueue,
+    enqueue_cut_decision,
+    enqueue_reprocess,
+)
+from eogum.services.r2 import delete_objects, download_to_bytes, object_exists
+from eogum.services.source_cache import upsert_source_asset
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 logger = logging.getLogger(__name__)
 
-ALLOWED_TARGET_DURATION_MINUTES = {20, 40, 60}
+ALLOWED_EDIT_INTENSITIES = {"light", "normal", "heavy"}
+ALLOWED_MULTICAM_SWITCHING = {
+    "none",
+    "follow_speaker",
+    "conservative_follow_speaker",
+}
+EDIT_INTENSITY_LABELS = {
+    "light": "적게 편집",
+    "normal": "일반 편집",
+    "heavy": "많이 편집",
+}
 
 
 def _extra_sources_hash(extra_sources: list[dict]) -> str | None:
@@ -64,6 +84,75 @@ def _pending_multicam_state(project: dict, extra_sources: list[dict]) -> dict:
     }
 
 
+def _valid_multicam_source_keys(project: dict) -> set[str]:
+    keys = {"primary"}
+    for index, _source in enumerate(project.get("extra_sources") or []):
+        keys.add(f"extra:{index}")
+    return keys
+
+
+def _validate_multicam_source_key(project: dict, source_key: str, field_name: str) -> None:
+    if source_key not in _valid_multicam_source_keys(project):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name}에 알 수 없는 멀티캠 source_key가 있습니다: {source_key}",
+        )
+
+
+def _merge_multicam_settings(
+    project: dict,
+    req: UpdateMulticamSettingsRequest,
+) -> dict:
+    merged = dict(project.get("settings") or {})
+
+    if req.multicam_switching is not None:
+        if req.multicam_switching not in ALLOWED_MULTICAM_SWITCHING:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="multicam_switching은 none, follow_speaker, conservative_follow_speaker 중 하나여야 합니다",
+            )
+        merged["multicam_switching"] = req.multicam_switching
+
+    if req.audio_source_key is not None:
+        _validate_multicam_source_key(project, req.audio_source_key, "audio_source_key")
+        merged["audio_source_key"] = req.audio_source_key
+
+    if req.speaker_source_map is not None:
+        speaker_source_map: dict[str, str] = {}
+        for speaker, source_key in req.speaker_source_map.items():
+            normalized_speaker = str(speaker).strip()
+            normalized_source_key = str(source_key).strip()
+            if not normalized_speaker or not normalized_source_key:
+                continue
+            _validate_multicam_source_key(
+                project,
+                normalized_source_key,
+                f"speaker_source_map[{normalized_speaker}]",
+            )
+            speaker_source_map[normalized_speaker] = normalized_source_key
+        merged["speaker_source_map"] = speaker_source_map
+
+    if req.multicam_source_labels is not None:
+        labels: dict[str, dict] = {}
+        for source_key, raw_label in req.multicam_source_labels.items():
+            normalized_source_key = str(source_key).strip()
+            _validate_multicam_source_key(
+                project,
+                normalized_source_key,
+                "multicam_source_labels",
+            )
+            label = raw_label if isinstance(raw_label, dict) else {}
+            display_id = str(label.get("display_id") or "").strip()
+            display_name = str(label.get("display_name") or "").strip()
+            labels[normalized_source_key] = {
+                "display_id": display_id,
+                "display_name": display_name,
+            }
+        merged["multicam_source_labels"] = labels
+
+    return merged
+
+
 def _first_row(result) -> dict | None:
     data = getattr(result, "data", None)
     if isinstance(data, list):
@@ -71,38 +160,125 @@ def _first_row(result) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _validate_project_settings(req: ProjectCreate) -> None:
-    settings_value = req.settings or {}
-    target = settings_value.get("output_target_duration_minutes")
-    if target is None:
-        target_minutes = None
-    else:
-        if isinstance(target, bool):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="결과 길이는 20, 40, 60분 중 하나여야 합니다",
-            )
+def _project_access_query(db, current_user: CurrentUser, select: str = "*"):
+    query = db.table("projects").select(select)
+    if not current_user.is_admin:
+        query = query.eq("user_id", current_user.id)
+    return query
 
+
+def _get_accessible_project(db, project_id: str, current_user: CurrentUser, select: str = "*") -> dict:
+    project = _project_access_query(db, current_user, select).eq("id", project_id).single().execute()
+    if not project.data:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+    return project.data
+
+
+def _upsert_project_source_asset_best_effort(db, project: dict) -> None:
+    source_sha256 = project.get("source_sha256")
+    source_size_bytes = project.get("source_size_bytes")
+    source_r2_key = project.get("source_r2_key")
+    if not source_sha256 or source_size_bytes is None or not source_r2_key:
+        return
+
+    try:
+        upsert_source_asset(
+            db,
+            sha256=source_sha256,
+            size_bytes=int(source_size_bytes),
+            r2_key=source_r2_key,
+            filename=project.get("source_filename"),
+            duration_seconds=project.get("source_duration_seconds"),
+        )
+    except Exception:
+        logger.exception("Failed to upsert source asset for project %s", project.get("id"))
+
+
+def _assert_project_source_exists(project: dict) -> None:
+    source_r2_key = project.get("source_r2_key")
+    if not source_r2_key:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="원본 소스 정보가 없어 멀티캠을 적용할 수 없습니다",
+        )
+
+    try:
+        exists = object_exists(source_r2_key)
+    except Exception as exc:
+        logger.exception("Failed to check source object for project %s", project.get("id"))
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="원본 파일 상태를 확인할 수 없습니다. 잠시 후 다시 시도해주세요.",
+        ) from exc
+
+    if not exists:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="원본 영상 파일이 저장소에 없어 멀티캠을 적용할 수 없습니다. 원본 파일을 다시 업로드해야 합니다.",
+        )
+
+
+def _source_r2_key_is_shared(db, *, r2_key: str | None, project_id: str) -> bool:
+    if not r2_key:
+        return False
+
+    try:
+        project_ref = (
+            db.table("projects")
+            .select("id")
+            .eq("source_r2_key", r2_key)
+            .neq("id", project_id)
+            .limit(1)
+            .execute()
+        )
+        if _first_row(project_ref):
+            return True
+
+        cache_ref = (
+            db.table("source_assets")
+            .select("id")
+            .eq("r2_key", r2_key)
+            .limit(1)
+            .execute()
+        )
+        return _first_row(cache_ref) is not None
+    except Exception:
+        logger.exception("Failed to check source references for R2 key %s", r2_key)
+        return True
+
+
+def _create_initial_job_or_fail(db, project: dict) -> dict:
+    try:
+        return create_initial_job(db, project)
+    except Exception as exc:
+        logger.exception("Failed to create initial job for project %s", project.get("id"))
         try:
-            target_minutes = int(target)
-        except (TypeError, ValueError):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="결과 길이는 20, 40, 60분 중 하나여야 합니다",
-            ) from None
+            db.table("projects").update({"status": "failed"}).eq("id", project["id"]).execute()
+        except Exception:
+            logger.exception("Failed to mark project %s failed after job creation error", project.get("id"))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="프로젝트 처리 작업 등록에 실패했습니다",
+        ) from exc
 
-        if target_minutes not in ALLOWED_TARGET_DURATION_MINUTES:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="결과 길이는 20, 40, 60분 중 하나여야 합니다",
-            )
 
-        min_source_seconds = int(target_minutes * 60 * 0.9)
-        if req.source_duration_seconds < min_source_seconds:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"{target_minutes}분 결과물을 만들려면 원본이 최소 {min_source_seconds}초 이상이어야 합니다",
-            )
+
+def _validate_project_settings(req: ProjectCreate) -> None:
+    settings_value = dict(req.settings or {})
+    if "output_target_duration_minutes" in settings_value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="결과 길이 설정은 더 이상 지원하지 않습니다. edit_intensity를 사용하세요",
+        )
+
+    edit_intensity = settings_value.get("edit_intensity", "normal")
+    if not isinstance(edit_intensity, str) or edit_intensity not in ALLOWED_EDIT_INTENSITIES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="편집 강도는 light, normal, heavy 중 하나여야 합니다",
+        )
+    settings_value["edit_intensity"] = edit_intensity
+    req.settings = settings_value
 
     for key in ("diarize", "tag_audio_events", "use_llm_segmentation", "use_llm_refinement"):
         value = settings_value.get(key)
@@ -157,56 +333,134 @@ def create_project(req: ProjectCreate, user_id: str = Depends(get_user_id)):
         "source_filename": req.source_filename,
         "source_duration_seconds": req.source_duration_seconds,
         "source_size_bytes": req.source_size_bytes,
+        "source_sha256": req.source_sha256,
         "settings": req.settings,
     }).execute().data[0]
 
-    # Enqueue for processing
-    enqueue(project["id"])
+    job = _create_initial_job_or_fail(db, project)
+    _upsert_project_source_asset_best_effort(db, project)
+
+    # Enqueue for processing only after the durable job exists.
+    enqueue(project["id"], job["id"])
 
     return project
 
 
-@router.get("", response_model=list[ProjectResponse])
-def list_projects(user_id: str = Depends(get_user_id)):
+@router.post("/{project_id}/variants", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
+def create_project_variant(project_id: str, req: ProjectVariantCreate, current_user: CurrentUser = Depends(get_current_user)):
+    if req.edit_intensity not in ALLOWED_EDIT_INTENSITIES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="편집 강도는 light, normal, heavy 중 하나여야 합니다",
+        )
+
     db = get_db()
-    result = db.table("projects").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
+    source_project_data = _get_accessible_project(db, project_id, current_user)
+    source_owner_id = source_project_data["user_id"]
+
+    if source_project_data["status"] != "completed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="완료된 프로젝트만 새 편집 버전을 만들 수 있습니다",
+        )
+
+    source_settings = dict(source_project_data.get("settings") or {})
+
+    duration = int(source_project_data.get("source_duration_seconds") or 0)
+    source_size_bytes = source_project_data.get("source_size_bytes")
+    source_r2_key = source_project_data.get("source_r2_key")
+    if not source_r2_key or source_size_bytes is None or duration <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="원본 소스 정보가 없어 새 편집 강도 프로젝트를 만들 수 없습니다",
+        )
+
+    balance = get_balance(source_owner_id)
+    if balance["available_seconds"] < duration:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail="크레딧이 부족합니다. 필요: %d초, 사용 가능: %d초" % (duration, balance["available_seconds"]),
+        )
+
+    variant_settings = {
+        **source_settings,
+        "edit_intensity": req.edit_intensity,
+        "bypass_llm_segmentation_cache": True,
+    }
+    for internal_key in (
+        "reused_transcription_srt_r2_key",
+        "reused_transcription_from_project_id",
+        "reused_transcription_from_job_id",
+    ):
+        variant_settings.pop(internal_key, None)
+    variant_name = (req.name or "").strip()
+    if not variant_name:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        variant_name = "{} - {} {}".format(
+            source_project_data["name"],
+            EDIT_INTENSITY_LABELS[req.edit_intensity],
+            timestamp,
+        )
+
+    project = db.table("projects").insert({
+        "user_id": source_owner_id,
+        "name": variant_name,
+        "status": "queued",
+        "cut_type": source_project_data["cut_type"],
+        "language": source_project_data["language"],
+        "source_r2_key": source_r2_key,
+        "source_filename": source_project_data.get("source_filename"),
+        "source_duration_seconds": duration,
+        "source_size_bytes": int(source_size_bytes),
+        "source_sha256": source_project_data.get("source_sha256"),
+        "settings": variant_settings,
+    }).execute().data[0]
+
+    _upsert_project_source_asset_best_effort(db, project)
+
+    job = _create_initial_job_or_fail(db, project)
+    enqueue(project["id"], job["id"])
+    return project
+
+
+@router.get("", response_model=list[ProjectResponse])
+def list_projects(current_user: CurrentUser = Depends(get_current_user)):
+    db = get_db()
+    result = _project_access_query(db, current_user).order("created_at", desc=True).execute()
     return result.data
 
 
 @router.get("/{project_id}", response_model=ProjectDetailResponse)
-def get_project(project_id: str, user_id: str = Depends(get_user_id)):
+def get_project(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
     db = get_db()
 
-    project = db.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).single().execute()
-    if not project.data:
-        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+    project_data = _get_accessible_project(db, project_id, current_user)
 
     jobs = db.table("jobs").select("*").eq("project_id", project_id).order("created_at").execute()
     report = db.table("edit_reports").select("*").eq("project_id", project_id).limit(1).execute()
 
-    data = project.data
+    data = project_data
     data["jobs"] = jobs.data
     data["report"] = report.data[0] if report.data else None
     return data
 
 
 @router.post("/{project_id}/retry", response_model=ProjectResponse)
-def retry_project(project_id: str, user_id: str = Depends(get_user_id)):
+def retry_project(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
     db = get_db()
 
-    project = db.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).single().execute()
-    if not project.data:
-        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+    project_data = _get_accessible_project(db, project_id, current_user)
+    owner_user_id = project_data["user_id"]
 
-    if project.data["status"] != "failed":
+    if project_data["status"] != "failed":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="실패한 프로젝트만 재시도할 수 있습니다",
         )
 
     # Check credits
-    duration = project.data["source_duration_seconds"]
-    balance = get_balance(user_id)
+    duration = project_data["source_duration_seconds"]
+    balance = get_balance(owner_user_id)
     if balance["available_seconds"] < duration:
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -217,12 +471,79 @@ def retry_project(project_id: str, user_id: str = Depends(get_user_id)):
     db.table("jobs").delete().eq("project_id", project_id).execute()
     db.table("edit_reports").delete().eq("project_id", project_id).execute()
 
-    # Reset project status
+    # Reset project status and create a durable retry job before enqueueing.
     updated = db.table("projects").update({"status": "queued"}).eq("id", project_id).execute().data[0]
+    job = _create_initial_job_or_fail(db, updated)
 
     # Enqueue for processing
-    enqueue(project_id)
+    enqueue(project_id, job["id"])
 
+    return updated
+
+
+@router.post("/{project_id}/cut-decision", response_model=ProjectResponse)
+def rerun_cut_decision(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    db = get_db()
+
+    project_data = _get_accessible_project(db, project_id, current_user)
+    owner_user_id = project_data["user_id"]
+
+    if project_data["status"] in {"queued", "processing"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="진행 중인 프로젝트는 cut decision을 다시 실행할 수 없습니다",
+        )
+
+    active_job = (
+        db.table("jobs")
+        .select("id, type")
+        .eq("project_id", project_id)
+        .eq("user_id", owner_user_id)
+        .in_("status", ["queued", "pending", "running", "cancel_requested"])
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if _first_row(active_job):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="이미 진행 중인 작업이 있습니다",
+        )
+
+    multicam_status = (project_data.get("multicam_state") or {}).get("status")
+    if project_data.get("extra_sources") and multicam_status == "pending_apply":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="등록된 멀티캠 변경사항을 먼저 적용하거나 제거한 뒤 cut decision을 다시 실행할 수 있습니다",
+        )
+
+    _assert_project_source_exists(project_data)
+
+    artifact_job = get_latest_artifact_job(
+        db,
+        project_id,
+        user_id=owner_user_id,
+        select="id, result_r2_keys",
+    )
+    if not artifact_job:
+        raise HTTPException(status_code=404, detail="완료된 작업이 없습니다. 전체 재처리가 필요합니다.")
+
+    result_keys = artifact_job["result_r2_keys"] or {}
+    if not result_keys.get("project_json"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="기존 refined segment 정보가 없어 cut decision만 다시 실행할 수 없습니다",
+        )
+
+    job = create_cut_decision_job(db, project_data)
+    updated = (
+        db.table("projects")
+        .update({"status": "processing"})
+        .eq("id", project_id)
+        .execute()
+        .data[0]
+    )
+    enqueue_cut_decision(project_id, job["id"])
     return updated
 
 
@@ -230,15 +551,13 @@ def retry_project(project_id: str, user_id: str = Depends(get_user_id)):
 def update_extra_sources(
     project_id: str,
     req: UpdateExtraSourcesRequest,
-    user_id: str = Depends(get_user_id),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     db = get_db()
 
-    project = db.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).single().execute()
-    if not project.data:
-        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+    project_data = _get_accessible_project(db, project_id, current_user)
 
-    if project.data["status"] not in ("completed", "failed", "reprocess_failed"):
+    if project_data["status"] not in ("completed", "failed", "reprocess_failed"):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="완료 또는 실패한 프로젝트만 추가 소스를 설정할 수 있습니다",
@@ -249,7 +568,7 @@ def update_extra_sources(
         db.table("projects")
         .update({
             "extra_sources": extra_sources,
-            "multicam_state": _pending_multicam_state(project.data, extra_sources),
+            "multicam_state": _pending_multicam_state(project_data, extra_sources),
         })
         .eq("id", project_id)
         .execute()
@@ -258,16 +577,55 @@ def update_extra_sources(
     return updated
 
 
+@router.put("/{project_id}/multicam-settings", response_model=ProjectResponse)
+def update_multicam_settings(
+    project_id: str,
+    req: UpdateMulticamSettingsRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    db = get_db()
+    project_data = _get_accessible_project(db, project_id, current_user)
+
+    if project_data["status"] in {"queued", "processing"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="처리 중인 프로젝트의 멀티캠 설정은 변경할 수 없습니다",
+        )
+
+    settings_value = _merge_multicam_settings(project_data, req)
+    update_values = {"settings": settings_value}
+    requires_reexport = (
+        req.multicam_switching is not None
+        or req.speaker_source_map is not None
+        or req.audio_source_key is not None
+    )
+    if requires_reexport and project_data.get("extra_sources"):
+        multicam_state = _pending_multicam_state(
+            project_data,
+            project_data.get("extra_sources") or [],
+        )
+        multicam_state["status"] = "pending_apply"
+        update_values["multicam_state"] = multicam_state
+
+    updated = (
+        db.table("projects")
+        .update(update_values)
+        .eq("id", project_id)
+        .execute()
+        .data[0]
+    )
+    return updated
+
+
 @router.post("/{project_id}/multicam", response_model=ProjectResponse)
-def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
+def multicam_reprocess(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
     """Queue project reprocess via split avid-cli commands."""
     db = get_db()
 
-    project = db.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).single().execute()
-    if not project.data:
-        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+    project_data = _get_accessible_project(db, project_id, current_user)
+    owner_user_id = project_data["user_id"]
 
-    if project.data["status"] not in ("completed", "failed", "reprocess_failed"):
+    if project_data["status"] not in ("completed", "failed", "reprocess_failed"):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="완료 또는 실패한 프로젝트만 재처리할 수 있습니다",
@@ -308,7 +666,7 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
         db.table("evaluations")
         .select("segments")
         .eq("project_id", project_id)
-        .eq("evaluator_id", user_id)
+        .eq("evaluator_id", owner_user_id)
         .limit(1)
         .execute()
     )
@@ -318,7 +676,7 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
     else:
         eval_segments = evaluation_payload
 
-    has_extra_sources = bool(project.data.get("extra_sources"))
+    has_extra_sources = bool(project_data.get("extra_sources"))
     current_project_has_extra_sources = len(stored_project_json.get("source_files") or []) > 1
     if not eval_segments and not has_extra_sources and not current_project_has_extra_sources:
         raise HTTPException(
@@ -326,19 +684,22 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
             detail="평가 데이터 또는 적용할 extra source 변경이 필요합니다",
         )
 
-    desired_hash = _extra_sources_hash(project.data.get("extra_sources") or [])
+    if has_extra_sources:
+        _assert_project_source_exists(project_data)
+
+    desired_hash = _extra_sources_hash(project_data.get("extra_sources") or [])
     queued_job = db.table("jobs").insert({
         "project_id": project_id,
-        "user_id": user_id,
+        "user_id": owner_user_id,
         "type": "reprocess_multicam",
         "status": "pending",
         "progress": 0,
     }).execute().data[0]
     multicam_state = {
-        **(project.data.get("multicam_state") or {}),
+        **(project_data.get("multicam_state") or {}),
         "status": "queued",
         "desired_sources_hash": desired_hash,
-        "source_count": len(project.data.get("extra_sources") or []),
+        "source_count": len(project_data.get("extra_sources") or []),
         "job_id": queued_job["id"],
         "error": None,
     }
@@ -349,18 +710,17 @@ def multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
 
 
 @router.post("/{project_id}/multicam/cancel", response_model=ProjectResponse)
-def cancel_multicam_reprocess(project_id: str, user_id: str = Depends(get_user_id)):
+def cancel_multicam_reprocess(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
     db = get_db()
 
-    project = db.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).single().execute()
-    if not project.data:
-        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+    project_data = _get_accessible_project(db, project_id, current_user)
+    owner_user_id = project_data["user_id"]
 
     latest = (
         db.table("jobs")
         .select("id, status")
         .eq("project_id", project_id)
-        .eq("user_id", user_id)
+        .eq("user_id", owner_user_id)
         .eq("type", "reprocess_multicam")
         .in_("status", ["pending", "running", "cancel_requested"])
         .order("created_at", desc=True)
@@ -381,7 +741,7 @@ def cancel_multicam_reprocess(project_id: str, user_id: str = Depends(get_user_i
 
     state_status = "canceled" if next_job_status == "canceled" else "canceling"
     multicam_state = {
-        **(project.data.get("multicam_state") or {}),
+        **(project_data.get("multicam_state") or {}),
         "status": state_status,
         "job_id": job_id,
         "error": None,
@@ -397,14 +757,12 @@ def cancel_multicam_reprocess(project_id: str, user_id: str = Depends(get_user_i
 
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_project(project_id: str, user_id: str = Depends(get_user_id)):
+def delete_project(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
     db = get_db()
 
-    project = db.table("projects").select("*").eq("id", project_id).eq("user_id", user_id).single().execute()
-    if not project.data:
-        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+    project_data = _get_accessible_project(db, project_id, current_user)
 
-    if project.data["status"] in {"queued", "processing"}:
+    if project_data["status"] in {"queued", "processing"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="처리 중인 프로젝트는 완료 또는 취소 후 삭제할 수 있습니다",
@@ -424,8 +782,14 @@ def delete_project(project_id: str, user_id: str = Depends(get_user_id)):
             detail="진행 중인 작업이 있어 프로젝트를 삭제할 수 없습니다",
         )
 
-    r2_keys = [project.data.get("source_r2_key")]
-    r2_keys.extend(src.get("r2_key") for src in (project.data.get("extra_sources") or []))
+    source_r2_key = project_data.get("source_r2_key")
+    r2_keys = []
+    if source_r2_key:
+        if _source_r2_key_is_shared(db, r2_key=source_r2_key, project_id=project_id):
+            logger.info("Skipping shared source object cleanup for project %s: %s", project_id, source_r2_key)
+        else:
+            r2_keys.append(source_r2_key)
+    r2_keys.extend(src.get("r2_key") for src in (project_data.get("extra_sources") or []))
     jobs = db.table("jobs").select("result_r2_keys").eq("project_id", project_id).execute()
     for job in jobs.data or []:
         for key in (job.get("result_r2_keys") or {}).values():

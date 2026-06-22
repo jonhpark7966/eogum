@@ -3,10 +3,18 @@
 export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
-import { api, type ProjectDetail, type PipelineStage, type MulticamState } from "@/lib/api";
+import {
+  api,
+  type ProjectDetail,
+  type PipelineStage,
+  type MulticamState,
+  type SegmentWithDecision,
+  type MulticamSwitching,
+  type MulticamSourceLabel,
+} from "@/lib/api";
 import { useUploads } from "@/lib/upload-provider";
 import { useParams, useRouter } from "next/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import Image from "next/image";
@@ -167,6 +175,86 @@ function multicamLabel(state: MulticamState | undefined, extraCount: number): st
   return status;
 }
 
+
+type MulticamSourceOption = {
+  source_key: string;
+  display_id: string;
+  display_name: string;
+  filename: string;
+};
+
+type SpeakerSummary = {
+  speaker: string;
+  samples: string[];
+};
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function sourceLabelsFromSettings(settings: Record<string, unknown> | undefined): Record<string, MulticamSourceLabel> {
+  const rawLabels = asRecord(settings?.multicam_source_labels);
+  return Object.fromEntries(Object.entries(rawLabels).map(([sourceKey, rawLabel]) => {
+    const label = asRecord(rawLabel);
+    return [sourceKey, {
+      display_id: typeof label.display_id === "string" ? label.display_id : undefined,
+      display_name: typeof label.display_name === "string" ? label.display_name : undefined,
+    }];
+  }));
+}
+
+function speakerSourceMapFromSettings(settings: Record<string, unknown> | undefined): Record<string, string> {
+  const rawMap = asRecord(settings?.speaker_source_map);
+  return Object.fromEntries(Object.entries(rawMap).flatMap(([speaker, sourceKey]) => (
+    typeof sourceKey === "string" ? [[speaker, sourceKey]] : []
+  )));
+}
+
+function normalizeMulticamSwitching(value: unknown): MulticamSwitching {
+  return value === "follow_speaker" || value === "conservative_follow_speaker" ? value : "none";
+}
+
+function multicamSourceOptions(project: ProjectDetail): MulticamSourceOption[] {
+  const labels = sourceLabelsFromSettings(project.settings);
+  const primaryLabel = labels.primary ?? {};
+  return [
+    {
+      source_key: "primary",
+      display_id: primaryLabel.display_id || "cam_1",
+      display_name: primaryLabel.display_name || "Main / Wide",
+      filename: project.source_filename || "source",
+    },
+    ...project.extra_sources.map((source, index) => {
+      const sourceKey = `extra:${index}`;
+      const label = labels[sourceKey] ?? {};
+      return {
+        source_key: sourceKey,
+        display_id: label.display_id || `cam_${index + 2}`,
+        display_name: label.display_name || `Camera ${index + 2}`,
+        filename: source.filename,
+      };
+    }),
+  ];
+}
+
+function speakerSummariesFromSegments(segments: SegmentWithDecision[]): SpeakerSummary[] {
+  const grouped = new Map<string, string[]>();
+  for (const segment of segments) {
+    const speaker = typeof segment.speaker === "string" ? segment.speaker.trim() : "";
+    if (!speaker) continue;
+    const samples = grouped.get(speaker) ?? [];
+    if (samples.length < 5 && segment.text.trim()) samples.push(segment.text.trim());
+    grouped.set(speaker, samples);
+  }
+  return Array.from(grouped.entries())
+    .map(([speaker, samples]) => ({ speaker, samples }))
+    .sort((a, b) => a.speaker.localeCompare(b.speaker));
+}
+
+function truncateSample(text: string): string {
+  return text.length > 44 ? `${text.slice(0, 44)}...` : text;
+}
+
 /* ── Section wrapper ── */
 function Section({ title, icon, children, className = "" }: {
   title: string;
@@ -208,11 +296,16 @@ export default function ProjectDetailPage() {
   // Multicam state
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [multicamProcessing, setMulticamProcessing] = useState(false);
+  const [multicamSettingsSaving, setMulticamSettingsSaving] = useState(false);
+  const [reviewSegments, setReviewSegments] = useState<SegmentWithDecision[]>([]);
+  const [reviewSegmentsLoading, setReviewSegmentsLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const projectId = params.id as string;
   const uploadTask = tasks.find((task) => task.projectId === projectId && ["queued", "uploading", "registering"].includes(task.status));
   const latestUploadTaskStatus = tasks.find((task) => task.projectId === projectId)?.status;
+  const multicamSources = useMemo(() => project ? multicamSourceOptions(project) : [], [project]);
+  const speakerSummaries = useMemo(() => speakerSummariesFromSegments(reviewSegments), [reviewSegments]);
 
   const loadProject = useCallback(async () => {
     const { data: { session } } = await supabase.auth.getSession();
@@ -257,6 +350,32 @@ export default function ProjectDetailPage() {
       void loadProject();
     }
   }, [latestUploadTaskStatus, loadProject]);
+
+
+  useEffect(() => {
+    if (!project || project.status !== "completed" || project.extra_sources.length === 0) {
+      setReviewSegments([]);
+      return;
+    }
+
+    let canceled = false;
+    async function loadSegments() {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session || canceled) return;
+      setReviewSegmentsLoading(true);
+      try {
+        const payload = await api.getSegments(session.access_token, projectId);
+        if (!canceled) setReviewSegments(payload.segments);
+      } catch {
+        if (!canceled) setReviewSegments([]);
+      } finally {
+        if (!canceled) setReviewSegmentsLoading(false);
+      }
+    }
+
+    void loadSegments();
+    return () => { canceled = true; };
+  }, [project, projectId, supabase.auth]);
 
   const handleRetry = async () => {
     const { data: { session } } = await supabase.auth.getSession();
@@ -349,6 +468,57 @@ export default function ProjectDetailPage() {
     } finally { setMulticamProcessing(false); }
   };
 
+
+  const updateMulticamSettings = async (payload: Parameters<typeof api.updateMulticamSettings>[2]) => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session || !project) return;
+    setMulticamSettingsSaving(true);
+    setError("");
+    try {
+      await api.updateMulticamSettings(session.access_token, projectId, payload);
+      await loadProject();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "멀티캠 설정 저장에 실패했습니다");
+    } finally {
+      setMulticamSettingsSaving(false);
+    }
+  };
+
+  const handleMulticamSwitchingChange = async (value: MulticamSwitching) => {
+    if (!project || value === normalizeMulticamSwitching(project.settings?.multicam_switching)) return;
+    await updateMulticamSettings({ multicam_switching: value });
+  };
+
+  const handleSpeakerSourceChange = async (speaker: string, sourceKey: string) => {
+    if (!project) return;
+    const speakerSourceMap = speakerSourceMapFromSettings(project.settings);
+    if (speakerSourceMap[speaker] === sourceKey) return;
+    await updateMulticamSettings({
+      speaker_source_map: {
+        ...speakerSourceMap,
+        [speaker]: sourceKey,
+      },
+    });
+  };
+
+  const handleSourceDisplayNameBlur = async (sourceKey: string, displayName: string) => {
+    if (!project) return;
+    const trimmedName = displayName.trim();
+    const labels = sourceLabelsFromSettings(project.settings);
+    const option = multicamSourceOptions(project).find((item) => item.source_key === sourceKey);
+    const currentName = labels[sourceKey]?.display_name || option?.display_name || "";
+    if (trimmedName === currentName) return;
+    await updateMulticamSettings({
+      multicam_source_labels: {
+        ...labels,
+        [sourceKey]: {
+          display_id: labels[sourceKey]?.display_id || option?.display_id || "",
+          display_name: trimmedName,
+        },
+      },
+    });
+  };
+
   const handleDeleteProject = async () => {
     const { data: { session } } = await supabase.auth.getSession();
     if (!session || !project) return;
@@ -429,6 +599,9 @@ export default function ProjectDetailPage() {
   const currentEditIntensityLabel = EDIT_INTENSITY_LABELS[currentEditIntensity];
   const isUploadingExtraSources = Boolean(uploadTask);
   const multicamStatus = project.multicam_state?.status || (project.extra_sources.length > 0 ? "pending_apply" : "not_applied");
+  const currentMulticamSwitching = normalizeMulticamSwitching(project.settings?.multicam_switching);
+  const currentSpeakerSourceMap = speakerSourceMapFromSettings(project.settings);
+  const hasSpeakerMetadata = speakerSummaries.length > 0;
   const canApplyMulticam = project.extra_sources.length > 0 && !isUploadingExtraSources && !["queued", "running", "canceling"].includes(multicamStatus);
   const canCancelMulticam = ["queued", "running", "canceling"].includes(multicamStatus);
   const canDeleteProject = !isProcessing && !isUploadingExtraSources && !canCancelMulticam;
@@ -756,6 +929,107 @@ export default function ProjectDetailPage() {
                     </div>
                   </div>
                 ))}
+              </div>
+            )}
+
+
+            {project.extra_sources.length > 0 && (
+              <div className="mb-5 space-y-5 border-t border-white/[0.04] pt-5">
+                <div>
+                  <div className="mb-2 flex items-center justify-between gap-3">
+                    <p className="text-xs uppercase tracking-wider text-gray-500">카메라 ID</p>
+                    {multicamSettingsSaving && <span className="text-xs text-cyan-300">저장 중...</span>}
+                  </div>
+                  <div className="grid gap-2">
+                    {multicamSources.map((source) => (
+                      <div key={source.source_key} className="grid gap-2 rounded-lg border border-white/[0.04] bg-white/[0.02] px-3 py-2.5 sm:grid-cols-[76px_1fr_1.2fr] sm:items-center">
+                        <span className="w-fit rounded-md border border-cyan-500/20 bg-cyan-500/10 px-2 py-1 text-xs font-medium text-cyan-200">
+                          {source.display_id}
+                        </span>
+                        <input
+                          defaultValue={source.display_name}
+                          disabled={multicamSettingsSaving || canCancelMulticam}
+                          onBlur={(event) => void handleSourceDisplayNameBlur(source.source_key, event.currentTarget.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") event.currentTarget.blur();
+                          }}
+                          className="min-w-0 rounded-md border border-white/[0.08] bg-black/20 px-2.5 py-1.5 text-sm text-gray-200 outline-none transition focus:border-cyan-400/40 disabled:opacity-50"
+                        />
+                        <span className="truncate text-xs text-gray-500">{source.filename}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <p className="mb-2 text-xs uppercase tracking-wider text-gray-500">카메라 전환</p>
+                  <div className="grid gap-2 sm:grid-cols-3">
+                    {([
+                      { value: "none", label: "없음" },
+                      { value: "follow_speaker", label: "화자 따라 전환" },
+                      { value: "conservative_follow_speaker", label: "보수적 전환" },
+                    ] as const).map((option) => {
+                      const selected = option.value === currentMulticamSwitching;
+                      return (
+                        <button
+                          key={option.value}
+                          type="button"
+                          disabled={multicamSettingsSaving || canCancelMulticam}
+                          onClick={() => void handleMulticamSwitchingChange(option.value)}
+                          className={"rounded-lg border px-3 py-2 text-left text-sm transition disabled:cursor-not-allowed disabled:opacity-50 " + (
+                            selected
+                              ? "border-cyan-400/50 bg-cyan-500/10 text-cyan-100"
+                              : "border-white/[0.08] bg-white/[0.02] text-gray-400 hover:border-white/[0.14] hover:bg-white/[0.04]"
+                          )}
+                        >
+                          {option.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="mb-2 flex items-center justify-between gap-3">
+                    <p className="text-xs uppercase tracking-wider text-gray-500">화자 매핑</p>
+                    {reviewSegmentsLoading && <span className="text-xs text-gray-500">불러오는 중...</span>}
+                  </div>
+                  {!hasSpeakerMetadata ? (
+                    <div className="rounded-lg border border-white/[0.04] bg-white/[0.02] px-4 py-3 text-sm text-gray-500">
+                      화자 metadata가 있는 segment가 없습니다.
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {speakerSummaries.map((summary) => (
+                        <div key={summary.speaker} className="grid gap-3 rounded-lg border border-white/[0.04] bg-white/[0.02] px-4 py-3 sm:grid-cols-[1fr_220px] sm:items-start">
+                          <div className="min-w-0">
+                            <p className="text-sm font-medium text-gray-200">{summary.speaker}</p>
+                            <div className="mt-1 space-y-1">
+                              {summary.samples.slice(0, 3).map((sample, index) => (
+                                <p key={`${summary.speaker}-${index}`} className="truncate text-xs text-gray-600">
+                                  {truncateSample(sample)}
+                                </p>
+                              ))}
+                            </div>
+                          </div>
+                          <select
+                            value={currentSpeakerSourceMap[summary.speaker] || ""}
+                            disabled={multicamSettingsSaving || canCancelMulticam}
+                            onChange={(event) => void handleSpeakerSourceChange(summary.speaker, event.currentTarget.value)}
+                            className="w-full rounded-md border border-white/[0.08] bg-[#050812] px-2.5 py-2 text-sm text-gray-200 outline-none transition focus:border-cyan-400/40 disabled:opacity-50"
+                          >
+                            <option value="">카메라 선택</option>
+                            {multicamSources.map((source) => (
+                              <option key={source.source_key} value={source.source_key}>
+                                {source.display_id} {source.display_name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 

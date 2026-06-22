@@ -31,6 +31,20 @@ export interface ExtraSource {
   offset_ms?: number | null;
 }
 
+export type MulticamSwitching = "none" | "follow_speaker" | "conservative_follow_speaker";
+
+export interface MulticamSourceLabel {
+  display_id?: string;
+  display_name?: string;
+}
+
+export interface UpdateMulticamSettingsPayload {
+  multicam_switching?: MulticamSwitching;
+  multicam_source_labels?: Record<string, MulticamSourceLabel>;
+  speaker_source_map?: Record<string, string>;
+  audio_source_key?: string;
+}
+
 export interface Project {
   id: string;
   user_id: string;
@@ -158,6 +172,7 @@ export interface SegmentWithDecision {
   raw_start_ms?: number | null;
   raw_end_ms?: number | null;
   text: string;
+  speaker?: string | null;
   ai: AiDecision | null;
   human?: HumanDecision | null;
 }
@@ -170,6 +185,7 @@ export interface EvalSegment {
   raw_start_ms?: number | null;
   raw_end_ms?: number | null;
   text: string;
+  speaker?: string | null;
   ai: AiDecision | null;
   human: HumanDecision | null;
 }
@@ -437,6 +453,12 @@ export const api = {
     apiFetch<Project>(`/projects/${id}/extra-sources`, token, {
       method: "PUT",
       body: JSON.stringify({ extra_sources }),
+    }),
+
+  updateMulticamSettings: (token: string, id: string, data: UpdateMulticamSettingsPayload) =>
+    apiFetch<Project>(`/projects/${id}/multicam-settings`, token, {
+      method: "PUT",
+      body: JSON.stringify(data),
     }),
 
   multicamReprocess: (token: string, id: string) =>

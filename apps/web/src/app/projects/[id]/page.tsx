@@ -141,6 +141,43 @@ function newestJobFirst(a: ProjectJob, b: ProjectJob): number {
   return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
 }
 
+type SegmentationDisplay = {
+  label: string;
+  className: string;
+  title: string;
+};
+
+const SEGMENTATION_BADGE_CLASSES: Record<string, string> = {
+  "Full compact": "border-emerald-400/20 bg-emerald-400/10 text-emerald-300",
+  "Legacy fallback": "border-amber-400/25 bg-amber-400/10 text-amber-300",
+  "Heuristic fallback": "border-orange-400/25 bg-orange-400/10 text-orange-300",
+  Heuristic: "border-orange-400/25 bg-orange-400/10 text-orange-300",
+  "Reused SRT": "border-slate-400/20 bg-slate-400/10 text-slate-300",
+  "LLM segmentation": "border-cyan-400/20 bg-cyan-400/10 text-cyan-300",
+  Unknown: "border-gray-400/20 bg-gray-400/10 text-gray-400",
+};
+
+function getSegmentationDisplay(project: ProjectDetail): SegmentationDisplay {
+  const metadataJob = [...project.jobs]
+    .filter((job) => typeof job.processing_metadata?.segmentation_label === "string")
+    .sort(newestJobFirst)[0];
+  const metadata = metadataJob?.processing_metadata ?? {};
+  const label = typeof metadata.segmentation_label === "string" ? metadata.segmentation_label : "Unknown";
+  const mode = typeof metadata.segmentation_mode === "string" ? metadata.segmentation_mode : "unknown";
+  const source = typeof metadata.segmentation_source === "string" ? metadata.segmentation_source : "unknown";
+  const cache = metadata.cache_bypassed === true
+    ? "cache bypassed"
+    : metadata.cache_hit === true
+      ? "cache hit"
+      : "cache miss";
+
+  return {
+    label,
+    className: SEGMENTATION_BADGE_CLASSES[label] ?? SEGMENTATION_BADGE_CLASSES.Unknown,
+    title: "Segmentation: " + label + " (" + mode + ", " + source + ", " + cache + ")",
+  };
+}
+
 function getVisibleProcessingJobs(project: ProjectDetail): ProjectJob[] {
   const multicamJobId = project.multicam_state?.job_id;
   if (multicamJobId) {
@@ -538,19 +575,13 @@ export default function ProjectDetailPage() {
   const openVariantModal = () => {
     if (!project) return;
     const current = normalizeEditIntensity(project.settings?.edit_intensity);
-    const next = EDIT_INTENSITY_OPTIONS.find((option) => option.value !== current)?.value ?? "normal";
-    setVariantIntensity(next);
+    setVariantIntensity(current);
     setVariantModalOpen(true);
     setError("");
   };
 
   const handleCreateVariant = async () => {
     if (!project) return;
-    const current = normalizeEditIntensity(project.settings?.edit_intensity);
-    if (variantIntensity === current) {
-      setError("이미 현재 프로젝트가 해당 편집 강도입니다");
-      return;
-    }
 
     const { data: { session } } = await supabase.auth.getSession();
     if (!session) return;
@@ -597,6 +628,7 @@ export default function ProjectDetailPage() {
   const cutTypeLabel = project.cut_type === "subtitle_cut" ? "강의/설명" : "팟캐스트";
   const currentEditIntensity = normalizeEditIntensity(project.settings?.edit_intensity);
   const currentEditIntensityLabel = EDIT_INTENSITY_LABELS[currentEditIntensity];
+  const segmentationDisplay = getSegmentationDisplay(project);
   const isUploadingExtraSources = Boolean(uploadTask);
   const multicamStatus = project.multicam_state?.status || (project.extra_sources.length > 0 ? "pending_apply" : "not_applied");
   const currentMulticamSwitching = normalizeMulticamSwitching(project.settings?.multicam_switching);
@@ -686,6 +718,12 @@ export default function ProjectDetailPage() {
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M4 21v-7" /><path d="M4 10V3" /><path d="M12 21v-9" /><path d="M12 8V3" /><path d="M20 21v-5" /><path d="M20 12V3" /><path d="M2 14h4" /><path d="M10 8h4" /><path d="M18 16h4" /></svg>
                     {currentEditIntensityLabel}
                   </span>
+                  <span
+                    className={"inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs font-medium " + segmentationDisplay.className}
+                    title={segmentationDisplay.title}
+                  >
+                    Segmentation: {segmentationDisplay.label}
+                  </span>
                   {project.source_duration_seconds && (
                     <span className="inline-flex items-center gap-1.5">
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></svg>
@@ -710,7 +748,7 @@ export default function ProjectDetailPage() {
                     onClick={openVariantModal}
                     className="rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-300 transition hover:bg-cyan-500/20"
                   >
-                    편집 강도 변경
+                    새 편집 버전
                   </button>
                 )}
                 <button
@@ -1205,9 +1243,10 @@ export default function ProjectDetailPage() {
       {variantModalOpen && (
         <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/70 px-4">
           <div className="w-full max-w-lg rounded-2xl border border-white/10 bg-[#0a0f1a] p-6 shadow-2xl">
-            <h2 className="text-lg font-semibold">편집 강도 변경</h2>
-            <div className="mt-4 rounded-xl border border-white/[0.06] bg-white/[0.025] px-4 py-3 text-sm text-gray-300">
-              현재 강도: <span className="font-medium text-cyan-300">{currentEditIntensityLabel}</span>
+            <h2 className="text-lg font-semibold">새 편집 버전 생성</h2>
+            <div className="mt-4 rounded-xl border border-white/[0.06] bg-white/[0.025] px-4 py-3 text-sm leading-6 text-gray-300">
+              현재 강도: <span className="font-medium text-cyan-300">{currentEditIntensityLabel}</span><br />
+              새 버전은 raw Scribe V2 cache만 재사용하고 Segmentation부터 다시 실행합니다.
             </div>
             <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-3">
               {EDIT_INTENSITY_OPTIONS.map((option) => {
@@ -1217,22 +1256,25 @@ export default function ProjectDetailPage() {
                   <button
                     key={option.value}
                     type="button"
-                    onClick={() => !isCurrent && setVariantIntensity(option.value)}
-                    disabled={isCurrent || creatingVariant}
+                    onClick={() => setVariantIntensity(option.value)}
+                    disabled={creatingVariant}
                     className={"rounded-xl border p-3 text-left transition disabled:cursor-not-allowed disabled:opacity-45 " + (
-                      isSelected && !isCurrent
+                      isSelected
                         ? "border-cyan-400/60 bg-cyan-500/10"
                         : "border-white/[0.08] bg-white/[0.02] hover:border-white/[0.16] hover:bg-white/[0.04]"
                     )}
                   >
                     <span className="block text-sm font-medium text-gray-100">{option.label}</span>
-                    <span className="mt-1 block text-xs text-gray-500">{isCurrent ? "현재 프로젝트" : option.description}</span>
+                    <span className="mt-1 block text-xs text-gray-500">
+                      {isCurrent ? "같은 강도로 새 Segmentation 실행" : option.description}
+                    </span>
                   </button>
                 );
               })}
             </div>
-            <div className="mt-4 rounded-xl border border-white/[0.06] bg-white/[0.025] px-4 py-3 text-xs text-gray-500">
-              새 프로젝트 이름: <span className="text-gray-300">{project.name} - {EDIT_INTENSITY_LABELS[variantIntensity]}</span>
+            <div className="mt-4 rounded-xl border border-white/[0.06] bg-white/[0.025] px-4 py-3 text-xs leading-5 text-gray-500">
+              새 프로젝트 이름: <span className="text-gray-300">{project.name} - {EDIT_INTENSITY_LABELS[variantIntensity]} YYYYMMDD-HHMMSS</span><br />
+              같은 강도를 선택해도 새 Segmentation 결과와 cut decision을 생성합니다.
             </div>
             <div className="mt-6 flex justify-end gap-3">
               <button
@@ -1244,7 +1286,7 @@ export default function ProjectDetailPage() {
               </button>
               <button
                 onClick={handleCreateVariant}
-                disabled={creatingVariant || variantIntensity === currentEditIntensity}
+                disabled={creatingVariant}
                 className="rounded-lg bg-cyan-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-cyan-400 disabled:opacity-50"
               >
                 {creatingVariant ? "생성 중..." : "생성"}

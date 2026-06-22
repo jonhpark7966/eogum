@@ -91,6 +91,7 @@ export interface Job {
   created_at: string;
   pipeline_stages: PipelineStage[];
   external_task_ids: Record<string, string>;
+  processing_metadata: Record<string, unknown>;
   result_r2_keys: Record<string, string> | null;
 }
 

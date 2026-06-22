@@ -11,6 +11,7 @@ import {
   type SegmentWithDecision,
   type MulticamSwitching,
   type MulticamSourceLabel,
+  type EditDecisionVersion,
 } from "@/lib/api";
 import { useUploads } from "@/lib/upload-provider";
 import { useParams, useRouter } from "next/navigation";
@@ -64,8 +65,22 @@ const EDIT_INTENSITY_LABELS: Record<EditIntensity, string> = {
   heavy: "많이 편집",
 };
 
+const EDIT_DECISION_VERSION_OPTIONS: { value: EditDecisionVersion; label: string; description: string }[] = [
+  { value: "legacy", label: "기존 방식", description: "현재 안정화된 cut/keep 판단" },
+  { value: "boundary_aware_v1", label: "Boundary-aware v1", description: "80ms 이하 인접 경계를 LLM이 함께 판단" },
+];
+
+const EDIT_DECISION_VERSION_LABELS: Record<EditDecisionVersion, string> = {
+  legacy: "기존 방식",
+  boundary_aware_v1: "Boundary-aware v1",
+};
+
 function normalizeEditIntensity(value: unknown): EditIntensity {
   return value === "light" || value === "normal" || value === "heavy" ? value : "normal";
+}
+
+function normalizeEditDecisionVersion(value: unknown): EditDecisionVersion {
+  return value === "boundary_aware_v1" ? "boundary_aware_v1" : "legacy";
 }
 
 const STAGE_STATUS_CONFIG: Record<string, { label: string; dot: string; text: string }> = {
@@ -327,6 +342,7 @@ export default function ProjectDetailPage() {
   const [deleting, setDeleting] = useState(false);
   const [variantModalOpen, setVariantModalOpen] = useState(false);
   const [variantIntensity, setVariantIntensity] = useState<EditIntensity>("light");
+  const [variantEditDecisionVersion, setVariantEditDecisionVersion] = useState<EditDecisionVersion>("legacy");
   const [creatingVariant, setCreatingVariant] = useState(false);
   const [sourceCacheReused, setSourceCacheReused] = useState(false);
 
@@ -576,6 +592,7 @@ export default function ProjectDetailPage() {
     if (!project) return;
     const current = normalizeEditIntensity(project.settings?.edit_intensity);
     setVariantIntensity(current);
+    setVariantEditDecisionVersion(normalizeEditDecisionVersion(project.settings?.edit_decision_version));
     setVariantModalOpen(true);
     setError("");
   };
@@ -589,6 +606,7 @@ export default function ProjectDetailPage() {
     try {
       const variant = await api.createProjectVariant(session.access_token, projectId, {
         edit_intensity: variantIntensity,
+        edit_decision_version: variantEditDecisionVersion,
       });
       router.push("/projects/" + variant.id);
     } catch (err) {
@@ -628,6 +646,8 @@ export default function ProjectDetailPage() {
   const cutTypeLabel = project.cut_type === "subtitle_cut" ? "강의/설명" : "팟캐스트";
   const currentEditIntensity = normalizeEditIntensity(project.settings?.edit_intensity);
   const currentEditIntensityLabel = EDIT_INTENSITY_LABELS[currentEditIntensity];
+  const currentEditDecisionVersion = normalizeEditDecisionVersion(project.settings?.edit_decision_version);
+  const currentEditDecisionVersionLabel = EDIT_DECISION_VERSION_LABELS[currentEditDecisionVersion];
   const segmentationDisplay = getSegmentationDisplay(project);
   const isUploadingExtraSources = Boolean(uploadTask);
   const multicamStatus = project.multicam_state?.status || (project.extra_sources.length > 0 ? "pending_apply" : "not_applied");
@@ -717,6 +737,9 @@ export default function ProjectDetailPage() {
                   <span className="inline-flex items-center gap-1.5 text-cyan-300">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M4 21v-7" /><path d="M4 10V3" /><path d="M12 21v-9" /><path d="M12 8V3" /><path d="M20 21v-5" /><path d="M20 12V3" /><path d="M2 14h4" /><path d="M10 8h4" /><path d="M18 16h4" /></svg>
                     {currentEditIntensityLabel}
+                  </span>
+                  <span className="inline-flex items-center gap-1.5 rounded-full border border-violet-400/20 bg-violet-400/10 px-2 py-0.5 text-xs font-medium text-violet-300">
+                    Edit Decision: {currentEditDecisionVersionLabel}
                   </span>
                   <span
                     className={"inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs font-medium " + segmentationDisplay.className}
@@ -1246,7 +1269,8 @@ export default function ProjectDetailPage() {
             <h2 className="text-lg font-semibold">새 편집 버전 생성</h2>
             <div className="mt-4 rounded-xl border border-white/[0.06] bg-white/[0.025] px-4 py-3 text-sm leading-6 text-gray-300">
               현재 강도: <span className="font-medium text-cyan-300">{currentEditIntensityLabel}</span><br />
-              새 버전은 raw Scribe V2 cache만 재사용하고 Segmentation부터 다시 실행합니다.
+              현재 Edit Decision: <span className="font-medium text-violet-300">{currentEditDecisionVersionLabel}</span><br />
+              새 버전은 전사 캐시를 재사용하고 편집 판단을 다시 실행합니다.
             </div>
             <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-3">
               {EDIT_INTENSITY_OPTIONS.map((option) => {
@@ -1266,15 +1290,30 @@ export default function ProjectDetailPage() {
                   >
                     <span className="block text-sm font-medium text-gray-100">{option.label}</span>
                     <span className="mt-1 block text-xs text-gray-500">
-                      {isCurrent ? "같은 강도로 새 Segmentation 실행" : option.description}
+                      {isCurrent ? "같은 강도로 새 편집 판단 실행" : option.description}
                     </span>
                   </button>
                 );
               })}
             </div>
+            <div className="mt-5">
+              <label className="mb-2 block text-sm font-medium text-gray-200">Edit Decision</label>
+              <select
+                value={variantEditDecisionVersion}
+                onChange={(event) => setVariantEditDecisionVersion(event.currentTarget.value as EditDecisionVersion)}
+                disabled={creatingVariant}
+                className="w-full rounded-xl border border-white/[0.08] bg-[#050812] px-3 py-2.5 text-sm text-gray-200 outline-none transition focus:border-cyan-400/40 disabled:opacity-50"
+              >
+                {EDIT_DECISION_VERSION_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label} - {option.description}
+                  </option>
+                ))}
+              </select>
+            </div>
             <div className="mt-4 rounded-xl border border-white/[0.06] bg-white/[0.025] px-4 py-3 text-xs leading-5 text-gray-500">
               새 프로젝트 이름: <span className="text-gray-300">{project.name} - {EDIT_INTENSITY_LABELS[variantIntensity]} YYYYMMDD-HHMMSS</span><br />
-              같은 강도를 선택해도 새 Segmentation 결과와 cut decision을 생성합니다.
+              같은 강도를 선택해도 새 edit decision을 생성합니다.
             </div>
             <div className="mt-6 flex justify-end gap-3">
               <button

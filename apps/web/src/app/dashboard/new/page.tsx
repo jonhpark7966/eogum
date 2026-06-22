@@ -10,6 +10,7 @@ import { useCallback, useRef, useState } from "react";
 
 type SourceMode = "file" | "youtube";
 type EditIntensity = "light" | "normal" | "heavy";
+type EditDecisionVersion = "legacy" | "boundary_aware_v1";
 
 const EDIT_INTENSITY_OPTIONS: {
   value: EditIntensity;
@@ -19,6 +20,15 @@ const EDIT_INTENSITY_OPTIONS: {
   { value: "light", label: "적게 편집", description: "꼭 필요한 컷만" },
   { value: "normal", label: "일반 편집", description: "균형 있게 정리" },
   { value: "heavy", label: "많이 편집", description: "적극적으로 압축" },
+];
+
+const EDIT_DECISION_VERSION_OPTIONS: {
+  value: EditDecisionVersion;
+  label: string;
+  description: string;
+}[] = [
+  { value: "legacy", label: "기존 방식", description: "현재 안정화된 cut/keep 판단" },
+  { value: "boundary_aware_v1", label: "Boundary-aware v1", description: "80ms 이하 인접 경계를 LLM이 함께 판단" },
 ];
 
 export default function NewProjectPage() {
@@ -31,6 +41,7 @@ export default function NewProjectPage() {
   const [name, setName] = useState("");
   const [cutType, setCutType] = useState("subtitle_cut");
   const [editIntensity, setEditIntensity] = useState<EditIntensity>("normal");
+  const [editDecisionVersion, setEditDecisionVersion] = useState<EditDecisionVersion>("legacy");
   const [language, setLanguage] = useState("ko");
   const [context, setContext] = useState("");
   const [diarize, setDiarize] = useState(true);
@@ -97,6 +108,7 @@ export default function NewProjectPage() {
   const buildProjectSettings = useCallback(() => {
     const projectSettings: Record<string, unknown> = {
       edit_intensity: editIntensity,
+      edit_decision_version: editDecisionVersion,
       diarize,
       tag_audio_events: tagAudioEvents,
       use_llm_segmentation: useLlmSegmentation,
@@ -114,6 +126,7 @@ export default function NewProjectPage() {
     context,
     diarize,
     editIntensity,
+    editDecisionVersion,
     numSpeakers,
     tagAudioEvents,
     useLlmSegmentation,
@@ -478,6 +491,22 @@ export default function NewProjectPage() {
                 </button>
               ))}
             </div>
+          </div>
+
+          {/* Edit decision version */}
+          <div>
+            <label className="block text-sm font-medium mb-2">Edit Decision</label>
+            <select
+              value={editDecisionVersion}
+              onChange={(e) => setEditDecisionVersion(e.target.value as EditDecisionVersion)}
+              className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-3 focus:outline-none focus:border-gray-500"
+            >
+              {EDIT_DECISION_VERSION_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label} - {option.description}
+                </option>
+              ))}
+            </select>
           </div>
 
           {/* Language */}

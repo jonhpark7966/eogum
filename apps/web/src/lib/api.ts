@@ -32,6 +32,7 @@ export interface ExtraSource {
 }
 
 export type MulticamSwitching = "none" | "follow_speaker" | "conservative_follow_speaker";
+export type EditDecisionVersion = "legacy" | "boundary_aware_v1";
 
 export interface MulticamSourceLabel {
   display_id?: string;
@@ -434,7 +435,7 @@ export const api = {
   createProjectVariant: (
     token: string,
     id: string,
-    data: { edit_intensity: "light" | "normal" | "heavy"; name?: string }
+    data: { edit_intensity: "light" | "normal" | "heavy"; edit_decision_version?: EditDecisionVersion; name?: string }
   ) =>
     apiFetch<Project>("/projects/" + id + "/variants", token, {
       method: "POST",

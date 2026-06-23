@@ -19,6 +19,7 @@ from eogum.config import settings
 logger = logging.getLogger(__name__)
 
 StatusCallback = Callable[[dict[str, Any]], None]
+DEFAULT_SEGMENTATION_BOUNDARY_RULE = "word_boundary"
 
 
 class ChalnaClientError(RuntimeError):
@@ -53,6 +54,7 @@ def transcribe_to_srt(
     use_llm_segmentation: bool = True,
     use_llm_refinement: bool = True,
     bypass_llm_segmentation_cache: bool = False,
+    segmentation_boundary_rule: str = DEFAULT_SEGMENTATION_BOUNDARY_RULE,
     on_status: StatusCallback | None = None,
     llm_log_path: str | None = None,
     timeout_seconds: float = 7200.0,
@@ -77,6 +79,7 @@ def transcribe_to_srt(
         "use_llm_segmentation": str(use_llm_segmentation).lower(),
         "use_llm_refinement": str(use_llm_refinement).lower(),
         "bypass_llm_segmentation_cache": str(bypass_llm_segmentation_cache).lower(),
+        "segmentation_boundary_rule": segmentation_boundary_rule,
         "diarize": str(diarize).lower(),
         "tag_audio_events": str(tag_audio_events).lower(),
         "output_format": "json",
@@ -213,6 +216,7 @@ def transcribe_from_scribe_response_to_srt(
     use_llm_segmentation: bool = True,
     use_llm_refinement: bool = True,
     bypass_llm_segmentation_cache: bool = False,
+    segmentation_boundary_rule: str = DEFAULT_SEGMENTATION_BOUNDARY_RULE,
     on_status: StatusCallback | None = None,
     llm_log_path: str | None = None,
     timeout_seconds: float = 7200.0,
@@ -240,6 +244,7 @@ def transcribe_from_scribe_response_to_srt(
             "use_llm_segmentation": str(use_llm_segmentation).lower(),
             "use_llm_refinement": str(use_llm_refinement).lower(),
             "bypass_llm_segmentation_cache": str(bypass_llm_segmentation_cache).lower(),
+            "segmentation_boundary_rule": segmentation_boundary_rule,
             "diarize": str(diarize).lower(),
             "tag_audio_events": str(tag_audio_events).lower(),
             "output_format": "json",
@@ -272,6 +277,7 @@ def transcribe_from_scribe_response_to_srt(
             segmentation_log=segmentation_log,
             use_llm_segmentation=use_llm_segmentation,
             bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
+            segmentation_boundary_rule=segmentation_boundary_rule,
         ),
     )
 
@@ -282,6 +288,7 @@ def summarize_segmentation_metadata(
     segmentation_log: list[dict[str, Any]] | None,
     use_llm_segmentation: bool,
     bypass_llm_segmentation_cache: bool = False,
+    segmentation_boundary_rule: str = DEFAULT_SEGMENTATION_BOUNDARY_RULE,
 ) -> dict[str, Any]:
     meta = metadata if isinstance(metadata, dict) else {}
     logs = [item for item in (segmentation_log or []) if isinstance(item, dict)]
@@ -332,7 +339,18 @@ def summarize_segmentation_metadata(
         "fallback": fallback,
         "cache_hit": cache_hit,
         "cache_bypassed": cache_bypassed,
+        "segmentation_boundary_rule": meta.get(
+            "segmentation_boundary_rule",
+            segmentation_boundary_rule,
+        ),
+        "segmentation_boundary_effective_rule": meta.get(
+            "segmentation_boundary_effective_rule",
+            meta.get("segmentation_boundary_rule", segmentation_boundary_rule),
+        ),
     }
+    boundary_stats = meta.get("segmentation_boundary_stats")
+    if isinstance(boundary_stats, dict):
+        result["segmentation_boundary_stats"] = boundary_stats
     if model:
         result["model"] = model
     if reasoning_effort:

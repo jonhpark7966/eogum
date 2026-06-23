@@ -24,15 +24,30 @@ export async function apiFetch<T>(
 }
 
 // ── Types ──
+export interface SourceDerived {
+  status?: "queued" | "processing" | "ready" | "failed" | string | null;
+  media_info_r2_key?: string | null;
+  audio_proxy_r2_key?: string | null;
+  audio_codec?: string | null;
+  sample_rate?: number | null;
+  channels?: number | null;
+  duration_ms?: number | null;
+  duration_diff_ms?: number | null;
+  error?: string | null;
+}
+
 export interface ExtraSource {
   r2_key: string;
   filename: string;
   size_bytes: number;
   offset_ms?: number | null;
+  source_sha256?: string | null;
+  derived?: SourceDerived | null;
 }
 
 export type MulticamSwitching = "none" | "follow_speaker" | "conservative_follow_speaker";
 export type EditDecisionVersion = "legacy" | "boundary_aware_v1";
+export type SegmentationBoundaryRule = "word_boundary" | "midpoint_gap" | "low_energy_gap_v1";
 
 export interface MulticamSourceLabel {
   display_id?: string;
@@ -56,6 +71,7 @@ export interface Project {
   source_filename: string | null;
   source_duration_seconds: number | null;
   source_sha256?: string | null;
+  source_derived?: SourceDerived | null;
   settings?: Record<string, unknown>;
   extra_sources: ExtraSource[];
   multicam_state: MulticamState;
@@ -435,7 +451,12 @@ export const api = {
   createProjectVariant: (
     token: string,
     id: string,
-    data: { edit_intensity: "light" | "normal" | "heavy"; edit_decision_version?: EditDecisionVersion; name?: string }
+    data: {
+      edit_intensity: "light" | "normal" | "heavy";
+      edit_decision_version?: EditDecisionVersion;
+      segmentation_boundary_rule?: SegmentationBoundaryRule;
+      name?: string;
+    }
   ) =>
     apiFetch<Project>("/projects/" + id + "/variants", token, {
       method: "POST",
@@ -455,6 +476,12 @@ export const api = {
     apiFetch<Project>(`/projects/${id}/extra-sources`, token, {
       method: "PUT",
       body: JSON.stringify({ extra_sources }),
+    }),
+
+  retryExtraSourceDerivatives: (token: string, id: string, force = false) =>
+    apiFetch<Project>(`/projects/${id}/extra-sources/derive`, token, {
+      method: "POST",
+      body: JSON.stringify({ force }),
     }),
 
   updateMulticamSettings: (token: string, id: string, data: UpdateMulticamSettingsPayload) =>

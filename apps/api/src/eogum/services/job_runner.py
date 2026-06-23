@@ -12,7 +12,7 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 
 from eogum.config import settings
-from eogum.services import avid, chalna, credit, email, r2, scribe_v2_cache, source_cache
+from eogum.services import avid, chalna, credit, email, r2, scribe_v2_cache, source_cache, source_derivatives
 from eogum.services.artifacts import get_latest_artifact_job
 from eogum.services.database import execute_with_retry, get_db
 from eogum.services.final_preview_cache import (
@@ -26,13 +26,20 @@ from eogum.services.final_preview_cache import (
 
 logger = logging.getLogger(__name__)
 
-_job_lanes = ("project", "cut_decision", "final_preview")
+_job_lanes = ("project", "source_derive", "cut_decision", "final_preview")
 _queues: dict[str, deque[dict[str, str | None]]] = {lane: deque() for lane in _job_lanes}
 _running_lanes: dict[str, bool] = {lane: False for lane in _job_lanes}
 _lock = threading.Lock()
 _initial_job_types = {"subtitle_cut", "podcast_cut"}
 _incomplete_job_statuses = ["queued", "pending", "running"]
 _stale_running_after = timedelta(hours=6)
+_PODCAST_CUT_RESUME_MARKER = "resume_state.json"
+ALLOWED_SEGMENTATION_BOUNDARY_RULES = {
+    "word_boundary",
+    "midpoint_gap",
+    "low_energy_gap_v1",
+}
+DEFAULT_SEGMENTATION_BOUNDARY_RULE = "word_boundary"
 
 
 def enqueue(project_id: str, job_id: str) -> None:
@@ -55,7 +62,14 @@ def enqueue_final_preview(project_id: str, job_id: str) -> None:
     _enqueue("final_preview", project_id, job_id)
 
 
+def enqueue_source_derive(project_id: str, job_id: str) -> None:
+    """Add source-derivative generation task to queue."""
+    _enqueue("source_derive", project_id, job_id)
+
+
 def _lane_for_kind(kind: str) -> str:
+    if kind == "source_derive":
+        return "source_derive"
     if kind == "cut_decision":
         return "cut_decision"
     if kind == "final_preview":
@@ -86,6 +100,8 @@ def _worker_loop(lane: str) -> None:
         try:
             if item["kind"] == "reprocess":
                 _reprocess_project(project_id, item["job_id"])
+            elif item["kind"] == "source_derive":
+                _derive_project_sources(project_id, item["job_id"])
             elif item["kind"] == "cut_decision":
                 _cut_decision_project(project_id, item["job_id"])
             elif item["kind"] == "final_preview":
@@ -140,6 +156,28 @@ def create_cut_decision_job(db, project: dict) -> dict:
         "progress": 0,
         "pipeline_stages": _cut_decision_pipeline_stages(),
         "external_task_ids": {},
+    }).execute().data[0]
+    return job
+
+
+def create_source_derive_job(
+    db,
+    project: dict,
+    *,
+    source_keys: list[str] | None = None,
+    force: bool = False,
+) -> dict:
+    """Create the durable queue record for source derivative generation."""
+    job = db.table("jobs").insert({
+        "project_id": project["id"],
+        "user_id": project["user_id"],
+        "type": "source_derive",
+        "status": "pending",
+        "progress": 0,
+        "input_payload": {
+            "source_keys": source_keys or source_derivatives.source_keys_needing_derivatives(project, force=force),
+            "force": force,
+        },
     }).execute().data[0]
     return job
 
@@ -202,6 +240,43 @@ def recover_stuck_final_previews(*, recover_running: bool = False) -> int:
     return recovered
 
 
+def recover_stuck_source_derivatives(*, recover_running: bool = False) -> int:
+    """Requeue source-derive jobs that were left behind by a process restart."""
+    db = get_db()
+    jobs = (
+        db.table("jobs")
+        .select("id, project_id, status, started_at, created_at")
+        .eq("type", "source_derive")
+        .in_("status", _incomplete_job_statuses)
+        .order("created_at")
+        .execute()
+        .data
+        or []
+    )
+
+    recovered = 0
+    for job in jobs:
+        try:
+            if job["status"] == "running" and not _should_recover_running_job(job, recover_running):
+                continue
+            db.table("jobs").update({
+                "status": "pending",
+                "progress": 0,
+                "error_message": None,
+                "started_at": None,
+                "completed_at": None,
+            }).eq("id", job["id"]).execute()
+            enqueue_source_derive(job["project_id"], job["id"])
+            recovered += 1
+            logger.info(
+                "Requeued stuck source-derive job %s for project %s",
+                job["id"], job["project_id"],
+            )
+        except Exception:
+            logger.exception("Failed to recover source-derive job %s", job.get("id"))
+    return recovered
+
+
 def start_stuck_project_sweeper(interval_seconds: int = 60) -> threading.Event:
     """Start a background sweeper for orphaned queued jobs."""
     stop_event = threading.Event()
@@ -215,6 +290,9 @@ def start_stuck_project_sweeper(interval_seconds: int = 60) -> threading.Event:
                 recovered_previews = recover_stuck_final_previews(recover_running=False)
                 if recovered_previews:
                     logger.info("Recovered %d stuck final-preview job(s)", recovered_previews)
+                recovered_derivatives = recover_stuck_source_derivatives(recover_running=False)
+                if recovered_derivatives:
+                    logger.info("Recovered %d stuck source-derive job(s)", recovered_derivatives)
             except Exception:
                 logger.exception("Stuck job sweeper failed")
 
@@ -259,6 +337,18 @@ def _recover_stuck_project(db, project: dict, *, recover_running: bool) -> bool:
         db.table("projects").update({"status": "processing"}).eq("id", project_id).execute()
         enqueue_reprocess(project_id, job["id"])
         logger.info("Requeued stuck reprocess job %s for project %s", job["id"], project_id)
+        return True
+
+    if job_type == "source_derive":
+        db.table("jobs").update({
+            "status": "pending",
+            "progress": 0,
+            "error_message": None,
+            "started_at": None,
+            "completed_at": None,
+        }).eq("id", job["id"]).execute()
+        enqueue_source_derive(project_id, job["id"])
+        logger.info("Requeued stuck source-derive job %s for project %s", job["id"], project_id)
         return True
 
     if job_type == "cut_decision":
@@ -366,6 +456,8 @@ def _process_project(project_id: str, job_id: str | None) -> None:
     user_email = None
     duration = 0
     credits_held = False
+    current_stage: str | None = None
+    resume_state: dict | None = None
 
     try:
         claimed = (
@@ -404,23 +496,39 @@ def _process_project(project_id: str, job_id: str | None) -> None:
         output_dir = temp_dir / "output"
         output_dir.mkdir(exist_ok=True)
         llm_log_path = output_dir / "llm_io.jsonl"
+        resume_state = _load_podcast_cut_resume_state(temp_dir, project)
 
         # 1. Hold credits
         credit.hold_credits(user_id, duration, job_id)
         credits_held = True
 
         # 2. Download source from R2
+        current_stage = "source_download"
         source_ext = Path(project["source_filename"]).suffix
-        source_path = str(temp_dir / f"source{source_ext}")
+        source_path_obj = temp_dir / f"source{source_ext}"
+        source_path = str(source_path_obj)
         _update_progress(db, job_id, 5)
 
-        r2.download_file(project["source_r2_key"], source_path)
+        if resume_state and _local_source_matches_resume_state(source_path_obj, resume_state):
+            logger.info("Reusing local source for podcast-cut retry project %s", project_id)
+        else:
+            r2.download_file(project["source_r2_key"], source_path)
         source_sha256 = _register_source_identity(
             db,
             project_id=project_id,
             project=project,
             source_path=source_path,
         )
+        _derive_primary_source_best_effort(
+            db,
+            project_id=project_id,
+            project=project,
+            source_path=source_path_obj,
+            source_sha256=source_sha256,
+        )
+        if resume_state and not _resume_state_source_matches_project(resume_state, project):
+            logger.warning("Discarding podcast-cut resume state for project %s after source validation", project_id)
+            resume_state = None
 
         # 2.5. Download extra sources (multicam)
         extra_source_paths: list[str] = []
@@ -433,6 +541,7 @@ def _process_project(project_id: str, job_id: str | None) -> None:
         _update_progress(db, job_id, 10)
 
         # 3. Transcribe
+        current_stage = "transcription"
         project_settings = project.get("settings") or {}
         transcription_context = project_settings.get("transcription_context")
         use_llm_refinement = _bool_project_setting(
@@ -445,47 +554,68 @@ def _process_project(project_id: str, job_id: str | None) -> None:
             "use_llm_segmentation",
             default=True,
         )
-        transcription_result = _download_reused_transcription_srt(
-            db,
-            job_id=job_id,
-            project_settings=project_settings,
-            output_dir=temp_dir,
-        )
-        if transcription_result is None:
-            transcription_result = _transcribe_with_scribe_v2_cache(
+        if resume_state:
+            srt_path = str(_podcast_cut_resume_srt_path(temp_dir))
+            transcription_result = _podcast_cut_resume_transcription_result(srt_path, resume_state)
+            logger.info("Resuming project %s from podcast-cut using %s", project_id, srt_path)
+        else:
+            transcription_result = _download_reused_transcription_srt(
                 db,
                 job_id=job_id,
-                project=project,
-                source_path=source_path,
+                project_settings=project_settings,
                 output_dir=temp_dir,
-                source_sha256=source_sha256,
-                language=project["language"],
-                transcription_context=transcription_context,
-                diarize=_bool_project_setting(project_settings, "diarize", default=True),
-                tag_audio_events=_bool_project_setting(project_settings, "tag_audio_events", default=True),
-                num_speakers=_optional_int_project_setting(project_settings, "num_speakers"),
-                use_llm_segmentation=use_llm_segmentation,
-                use_llm_refinement=use_llm_refinement,
-                bypass_llm_segmentation_cache=_bool_project_setting(
-                    project_settings,
-                    "bypass_llm_segmentation_cache",
-                    default=False,
-                ),
-                llm_log_path=llm_log_path,
             )
+            if transcription_result is None:
+                transcription_result = _transcribe_with_scribe_v2_cache(
+                    db,
+                    job_id=job_id,
+                    project=project,
+                    source_path=source_path,
+                    output_dir=temp_dir,
+                    source_sha256=source_sha256,
+                    language=project["language"],
+                    transcription_context=transcription_context,
+                    diarize=_bool_project_setting(project_settings, "diarize", default=True),
+                    tag_audio_events=_bool_project_setting(project_settings, "tag_audio_events", default=True),
+                    num_speakers=_optional_int_project_setting(project_settings, "num_speakers"),
+                    use_llm_segmentation=use_llm_segmentation,
+                    use_llm_refinement=use_llm_refinement,
+                    bypass_llm_segmentation_cache=_bool_project_setting(
+                        project_settings,
+                        "bypass_llm_segmentation_cache",
+                        default=False,
+                    ),
+                    segmentation_boundary_rule=_output_segmentation_boundary_rule(project),
+                    llm_log_path=llm_log_path,
+                )
         srt_path = transcription_result.srt_path
         _update_progress(db, job_id, 30)
 
         # 4. Transcript overview (Pass 1)
-        storyline_path = avid.transcript_overview(
-            srt_path,
-            output_path=str(output_dir / "storyline.json"),
-            llm_log_path=str(llm_log_path),
-        )
+        current_stage = "storyline"
+        if resume_state:
+            storyline_path = str(_podcast_cut_resume_storyline_path(temp_dir))
+            logger.info("Reusing transcript overview for podcast-cut retry project %s", project_id)
+        else:
+            storyline_path = avid.transcript_overview(
+                srt_path,
+                output_path=str(output_dir / "storyline.json"),
+                llm_log_path=str(llm_log_path),
+            )
         _update_progress(db, job_id, 50)
 
         # 5. Cut (Pass 2)
+        current_stage = "podcast_cut"
         cut_fn = avid.subtitle_cut if project["cut_type"] == "subtitle_cut" else avid.podcast_cut
+        if project["cut_type"] == "podcast_cut":
+            _write_podcast_cut_resume_state(
+                temp_dir,
+                project_id=project_id,
+                project=project,
+                source_sha256=source_sha256,
+                srt_path=srt_path,
+                storyline_path=storyline_path,
+            )
         result_paths = cut_fn(
             source_path=source_path,
             srt_path=srt_path,
@@ -494,10 +624,13 @@ def _process_project(project_id: str, job_id: str | None) -> None:
             final=True,
             extra_sources=extra_source_paths or None,
             edit_intensity=_output_edit_intensity(project),
+            edit_decision_version=_output_edit_decision_version(project),
+            segmentation_boundary_rule=_output_segmentation_boundary_rule(project),
             llm_log_path=str(llm_log_path),
         )
         result_paths["storyline"] = storyline_path
         _update_progress(db, job_id, 75)
+        current_stage = "upload"
 
         # 5.5. Generate low-quality preview for review page
         import subprocess as sp
@@ -574,14 +707,444 @@ def _process_project(project_id: str, job_id: str | None) -> None:
             logger.exception("Failed to send failure email for project %s", project_id)
 
     finally:
-        # Cleanup temp files
+        # Cleanup temp files unless a podcast-cut retry can reuse them.
         import shutil
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        if _should_preserve_podcast_cut_temp(temp_dir, project, current_stage):
+            logger.info("Preserving temp dir for podcast-cut retry: %s", temp_dir)
+        else:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _derive_project_sources(project_id: str, job_id: str | None) -> None:
+    if not job_id:
+        raise RuntimeError("source-derive job_id is required")
+
+    db = get_db()
+    claimed = (
+        db.table("jobs")
+        .update({
+            "status": "running",
+            "progress": 0,
+            "error_message": None,
+            "started_at": "now()",
+            "completed_at": None,
+        })
+        .eq("id", job_id)
+        .eq("project_id", project_id)
+        .in_("status", ["queued", "pending"])
+        .execute()
+    )
+    if not claimed.data:
+        logger.info("Source-derive job %s for project %s was already claimed or finished", job_id, project_id)
+        return
+
+    job = db.table("jobs").select("input_payload").eq("id", job_id).single().execute().data
+    input_payload = job.get("input_payload") or {}
+    force = bool(input_payload.get("force"))
+    project = db.table("projects").select("*").eq("id", project_id).single().execute().data
+    source_keys = input_payload.get("source_keys") or source_derivatives.source_keys_needing_derivatives(project, force=force)
+    source_keys = [str(key) for key in source_keys if key]
+    if not source_keys:
+        db.table("jobs").update({
+            "status": "completed",
+            "progress": 100,
+            "completed_at": "now()",
+        }).eq("id", job_id).execute()
+        return
+
+    temp_root = settings.avid_temp_dir / "source_derivatives"
+    temp_root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        total = len(source_keys)
+        for index, source_key in enumerate(source_keys):
+            project = db.table("projects").select("*").eq("id", project_id).single().execute().data
+            ref = source_derivatives.source_ref(project, source_key)
+            if not force and source_derivatives.is_ready(ref.get("derived") or {}):
+                _update_source_derive_progress(db, job_id, index + 1, total)
+                continue
+
+            project = _update_project_source_derivative(
+                db,
+                project_id=project_id,
+                project=project,
+                source_key=source_key,
+                snapshot=source_derivatives.processing_snapshot(),
+            )
+            ref = source_derivatives.source_ref(project, source_key)
+            try:
+                snapshot, source_sha256 = source_derivatives.derive_r2_source(ref, temp_root)
+                size_bytes = int(ref.get("size_bytes") or 0)
+                duration_ms = snapshot.get("duration_ms")
+                duration_seconds = int(round(int(duration_ms) / 1000)) if duration_ms else None
+                source_derivatives.persist_asset_derivative(
+                    db,
+                    source_sha256=source_sha256,
+                    size_bytes=size_bytes,
+                    r2_key=ref["r2_key"],
+                    filename=ref.get("filename"),
+                    duration_seconds=duration_seconds,
+                    snapshot=snapshot,
+                )
+                project = _update_project_source_derivative(
+                    db,
+                    project_id=project_id,
+                    project=project,
+                    source_key=source_key,
+                    snapshot=snapshot,
+                    source_sha256=source_sha256,
+                )
+            except Exception as exc:
+                logger.exception("Failed to derive source %s for project %s", source_key, project_id)
+                _update_project_source_derivative(
+                    db,
+                    project_id=project_id,
+                    project=project,
+                    source_key=source_key,
+                    snapshot=source_derivatives.failed_snapshot(str(exc)),
+                )
+                raise
+            _update_source_derive_progress(db, job_id, index + 1, total)
+
+        db.table("jobs").update({
+            "status": "completed",
+            "progress": 100,
+            "completed_at": "now()",
+        }).eq("id", job_id).execute()
+    except Exception as exc:
+        db.table("jobs").update({
+            "status": "failed",
+            "error_message": str(exc)[:1000],
+            "completed_at": "now()",
+        }).eq("id", job_id).execute()
+        raise
+
+
+def _derive_primary_source_best_effort(
+    db,
+    *,
+    project_id: str,
+    project: dict,
+    source_path: Path,
+    source_sha256: str,
+) -> None:
+    if source_derivatives.is_ready(project.get("source_derived") or {}):
+        return
+    try:
+        snapshot, derived_sha256 = source_derivatives.derive_local_source(
+            source_path=source_path,
+            source_key="primary",
+            source_r2_key=project["source_r2_key"],
+            filename=project.get("source_filename"),
+            size_bytes=project.get("source_size_bytes"),
+        )
+        if derived_sha256 != source_sha256:
+            raise RuntimeError("derived source hash does not match registered source hash")
+        size_bytes = int(project.get("source_size_bytes") or source_path.stat().st_size)
+        source_derivatives.persist_asset_derivative(
+            db,
+            source_sha256=source_sha256,
+            size_bytes=size_bytes,
+            r2_key=project["source_r2_key"],
+            filename=project.get("source_filename"),
+            duration_seconds=project.get("source_duration_seconds"),
+            snapshot=snapshot,
+        )
+        updated = _update_project_source_derivative(
+            db,
+            project_id=project_id,
+            project=project,
+            source_key="primary",
+            snapshot=snapshot,
+            source_sha256=source_sha256,
+        )
+        project.update(updated)
+    except Exception:
+        logger.exception("Best-effort primary source derivative generation failed for project %s", project_id)
+
+
+def _update_source_derive_progress(db, job_id: str, completed: int, total: int) -> None:
+    progress = min(100, max(0, round((completed / max(1, total)) * 100)))
+    db.table("jobs").update({"progress": progress}).eq("id", job_id).execute()
+
+
+def _update_project_source_derivative(
+    db,
+    *,
+    project_id: str,
+    project: dict,
+    source_key: str,
+    snapshot: dict,
+    source_sha256: str | None = None,
+) -> dict:
+    updated_project = source_derivatives.set_project_source_snapshot(
+        project,
+        source_key,
+        snapshot,
+        source_sha256=source_sha256,
+    )
+    payload: dict[str, object] = {}
+    if source_key == "primary":
+        payload["source_derived"] = updated_project.get("source_derived") or {}
+        if source_sha256:
+            payload["source_sha256"] = source_sha256
+    else:
+        payload["extra_sources"] = updated_project.get("extra_sources") or []
+
+    return db.table("projects").update(payload).eq("id", project_id).execute().data[0]
+
+
+def _ensure_source_derivatives_current(
+    db,
+    *,
+    project_id: str,
+    project: dict,
+    temp_root: Path,
+) -> dict:
+    source_keys = source_derivatives.source_keys_needing_derivatives(project)
+    if not source_keys:
+        return project
+
+    temp_root.mkdir(parents=True, exist_ok=True)
+    current_project = project
+    for source_key in source_keys:
+        current_project = _update_project_source_derivative(
+            db,
+            project_id=project_id,
+            project=current_project,
+            source_key=source_key,
+            snapshot=source_derivatives.processing_snapshot(),
+        )
+        ref = source_derivatives.source_ref(current_project, source_key)
+        snapshot, source_sha256 = source_derivatives.derive_r2_source(ref, temp_root)
+        size_bytes = int(ref.get("size_bytes") or 0)
+        duration_ms = snapshot.get("duration_ms")
+        duration_seconds = int(round(int(duration_ms) / 1000)) if duration_ms else None
+        source_derivatives.persist_asset_derivative(
+            db,
+            source_sha256=source_sha256,
+            size_bytes=size_bytes,
+            r2_key=ref["r2_key"],
+            filename=ref.get("filename"),
+            duration_seconds=duration_seconds,
+            snapshot=snapshot,
+        )
+        current_project = _update_project_source_derivative(
+            db,
+            project_id=project_id,
+            project=current_project,
+            source_key=source_key,
+            snapshot=snapshot,
+            source_sha256=source_sha256,
+        )
+    return current_project
 
 
 def _output_edit_intensity(project: dict) -> str:
     value = (project.get("settings") or {}).get("edit_intensity")
     return value if value in {"light", "normal", "heavy"} else "normal"
+
+
+def _output_edit_decision_version(project: dict) -> str:
+    value = (project.get("settings") or {}).get("edit_decision_version")
+    return value if value in {"legacy", "boundary_aware_v1"} else "legacy"
+
+
+def _output_segmentation_boundary_rule(project: dict) -> str:
+    value = (project.get("settings") or {}).get("segmentation_boundary_rule")
+    return (
+        value
+        if isinstance(value, str) and value in ALLOWED_SEGMENTATION_BOUNDARY_RULES
+        else DEFAULT_SEGMENTATION_BOUNDARY_RULE
+    )
+
+
+def _podcast_cut_resume_marker_path(temp_dir: Path) -> Path:
+    return temp_dir / "output" / _PODCAST_CUT_RESUME_MARKER
+
+
+def _podcast_cut_resume_srt_path(temp_dir: Path) -> Path:
+    return temp_dir / "source.srt"
+
+
+def _podcast_cut_resume_storyline_path(temp_dir: Path) -> Path:
+    return temp_dir / "output" / "storyline.json"
+
+
+def _project_settings_hash(project: dict) -> str:
+    payload = json.dumps(
+        project.get("settings") or {},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _int_or_none(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_valid_srt_file(path: Path) -> bool:
+    if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+        return False
+    try:
+        return "-->" in path.read_text(encoding="utf-8", errors="ignore")[:8192]
+    except Exception:
+        logger.exception("Failed to validate resume SRT %s", path)
+        return False
+
+
+def _is_valid_storyline_file(path: Path) -> bool:
+    if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+        return False
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+        return True
+    except Exception:
+        logger.exception("Failed to validate resume storyline %s", path)
+        return False
+
+
+def _resume_state_source_matches_project(state: dict, project: dict) -> bool:
+    expected_size = _int_or_none(state.get("source_size_bytes"))
+    project_size = _int_or_none(project.get("source_size_bytes"))
+    return (
+        bool(state.get("source_sha256"))
+        and state.get("source_sha256") == project.get("source_sha256")
+        and expected_size is not None
+        and project_size == expected_size
+    )
+
+
+def _local_source_matches_resume_state(path: Path, state: dict) -> bool:
+    expected_size = _int_or_none(state.get("source_size_bytes"))
+    expected_sha256 = state.get("source_sha256")
+    if not path.exists() or not path.is_file() or expected_size is None or not expected_sha256:
+        return False
+    if path.stat().st_size != expected_size:
+        return False
+    return source_cache.sha256_file(path) == expected_sha256
+
+
+def _load_podcast_cut_resume_state(temp_dir: Path, project: dict | None) -> dict | None:
+    if not project or project.get("cut_type") != "podcast_cut":
+        return None
+
+    marker_path = _podcast_cut_resume_marker_path(temp_dir)
+    if not marker_path.exists():
+        return None
+
+    try:
+        state = json.loads(marker_path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("Failed to load podcast-cut resume marker %s", marker_path)
+        return None
+
+    if not isinstance(state, dict):
+        return None
+    if state.get("failed_stage") != "podcast_cut":
+        return None
+    if state.get("project_id") != project.get("id"):
+        return None
+    if state.get("source_r2_key") != project.get("source_r2_key"):
+        return None
+    if state.get("cut_type") != project.get("cut_type"):
+        return None
+    if state.get("settings_hash") != _project_settings_hash(project):
+        return None
+
+    project_sha256 = project.get("source_sha256")
+    if project_sha256 and state.get("source_sha256") != project_sha256:
+        return None
+    project_size = _int_or_none(project.get("source_size_bytes"))
+    state_size = _int_or_none(state.get("source_size_bytes"))
+    if project_size is not None and state_size != project_size:
+        return None
+
+    srt_path = _podcast_cut_resume_srt_path(temp_dir)
+    storyline_path = _podcast_cut_resume_storyline_path(temp_dir)
+    if state.get("srt_path") != str(srt_path):
+        return None
+    if state.get("storyline_path") != str(storyline_path):
+        return None
+    if not _is_valid_srt_file(srt_path):
+        return None
+    if not _is_valid_storyline_file(storyline_path):
+        return None
+
+    return state
+
+
+def _write_podcast_cut_resume_state(
+    temp_dir: Path,
+    *,
+    project_id: str,
+    project: dict,
+    source_sha256: str,
+    srt_path: str,
+    storyline_path: str,
+) -> None:
+    source_size_bytes = _int_or_none(project.get("source_size_bytes"))
+    if not source_sha256 or source_size_bytes is None:
+        logger.warning("Skipping podcast-cut resume marker for project %s: source identity missing", project_id)
+        return
+
+    marker_path = _podcast_cut_resume_marker_path(temp_dir)
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "project_id": project_id,
+        "source_r2_key": project.get("source_r2_key"),
+        "source_sha256": source_sha256,
+        "source_size_bytes": source_size_bytes,
+        "cut_type": project.get("cut_type"),
+        "settings_hash": _project_settings_hash(project),
+        "srt_path": str(Path(srt_path)),
+        "storyline_path": str(Path(storyline_path)),
+        "failed_stage": "podcast_cut",
+    }
+    marker_path.write_text(
+        json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _podcast_cut_resume_transcription_result(
+    srt_path: str,
+    resume_state: dict,
+) -> chalna.TranscriptionSrtResult:
+    return chalna.TranscriptionSrtResult(
+        srt_path=srt_path,
+        external_task_id="",
+        metadata={"segmentation_source": "resume"},
+        segmentation_log=[],
+        processing_metadata={
+            "segmentation_source": "resume",
+            "segmentation_mode": "podcast_cut_resume",
+            "segmentation_label": "Podcast-cut retry resume",
+            "fallback": False,
+            "cache_hit": False,
+            "cache_bypassed": False,
+            "resumed_from_temp": True,
+            "resume_failed_stage": resume_state.get("failed_stage"),
+        },
+    )
+
+
+def _should_preserve_podcast_cut_temp(
+    temp_dir: Path,
+    project: dict | None,
+    current_stage: str | None,
+) -> bool:
+    if current_stage != "podcast_cut":
+        return False
+    return _load_podcast_cut_resume_state(temp_dir, project) is not None
 
 
 def _resolve_extra_source_offsets(extra_sources: list[dict]) -> list[int] | None:
@@ -875,23 +1438,26 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
                 encoding="utf-8",
             )
 
-        source_path = None
-        extra_paths: list[str] = []
+        source_manifest_path = None
         if has_extra_sources:
-            source_ext = Path(project["source_filename"]).suffix
-            local_source_path = temp_dir / f"source{source_ext}"
             _raise_if_canceled(db, job_id)
-            r2.download_file(project["source_r2_key"], str(local_source_path))
+            project = _ensure_source_derivatives_current(
+                db,
+                project_id=project_id,
+                project=project,
+                temp_root=settings.avid_temp_dir / "source_derivatives",
+            )
             _raise_if_canceled(db, job_id)
-            source_path = str(local_source_path)
-
-            used_extra_names: set[str] = set()
-            for i, es in enumerate(project["extra_sources"]):
-                local_path = _local_extra_source_path(temp_dir, es, i, used_extra_names)
-                _raise_if_canceled(db, job_id)
-                r2.download_file(es["r2_key"], str(local_path))
-                _raise_if_canceled(db, job_id)
-                extra_paths.append(str(local_path))
+            local_derivatives = source_derivatives.download_ready_derivatives(
+                project,
+                temp_dir / "derived_sources",
+            )
+            _raise_if_canceled(db, job_id)
+            source_manifest_path = source_derivatives.build_manifest(
+                project,
+                temp_dir / "multicam_sources.json",
+                local_derivatives,
+            )
 
         steps = _plan_reprocess_steps(
             has_evaluation=bool(eval_segments),
@@ -921,12 +1487,12 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
         if "rebuild-multicam" in steps:
             multicam_output = temp_dir / "02_multicam.project.avid.json"
             _raise_if_canceled(db, job_id)
-            payload = avid.rebuild_multicam(
+            if not source_manifest_path:
+                raise RuntimeError("멀티캠 source manifest가 준비되지 않았습니다")
+            payload = avid.rebuild_multicam_from_manifest(
                 project_json_path=str(working_project_json),
-                source_path=str(source_path),
-                extra_sources=extra_paths,
+                source_manifest_path=str(source_manifest_path),
                 output_project_json=str(multicam_output),
-                offsets=extra_offsets,
                 is_canceled=cancel_check,
             )
             _raise_if_canceled(db, job_id)
@@ -1188,6 +1754,7 @@ def _cut_decision_project(project_id: str, job_id: str | None) -> None:
             final=True,
             extra_sources=extra_source_paths or None,
             edit_intensity=_output_edit_intensity(project),
+            edit_decision_version=_output_edit_decision_version(project),
             llm_log_path=str(llm_log_path),
         )
         if llm_log_path.exists() and llm_log_path.stat().st_size > 0:
@@ -1793,6 +2360,7 @@ def _transcribe_with_scribe_v2_cache(
     use_llm_segmentation: bool,
     use_llm_refinement: bool,
     bypass_llm_segmentation_cache: bool,
+    segmentation_boundary_rule: str,
     llm_log_path: Path | None = None,
 ) -> chalna.TranscriptionSrtResult:
     source = Path(source_path)
@@ -1884,7 +2452,11 @@ def _transcribe_with_scribe_v2_cache(
             scribe_v2_cache.mark_cache_failed(db, cache_key=cache_key, error_message=str(exc))
             raise
 
-    if not use_llm_segmentation and not use_llm_refinement:
+    if (
+        not use_llm_segmentation
+        and not use_llm_refinement
+        and segmentation_boundary_rule == DEFAULT_SEGMENTATION_BOUNDARY_RULE
+    ):
         output_path = output_dir / "source.srt"
         output_path.write_text(raw_srt_local.read_text(encoding="utf-8"), encoding="utf-8")
         _write_scribe_cache_pipeline_status(
@@ -1906,9 +2478,11 @@ def _transcribe_with_scribe_v2_cache(
                 "segmentation_label": "Heuristic",
                 "fallback": False,
                 "cache_hit": False,
-                "cache_bypassed": False,
-            },
-        )
+            "cache_bypassed": False,
+            "segmentation_boundary_rule": segmentation_boundary_rule,
+            "segmentation_boundary_effective_rule": segmentation_boundary_rule,
+        },
+    )
 
     return chalna.transcribe_from_scribe_response_to_srt(
         source_path,
@@ -1922,6 +2496,7 @@ def _transcribe_with_scribe_v2_cache(
         use_llm_segmentation=use_llm_segmentation,
         use_llm_refinement=use_llm_refinement,
         bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
+        segmentation_boundary_rule=segmentation_boundary_rule,
         llm_log_path=str(llm_log_path) if llm_log_path else None,
         on_status=lambda payload: _update_chalna_pipeline_status(
             db,

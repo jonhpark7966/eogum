@@ -3,7 +3,7 @@
 export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
-import { api, uploadFile, YouTubeInfoResponse } from "@/lib/api";
+import { api, uploadFile, type SegmentationBoundaryRule, YouTubeInfoResponse } from "@/lib/api";
 import { sha256File } from "@/lib/hash";
 import { useRouter } from "next/navigation";
 import { useCallback, useRef, useState } from "react";
@@ -31,6 +31,16 @@ const EDIT_DECISION_VERSION_OPTIONS: {
   { value: "boundary_aware_v1", label: "Boundary-aware v1", description: "80ms 이하 인접 경계를 LLM이 함께 판단" },
 ];
 
+const SEGMENTATION_BOUNDARY_RULE_OPTIONS: {
+  value: SegmentationBoundaryRule;
+  label: string;
+  description: string;
+}[] = [
+  { value: "word_boundary", label: "Word boundary", description: "Scribe word timestamp 유지" },
+  { value: "midpoint_gap", label: "Midpoint gap", description: "짧은 gap은 midpoint, 긴 gap은 padding 제한" },
+  { value: "low_energy_gap_v1", label: "Low-energy v1", description: "짧은 gap에서 가장 조용한 지점 선택" },
+];
+
 export default function NewProjectPage() {
   const router = useRouter();
   const supabase = createClient();
@@ -42,6 +52,8 @@ export default function NewProjectPage() {
   const [cutType, setCutType] = useState("subtitle_cut");
   const [editIntensity, setEditIntensity] = useState<EditIntensity>("normal");
   const [editDecisionVersion, setEditDecisionVersion] = useState<EditDecisionVersion>("legacy");
+  const [segmentationBoundaryRule, setSegmentationBoundaryRule] =
+    useState<SegmentationBoundaryRule>("word_boundary");
   const [language, setLanguage] = useState("ko");
   const [context, setContext] = useState("");
   const [diarize, setDiarize] = useState(true);
@@ -109,6 +121,7 @@ export default function NewProjectPage() {
     const projectSettings: Record<string, unknown> = {
       edit_intensity: editIntensity,
       edit_decision_version: editDecisionVersion,
+      segmentation_boundary_rule: segmentationBoundaryRule,
       diarize,
       tag_audio_events: tagAudioEvents,
       use_llm_segmentation: useLlmSegmentation,
@@ -127,6 +140,7 @@ export default function NewProjectPage() {
     diarize,
     editIntensity,
     editDecisionVersion,
+    segmentationBoundaryRule,
     numSpeakers,
     tagAudioEvents,
     useLlmSegmentation,
@@ -502,6 +516,22 @@ export default function NewProjectPage() {
               className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-3 focus:outline-none focus:border-gray-500"
             >
               {EDIT_DECISION_VERSION_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label} - {option.description}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Segmentation boundary rule */}
+          <div>
+            <label className="block text-sm font-medium mb-2">Segmentation Boundary</label>
+            <select
+              value={segmentationBoundaryRule}
+              onChange={(e) => setSegmentationBoundaryRule(e.target.value as SegmentationBoundaryRule)}
+              className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-3 focus:outline-none focus:border-gray-500"
+            >
+              {SEGMENTATION_BOUNDARY_RULE_OPTIONS.map((option) => (
                 <option key={option.value} value={option.value}>
                   {option.label} - {option.description}
                 </option>

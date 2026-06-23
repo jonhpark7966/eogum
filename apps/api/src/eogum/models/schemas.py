@@ -21,10 +21,16 @@ class ExtraSourceItem(BaseModel):
     filename: str
     size_bytes: int
     offset_ms: int | None = None
+    source_sha256: str | None = None
+    derived: dict | None = None
 
 
 class UpdateExtraSourcesRequest(BaseModel):
     extra_sources: list[ExtraSourceItem]
+
+
+class SourceDeriveRequest(BaseModel):
+    force: bool = False
 
 
 class UpdateMulticamSettingsRequest(BaseModel):
@@ -49,6 +55,8 @@ class ProjectCreate(BaseModel):
 
 class ProjectVariantCreate(BaseModel):
     edit_intensity: str
+    edit_decision_version: str | None = None
+    segmentation_boundary_rule: str | None = None
     name: str | None = None
 
 
@@ -62,6 +70,7 @@ class ProjectResponse(BaseModel):
     source_filename: str | None
     source_duration_seconds: int | None
     source_sha256: str | None = None
+    source_derived: dict = {}
     extra_sources: list[dict] = []
     multicam_state: dict = {}
     created_at: datetime

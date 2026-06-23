@@ -17,6 +17,7 @@ async def lifespan(app: FastAPI):
     from eogum.services.job_runner import (
         recover_stuck_final_previews,
         recover_stuck_projects,
+        recover_stuck_source_derivatives,
         start_stuck_project_sweeper,
     )
 
@@ -33,6 +34,13 @@ async def lifespan(app: FastAPI):
             logger.info("Recovered %d stuck final-preview job(s) on startup", recovered_previews)
     except Exception:
         logger.exception("Startup final-preview recovery failed")
+
+    try:
+        recovered_derivatives = recover_stuck_source_derivatives(recover_running=True)
+        if recovered_derivatives:
+            logger.info("Recovered %d stuck source-derive job(s) on startup", recovered_derivatives)
+    except Exception:
+        logger.exception("Startup source-derive recovery failed")
 
     sweeper_stop = start_stuck_project_sweeper(interval_seconds=60)
     try:

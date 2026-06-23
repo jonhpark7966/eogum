@@ -11,6 +11,7 @@ from eogum.models.schemas import (
     ProjectDetailResponse,
     ProjectResponse,
     ProjectVariantCreate,
+    SourceDeriveRequest,
     UpdateExtraSourcesRequest,
     UpdateMulticamSettingsRequest,
 )
@@ -20,17 +21,26 @@ from eogum.services.database import get_db
 from eogum.services.job_runner import (
     create_cut_decision_job,
     create_initial_job,
+    create_source_derive_job,
     enqueue,
     enqueue_cut_decision,
     enqueue_reprocess,
+    enqueue_source_derive,
 )
 from eogum.services.r2 import delete_objects, download_to_bytes, object_exists
-from eogum.services.source_cache import upsert_source_asset
+from eogum.services import source_derivatives
+from eogum.services.source_cache import lookup_source_asset, upsert_source_asset
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 logger = logging.getLogger(__name__)
 
 ALLOWED_EDIT_INTENSITIES = {"light", "normal", "heavy"}
+ALLOWED_EDIT_DECISION_VERSIONS = {"legacy", "boundary_aware_v1"}
+ALLOWED_SEGMENTATION_BOUNDARY_RULES = {
+    "word_boundary",
+    "midpoint_gap",
+    "low_energy_gap_v1",
+}
 ALLOWED_MULTICAM_SWITCHING = {
     "none",
     "follow_speaker",
@@ -194,6 +204,18 @@ def _upsert_project_source_asset_best_effort(db, project: dict) -> None:
         logger.exception("Failed to upsert source asset for project %s", project.get("id"))
 
 
+def _cached_source_derived(db, *, sha256: str | None, size_bytes: int | None) -> dict:
+    if not sha256 or size_bytes is None:
+        return {}
+    try:
+        asset = lookup_source_asset(db, sha256=sha256, size_bytes=int(size_bytes))
+    except Exception:
+        logger.exception("Failed to lookup cached source derivative")
+        return {}
+    snapshot = source_derivatives.normalize_asset_row(asset)
+    return snapshot if source_derivatives.is_ready(snapshot) else {}
+
+
 def _assert_project_source_exists(project: dict) -> None:
     source_r2_key = project.get("source_r2_key")
     if not source_r2_key:
@@ -262,6 +284,78 @@ def _create_initial_job_or_fail(db, project: dict) -> dict:
         ) from exc
 
 
+def _mark_derivatives_queued(project: dict, source_keys: list[str]) -> dict:
+    updated = dict(project)
+    for source_key in source_keys:
+        ref = source_derivatives.source_ref(updated, source_key)
+        if source_derivatives.is_ready(ref.get("derived") or {}):
+            continue
+        updated = source_derivatives.set_project_source_snapshot(
+            updated,
+            source_key,
+            source_derivatives.queued_snapshot(),
+        )
+    return updated
+
+
+def _queue_source_derive_if_needed(
+    db,
+    project: dict,
+    *,
+    source_keys: list[str],
+    force: bool = False,
+) -> None:
+    source_keys = [key for key in source_keys if key]
+    if not source_keys:
+        return
+    job = create_source_derive_job(db, project, source_keys=source_keys, force=force)
+    enqueue_source_derive(project["id"], job["id"])
+
+
+def _extra_sources_with_preserved_derivatives(project: dict, incoming: list[dict]) -> list[dict]:
+    existing_by_key = {
+        item.get("r2_key"): item
+        for item in (project.get("extra_sources") or [])
+        if item.get("r2_key")
+    }
+    merged: list[dict] = []
+    for source in incoming:
+        normalized = dict(source)
+        existing = existing_by_key.get(normalized.get("r2_key")) or {}
+        if existing.get("source_sha256"):
+            normalized["source_sha256"] = existing["source_sha256"]
+        if existing.get("derived"):
+            normalized["derived"] = existing["derived"]
+        elif not normalized.get("derived"):
+            normalized["derived"] = {}
+        merged.append(normalized)
+    return merged
+
+
+def _ensure_multicam_derivatives_ready_or_raise(db, project: dict) -> None:
+    missing = source_derivatives.source_keys_needing_derivatives(project)
+    if not missing:
+        return
+
+    queued_project = _mark_derivatives_queued(project, missing)
+    update_values = {
+        "source_derived": queued_project.get("source_derived") or {},
+        "extra_sources": queued_project.get("extra_sources") or [],
+    }
+    updated = (
+        db.table("projects")
+        .update(update_values)
+        .eq("id", project["id"])
+        .execute()
+        .data[0]
+    )
+    _queue_source_derive_if_needed(db, updated, source_keys=missing)
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="멀티캠 적용 준비 중입니다. 오디오 프록시 생성이 끝난 뒤 다시 시도해주세요.",
+    )
+
+
 
 def _validate_project_settings(req: ProjectCreate) -> None:
     settings_value = dict(req.settings or {})
@@ -278,6 +372,28 @@ def _validate_project_settings(req: ProjectCreate) -> None:
             detail="편집 강도는 light, normal, heavy 중 하나여야 합니다",
         )
     settings_value["edit_intensity"] = edit_intensity
+
+    edit_decision_version = settings_value.get("edit_decision_version", "legacy")
+    if (
+        not isinstance(edit_decision_version, str)
+        or edit_decision_version not in ALLOWED_EDIT_DECISION_VERSIONS
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Edit Decision 방식은 legacy 또는 boundary_aware_v1 중 하나여야 합니다",
+        )
+    settings_value["edit_decision_version"] = edit_decision_version
+
+    segmentation_boundary_rule = settings_value.get("segmentation_boundary_rule", "word_boundary")
+    if (
+        not isinstance(segmentation_boundary_rule, str)
+        or segmentation_boundary_rule not in ALLOWED_SEGMENTATION_BOUNDARY_RULES
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Segmentation Boundary Rule은 word_boundary, midpoint_gap, low_energy_gap_v1 중 하나여야 합니다",
+        )
+    settings_value["segmentation_boundary_rule"] = segmentation_boundary_rule
     req.settings = settings_value
 
     for key in ("diarize", "tag_audio_events", "use_llm_segmentation", "use_llm_refinement"):
@@ -323,6 +439,12 @@ def create_project(req: ProjectCreate, user_id: str = Depends(get_user_id)):
         )
 
     db = get_db()
+    source_derived = _cached_source_derived(
+        db,
+        sha256=req.source_sha256,
+        size_bytes=req.source_size_bytes,
+    )
+
     project = db.table("projects").insert({
         "user_id": user_id,
         "name": req.name,
@@ -334,6 +456,7 @@ def create_project(req: ProjectCreate, user_id: str = Depends(get_user_id)):
         "source_duration_seconds": req.source_duration_seconds,
         "source_size_bytes": req.source_size_bytes,
         "source_sha256": req.source_sha256,
+        "source_derived": source_derived,
         "settings": req.settings,
     }).execute().data[0]
 
@@ -352,6 +475,23 @@ def create_project_variant(project_id: str, req: ProjectVariantCreate, current_u
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="편집 강도는 light, normal, heavy 중 하나여야 합니다",
+        )
+
+    requested_edit_decision_version = req.edit_decision_version
+    if requested_edit_decision_version is not None and requested_edit_decision_version not in ALLOWED_EDIT_DECISION_VERSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Edit Decision 방식은 legacy 또는 boundary_aware_v1 중 하나여야 합니다",
+        )
+
+    requested_segmentation_boundary_rule = req.segmentation_boundary_rule
+    if (
+        requested_segmentation_boundary_rule is not None
+        and requested_segmentation_boundary_rule not in ALLOWED_SEGMENTATION_BOUNDARY_RULES
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Segmentation Boundary Rule은 word_boundary, midpoint_gap, low_energy_gap_v1 중 하나여야 합니다",
         )
 
     db = get_db()
@@ -382,9 +522,25 @@ def create_project_variant(project_id: str, req: ProjectVariantCreate, current_u
             detail="크레딧이 부족합니다. 필요: %d초, 사용 가능: %d초" % (duration, balance["available_seconds"]),
         )
 
+    source_edit_decision_version = source_settings.get("edit_decision_version", "legacy")
+    if source_edit_decision_version not in ALLOWED_EDIT_DECISION_VERSIONS:
+        source_edit_decision_version = "legacy"
+    edit_decision_version = requested_edit_decision_version or source_edit_decision_version
+    source_segmentation_boundary_rule = source_settings.get(
+        "segmentation_boundary_rule",
+        "word_boundary",
+    )
+    if source_segmentation_boundary_rule not in ALLOWED_SEGMENTATION_BOUNDARY_RULES:
+        source_segmentation_boundary_rule = "word_boundary"
+    segmentation_boundary_rule = (
+        requested_segmentation_boundary_rule or source_segmentation_boundary_rule
+    )
+
     variant_settings = {
         **source_settings,
         "edit_intensity": req.edit_intensity,
+        "edit_decision_version": edit_decision_version,
+        "segmentation_boundary_rule": segmentation_boundary_rule,
         "bypass_llm_segmentation_cache": True,
     }
     for internal_key in (
@@ -402,6 +558,12 @@ def create_project_variant(project_id: str, req: ProjectVariantCreate, current_u
             timestamp,
         )
 
+    source_derived = source_project_data.get("source_derived") or _cached_source_derived(
+        db,
+        sha256=source_project_data.get("source_sha256"),
+        size_bytes=int(source_size_bytes),
+    )
+
     project = db.table("projects").insert({
         "user_id": source_owner_id,
         "name": variant_name,
@@ -413,6 +575,7 @@ def create_project_variant(project_id: str, req: ProjectVariantCreate, current_u
         "source_duration_seconds": duration,
         "source_size_bytes": int(source_size_bytes),
         "source_sha256": source_project_data.get("source_sha256"),
+        "source_derived": source_derived,
         "settings": variant_settings,
     }).execute().data[0]
 
@@ -563,10 +726,24 @@ def update_extra_sources(
             detail="완료 또는 실패한 프로젝트만 추가 소스를 설정할 수 있습니다",
         )
 
-    extra_sources = [s.model_dump() for s in req.extra_sources]
+    extra_sources = _extra_sources_with_preserved_derivatives(
+        project_data,
+        [s.model_dump() for s in req.extra_sources],
+    )
+    pending_project = {
+        **project_data,
+        "extra_sources": extra_sources,
+    }
+    source_keys = (
+        source_derivatives.source_keys_needing_derivatives(pending_project)
+        if extra_sources else []
+    )
+    pending_project = _mark_derivatives_queued(pending_project, source_keys)
+    extra_sources = pending_project.get("extra_sources") or []
     updated = (
         db.table("projects")
         .update({
+            "source_derived": pending_project.get("source_derived") or {},
             "extra_sources": extra_sources,
             "multicam_state": _pending_multicam_state(project_data, extra_sources),
         })
@@ -574,6 +751,43 @@ def update_extra_sources(
         .execute()
         .data[0]
     )
+    _queue_source_derive_if_needed(db, updated, source_keys=source_keys)
+    return updated
+
+
+@router.post("/{project_id}/extra-sources/derive", response_model=ProjectResponse)
+def retry_extra_source_derivatives(
+    project_id: str,
+    req: SourceDeriveRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    db = get_db()
+    project_data = _get_accessible_project(db, project_id, current_user)
+
+    if project_data["status"] in {"queued", "processing"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="처리 중인 프로젝트의 파생 파일은 재생성할 수 없습니다",
+        )
+    if not project_data.get("extra_sources"):
+        return project_data
+
+    source_keys = source_derivatives.source_keys_needing_derivatives(project_data, force=req.force)
+    if not source_keys:
+        return project_data
+
+    queued_project = _mark_derivatives_queued(project_data, source_keys)
+    updated = (
+        db.table("projects")
+        .update({
+            "source_derived": queued_project.get("source_derived") or {},
+            "extra_sources": queued_project.get("extra_sources") or [],
+        })
+        .eq("id", project_id)
+        .execute()
+        .data[0]
+    )
+    _queue_source_derive_if_needed(db, updated, source_keys=source_keys, force=req.force)
     return updated
 
 
@@ -685,7 +899,7 @@ def multicam_reprocess(project_id: str, current_user: CurrentUser = Depends(get_
         )
 
     if has_extra_sources:
-        _assert_project_source_exists(project_data)
+        _ensure_multicam_derivatives_ready_or_raise(db, project_data)
 
     desired_hash = _extra_sources_hash(project_data.get("extra_sources") or [])
     queued_job = db.table("jobs").insert({

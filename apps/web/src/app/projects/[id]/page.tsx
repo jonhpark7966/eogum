@@ -12,6 +12,7 @@ import {
   type MulticamSwitching,
   type MulticamSourceLabel,
   type EditDecisionVersion,
+  type SegmentationBoundaryRule,
 } from "@/lib/api";
 import { useUploads } from "@/lib/upload-provider";
 import { useParams, useRouter } from "next/navigation";
@@ -48,6 +49,7 @@ const JOB_TYPE_LABELS: Record<string, string> = {
   reprocess_multicam: "멀티캠 적용",
   cut_decision: "컷 결정 재실행",
   final_preview: "완성본 미리보기",
+  source_derive: "오디오 준비",
 };
 
 
@@ -75,12 +77,32 @@ const EDIT_DECISION_VERSION_LABELS: Record<EditDecisionVersion, string> = {
   boundary_aware_v1: "Boundary-aware v1",
 };
 
+const SEGMENTATION_BOUNDARY_RULE_OPTIONS: {
+  value: SegmentationBoundaryRule;
+  label: string;
+  description: string;
+}[] = [
+  { value: "word_boundary", label: "Word boundary", description: "Scribe word timestamp 유지" },
+  { value: "midpoint_gap", label: "Midpoint gap", description: "짧은 gap은 midpoint, 긴 gap은 padding 제한" },
+  { value: "low_energy_gap_v1", label: "Low-energy v1", description: "짧은 gap에서 가장 조용한 지점 선택" },
+];
+
+const SEGMENTATION_BOUNDARY_RULE_LABELS: Record<SegmentationBoundaryRule, string> = {
+  word_boundary: "Word boundary",
+  midpoint_gap: "Midpoint gap",
+  low_energy_gap_v1: "Low-energy v1",
+};
+
 function normalizeEditIntensity(value: unknown): EditIntensity {
   return value === "light" || value === "normal" || value === "heavy" ? value : "normal";
 }
 
 function normalizeEditDecisionVersion(value: unknown): EditDecisionVersion {
   return value === "boundary_aware_v1" ? "boundary_aware_v1" : "legacy";
+}
+
+function normalizeSegmentationBoundaryRule(value: unknown): SegmentationBoundaryRule {
+  return value === "midpoint_gap" || value === "low_energy_gap_v1" ? value : "word_boundary";
 }
 
 const STAGE_STATUS_CONFIG: Record<string, { label: string; dot: string; text: string }> = {
@@ -193,6 +215,41 @@ function getSegmentationDisplay(project: ProjectDetail): SegmentationDisplay {
   };
 }
 
+function getBoundaryRuleDisplay(project: ProjectDetail): SegmentationDisplay {
+  const metadataJob = [...project.jobs]
+    .filter((job) => typeof job.processing_metadata?.segmentation_boundary_rule === "string")
+    .sort(newestJobFirst)[0];
+  const metadata = metadataJob?.processing_metadata ?? {};
+  const rule = normalizeSegmentationBoundaryRule(
+    metadata.segmentation_boundary_rule ?? project.settings?.segmentation_boundary_rule
+  );
+  const effectiveRule = normalizeSegmentationBoundaryRule(
+    metadata.segmentation_boundary_effective_rule ?? rule
+  );
+  const stats = metadata.segmentation_boundary_stats;
+  const statParts: string[] = [];
+  if (stats && typeof stats === "object") {
+    const values = stats as Record<string, unknown>;
+    for (const key of ["low_energy_boundaries", "midpoint_boundaries", "capped_gap_boundaries", "fallback_boundaries"]) {
+      if (typeof values[key] === "number") statParts.push(`${key}=${values[key]}`);
+    }
+  }
+  return {
+    label: SEGMENTATION_BOUNDARY_RULE_LABELS[rule],
+    className:
+      rule === "low_energy_gap_v1"
+        ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300"
+        : rule === "midpoint_gap"
+          ? "border-sky-400/20 bg-sky-400/10 text-sky-300"
+          : "border-slate-400/20 bg-slate-400/10 text-slate-300",
+    title:
+      "Boundary: " +
+      SEGMENTATION_BOUNDARY_RULE_LABELS[rule] +
+      (effectiveRule !== rule ? " (effective: " + SEGMENTATION_BOUNDARY_RULE_LABELS[effectiveRule] + ")" : "") +
+      (statParts.length ? " - " + statParts.join(", ") : ""),
+  };
+}
+
 function getVisibleProcessingJobs(project: ProjectDetail): ProjectJob[] {
   const multicamJobId = project.multicam_state?.job_id;
   if (multicamJobId) {
@@ -264,6 +321,40 @@ function speakerSourceMapFromSettings(settings: Record<string, unknown> | undefi
 
 function normalizeMulticamSwitching(value: unknown): MulticamSwitching {
   return value === "follow_speaker" || value === "conservative_follow_speaker" ? value : "none";
+}
+
+function sourceDerivedStatus(source: { derived?: { status?: string | null } | null }): string {
+  return source.derived?.status || "missing";
+}
+
+function derivedStatusLabel(status: string): string {
+  if (status === "ready") return "오디오 준비 완료";
+  if (status === "queued" || status === "processing") return "오디오 준비 중";
+  if (status === "failed") return "오디오 준비 실패";
+  return "오디오 미준비";
+}
+
+function multicamDerivativesReady(project: ProjectDetail): boolean {
+  return project.source_derived?.status === "ready"
+    && project.extra_sources.every((source) => sourceDerivedStatus(source) === "ready");
+}
+
+function hasActiveDerivatives(project: ProjectDetail | null): boolean {
+  if (!project) return false;
+  const statuses = [
+    project.source_derived?.status,
+    ...project.extra_sources.map((source) => source.derived?.status),
+  ];
+  return statuses.some((status) => status === "queued" || status === "processing");
+}
+
+function hasFailedDerivatives(project: ProjectDetail | null): boolean {
+  if (!project) return false;
+  const statuses = [
+    project.source_derived?.status,
+    ...project.extra_sources.map((source) => source.derived?.status),
+  ];
+  return statuses.some((status) => status === "failed");
 }
 
 function multicamSourceOptions(project: ProjectDetail): MulticamSourceOption[] {
@@ -343,12 +434,15 @@ export default function ProjectDetailPage() {
   const [variantModalOpen, setVariantModalOpen] = useState(false);
   const [variantIntensity, setVariantIntensity] = useState<EditIntensity>("light");
   const [variantEditDecisionVersion, setVariantEditDecisionVersion] = useState<EditDecisionVersion>("legacy");
+  const [variantSegmentationBoundaryRule, setVariantSegmentationBoundaryRule] =
+    useState<SegmentationBoundaryRule>("word_boundary");
   const [creatingVariant, setCreatingVariant] = useState(false);
   const [sourceCacheReused, setSourceCacheReused] = useState(false);
 
   // Multicam state
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [multicamProcessing, setMulticamProcessing] = useState(false);
+  const [derivativesRetrying, setDerivativesRetrying] = useState(false);
   const [multicamSettingsSaving, setMulticamSettingsSaving] = useState(false);
   const [reviewSegments, setReviewSegments] = useState<SegmentWithDecision[]>([]);
   const [reviewSegmentsLoading, setReviewSegmentsLoading] = useState(false);
@@ -359,6 +453,13 @@ export default function ProjectDetailPage() {
   const latestUploadTaskStatus = tasks.find((task) => task.projectId === projectId)?.status;
   const multicamSources = useMemo(() => project ? multicamSourceOptions(project) : [], [project]);
   const speakerSummaries = useMemo(() => speakerSummariesFromSegments(reviewSegments), [reviewSegments]);
+  const derivativePollingKey = project
+    ? [
+        project.source_derived?.status || "missing",
+        ...project.extra_sources.map((source) => source.derived?.status || "missing"),
+      ].join("|")
+    : "";
+  const hasActiveSourceDerivatives = hasActiveDerivatives(project);
 
   const loadProject = useCallback(async () => {
     const { data: { session } } = await supabase.auth.getSession();
@@ -390,13 +491,14 @@ export default function ProjectDetailPage() {
         project?.status === "queued" ||
         multicamStatus === "queued" ||
         multicamStatus === "running" ||
-        multicamStatus === "canceling"
+        multicamStatus === "canceling" ||
+        hasActiveSourceDerivatives
       ) {
         loadProject();
       }
     }, 5000);
     return () => clearInterval(interval);
-  }, [loadProject, project?.status, project?.multicam_state?.status]);
+  }, [loadProject, project?.status, project?.multicam_state?.status, hasActiveSourceDerivatives, derivativePollingKey]);
 
   useEffect(() => {
     if (latestUploadTaskStatus === "completed") {
@@ -509,6 +611,21 @@ export default function ProjectDetailPage() {
     } finally { setMulticamProcessing(false); }
   };
 
+  const handleRetryDerivatives = async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    setDerivativesRetrying(true);
+    setError("");
+    try {
+      await api.retryExtraSourceDerivatives(session.access_token, projectId);
+      await loadProject();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "오디오 준비 재시도에 실패했습니다");
+    } finally {
+      setDerivativesRetrying(false);
+    }
+  };
+
   const handleCancelMulticam = async () => {
     const { data: { session } } = await supabase.auth.getSession();
     if (!session) return;
@@ -593,6 +710,9 @@ export default function ProjectDetailPage() {
     const current = normalizeEditIntensity(project.settings?.edit_intensity);
     setVariantIntensity(current);
     setVariantEditDecisionVersion(normalizeEditDecisionVersion(project.settings?.edit_decision_version));
+    setVariantSegmentationBoundaryRule(
+      normalizeSegmentationBoundaryRule(project.settings?.segmentation_boundary_rule)
+    );
     setVariantModalOpen(true);
     setError("");
   };
@@ -607,6 +727,7 @@ export default function ProjectDetailPage() {
       const variant = await api.createProjectVariant(session.access_token, projectId, {
         edit_intensity: variantIntensity,
         edit_decision_version: variantEditDecisionVersion,
+        segmentation_boundary_rule: variantSegmentationBoundaryRule,
       });
       router.push("/projects/" + variant.id);
     } catch (err) {
@@ -648,13 +769,25 @@ export default function ProjectDetailPage() {
   const currentEditIntensityLabel = EDIT_INTENSITY_LABELS[currentEditIntensity];
   const currentEditDecisionVersion = normalizeEditDecisionVersion(project.settings?.edit_decision_version);
   const currentEditDecisionVersionLabel = EDIT_DECISION_VERSION_LABELS[currentEditDecisionVersion];
+  const currentBoundaryRule = normalizeSegmentationBoundaryRule(project.settings?.segmentation_boundary_rule);
+  const currentBoundaryRuleLabel = SEGMENTATION_BOUNDARY_RULE_LABELS[currentBoundaryRule];
   const segmentationDisplay = getSegmentationDisplay(project);
+  const boundaryRuleDisplay = getBoundaryRuleDisplay(project);
   const isUploadingExtraSources = Boolean(uploadTask);
   const multicamStatus = project.multicam_state?.status || (project.extra_sources.length > 0 ? "pending_apply" : "not_applied");
   const currentMulticamSwitching = normalizeMulticamSwitching(project.settings?.multicam_switching);
   const currentSpeakerSourceMap = speakerSourceMapFromSettings(project.settings);
   const hasSpeakerMetadata = speakerSummaries.length > 0;
-  const canApplyMulticam = project.extra_sources.length > 0 && !isUploadingExtraSources && !["queued", "running", "canceling"].includes(multicamStatus);
+  const derivativesReady = project.extra_sources.length > 0 && multicamDerivativesReady(project);
+  const derivativesFailed = hasFailedDerivatives(project);
+  const canRetryDerivatives = project.extra_sources.length > 0
+    && !derivativesReady
+    && !hasActiveSourceDerivatives
+    && !isUploadingExtraSources;
+  const canApplyMulticam = project.extra_sources.length > 0
+    && derivativesReady
+    && !isUploadingExtraSources
+    && !["queued", "running", "canceling"].includes(multicamStatus);
   const canCancelMulticam = ["queued", "running", "canceling"].includes(multicamStatus);
   const canDeleteProject = !isProcessing && !isUploadingExtraSources && !canCancelMulticam;
   const scribeV2CacheHit = hasScribeV2CacheHit(project);
@@ -746,6 +879,12 @@ export default function ProjectDetailPage() {
                     title={segmentationDisplay.title}
                   >
                     Segmentation: {segmentationDisplay.label}
+                  </span>
+                  <span
+                    className={"inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs font-medium " + boundaryRuleDisplay.className}
+                    title={boundaryRuleDisplay.title}
+                  >
+                    Boundary: {boundaryRuleDisplay.label}
                   </span>
                   {project.source_duration_seconds && (
                     <span className="inline-flex items-center gap-1.5">
@@ -938,6 +1077,7 @@ export default function ProjectDetailPage() {
                       </div>
                       <div className="flex items-center gap-3 shrink-0">
                         <span className="text-xs text-gray-600">{formatSize(src.size_bytes)}</span>
+                        <span className="text-xs text-gray-500">{derivedStatusLabel(sourceDerivedStatus(src))}</span>
                         <button onClick={() => handleDownloadExtraSource(i)} className="text-cyan-400/70 hover:text-cyan-300 text-xs font-medium transition-colors">
                           다운로드
                         </button>
@@ -981,6 +1121,7 @@ export default function ProjectDetailPage() {
                     </div>
                     <div className="flex items-center gap-3 shrink-0">
                       <span className="text-xs text-gray-600">{formatSize(src.size_bytes)}</span>
+                      <span className="text-xs text-gray-500">{derivedStatusLabel(sourceDerivedStatus(src))}</span>
                       <button onClick={() => handleDownloadExtraSource(i)} className="text-cyan-400/70 hover:text-cyan-300 text-xs font-medium transition-colors">
                         다운로드
                       </button>
@@ -1167,6 +1308,18 @@ export default function ProjectDetailPage() {
                   {isUploadingExtraSources ? "업로드 중..." : "업로드"}
                 </button>
               )}
+              {hasActiveSourceDerivatives && (
+                <span className="px-3 py-2 text-xs text-gray-400">오디오 준비 중...</span>
+              )}
+              {canRetryDerivatives && (
+                <button
+                  onClick={handleRetryDerivatives}
+                  disabled={derivativesRetrying}
+                  className="px-4 py-2 text-sm font-medium bg-amber-500/10 text-amber-300 border border-amber-500/20 rounded-lg hover:bg-amber-500/20 transition-all disabled:opacity-50"
+                >
+                  {derivativesRetrying ? "재생성 중..." : derivativesFailed ? "오디오 재생성" : "오디오 준비"}
+                </button>
+              )}
               {canApplyMulticam && (
                 <button
                   onClick={handleMulticamReprocess}
@@ -1270,6 +1423,7 @@ export default function ProjectDetailPage() {
             <div className="mt-4 rounded-xl border border-white/[0.06] bg-white/[0.025] px-4 py-3 text-sm leading-6 text-gray-300">
               현재 강도: <span className="font-medium text-cyan-300">{currentEditIntensityLabel}</span><br />
               현재 Edit Decision: <span className="font-medium text-violet-300">{currentEditDecisionVersionLabel}</span><br />
+              현재 Boundary: <span className="font-medium text-emerald-300">{currentBoundaryRuleLabel}</span><br />
               새 버전은 전사 캐시를 재사용하고 편집 판단을 다시 실행합니다.
             </div>
             <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-3">
@@ -1305,6 +1459,21 @@ export default function ProjectDetailPage() {
                 className="w-full rounded-xl border border-white/[0.08] bg-[#050812] px-3 py-2.5 text-sm text-gray-200 outline-none transition focus:border-cyan-400/40 disabled:opacity-50"
               >
                 {EDIT_DECISION_VERSION_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label} - {option.description}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="mt-5">
+              <label className="mb-2 block text-sm font-medium text-gray-200">Segmentation Boundary</label>
+              <select
+                value={variantSegmentationBoundaryRule}
+                onChange={(event) => setVariantSegmentationBoundaryRule(event.currentTarget.value as SegmentationBoundaryRule)}
+                disabled={creatingVariant}
+                className="w-full rounded-xl border border-white/[0.08] bg-[#050812] px-3 py-2.5 text-sm text-gray-200 outline-none transition focus:border-cyan-400/40 disabled:opacity-50"
+              >
+                {SEGMENTATION_BOUNDARY_RULE_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
                     {option.label} - {option.description}
                   </option>

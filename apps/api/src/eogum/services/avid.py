@@ -245,6 +245,8 @@ def subtitle_cut(
     final: bool = False,
     extra_sources: list[str] | None = None,
     edit_intensity: str = "normal",
+    edit_decision_version: str = "legacy",
+    segmentation_boundary_rule: str = "word_boundary",
     llm_log_path: str | None = None,
 ) -> dict[str, str]:
     """Run avid subtitle-cut (Pass 2). Returns result paths dict."""
@@ -256,6 +258,8 @@ def subtitle_cut(
     if final:
         args += ["--final"]
     args += ["--edit-intensity", edit_intensity]
+    args += ["--edit-decision-version", edit_decision_version]
+    args += ["--segmentation-boundary-rule", segmentation_boundary_rule]
     for src in extra_sources or []:
         args += ["--extra-source", src]
 
@@ -275,6 +279,8 @@ def podcast_cut(
     final: bool = False,
     extra_sources: list[str] | None = None,
     edit_intensity: str = "normal",
+    edit_decision_version: str = "legacy",
+    segmentation_boundary_rule: str = "word_boundary",
     llm_log_path: str | None = None,
 ) -> dict[str, str]:
     """Run avid podcast-cut (Pass 2). Returns result paths dict."""
@@ -288,12 +294,14 @@ def podcast_cut(
     if final:
         args += ["--final"]
     args += ["--edit-intensity", edit_intensity]
+    args += ["--edit-decision-version", edit_decision_version]
+    args += ["--segmentation-boundary-rule", segmentation_boundary_rule]
     for src in extra_sources or []:
         args += ["--extra-source", src]
 
     payload = _run_avid_json(
         args,
-        timeout=1800,
+        timeout=7200,
         extra_env=_llm_log_env(llm_log_path, "edit_decision"),
     )
     return {key: str(value) for key, value in (payload.get("artifacts") or {}).items()}
@@ -396,6 +404,21 @@ def rebuild_multicam(
         args += ["--extra-source", src]
     for offset in offsets or []:
         args += ["--offset", str(offset)]
+    return _run_avid_json(args, timeout=3600, is_canceled=is_canceled)
+
+
+def rebuild_multicam_from_manifest(
+    project_json_path: str,
+    source_manifest_path: str,
+    output_project_json: str,
+    is_canceled: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    args = [
+        "rebuild-multicam",
+        "--project-json", project_json_path,
+        "--source-manifest", source_manifest_path,
+        "--output-project-json", output_project_json,
+    ]
     return _run_avid_json(args, timeout=3600, is_canceled=is_canceled)
 
 

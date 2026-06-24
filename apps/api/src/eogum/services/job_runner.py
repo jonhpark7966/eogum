@@ -18,6 +18,7 @@ from eogum.services import (
     credit,
     email,
     overlap_protection as overlap_detection,
+    overlap_speaker_mapping,
     r2,
     scribe_v2_cache,
     source_cache,
@@ -635,6 +636,16 @@ def _process_project(project_id: str, job_id: str | None) -> None:
                 )
         srt_path = transcription_result.srt_path
         segments_json_path = transcription_result.segments_json_path
+        if overlap_artifact_path and segments_json_path:
+            try:
+                speaker_mapping_summary = overlap_speaker_mapping.enrich_overlap_speaker_mapping_files(
+                    overlap_path=overlap_artifact_path,
+                    segments_path=segments_json_path,
+                )
+                if overlap_detection_metadata is not None:
+                    overlap_detection_metadata["speaker_mapping"] = speaker_mapping_summary
+            except Exception:
+                logger.exception("Failed to enrich overlap speaker mapping for project %s", project_id)
         _update_progress(db, job_id, 30)
 
         # 4. Transcript overview (Pass 1)
@@ -1059,7 +1070,7 @@ def _compact_overlap_detection_metadata(payload: dict) -> dict:
             compact["error_type"] = value.get("error_type")
             compact["error"] = value.get("error")
         models[str(key)] = compact
-    return {
+    compact_payload = {
         "schema_version": payload.get("schema_version"),
         "status": payload.get("status"),
         "interval_count": payload.get("interval_count"),
@@ -1067,6 +1078,17 @@ def _compact_overlap_detection_metadata(payload: dict) -> dict:
         "elapsed_seconds": payload.get("elapsed_seconds"),
         "models": models,
     }
+    speaker_mapping = payload.get("speaker_mapping")
+    if isinstance(speaker_mapping, dict):
+        compact_payload["speaker_mapping"] = {
+            "schema_version": speaker_mapping.get("schema_version"),
+            "method": speaker_mapping.get("method"),
+            "intervals": speaker_mapping.get("intervals"),
+            "mapped_intervals": speaker_mapping.get("mapped_intervals"),
+            "segments": speaker_mapping.get("segments"),
+            "enriched_segments": speaker_mapping.get("enriched_segments"),
+        }
+    return compact_payload
 
 
 def _podcast_cut_resume_marker_path(temp_dir: Path) -> Path:

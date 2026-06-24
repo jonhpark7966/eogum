@@ -130,19 +130,27 @@ function overlapProtectionMetadata(seg: EvalSegment): Record<string, unknown> | 
   return value && typeof value === "object" ? value as Record<string, unknown> : null;
 }
 
+function stringListValue(value: unknown): string {
+  return Array.isArray(value)
+    ? value.map((item) => String(item)).filter(Boolean).join(", ")
+    : "";
+}
+
 function overlapProtectionBadgeTitle(metadata: Record<string, unknown>): string {
   const count = typeof metadata.source_segment_count === "number"
     ? metadata.source_segment_count
     : Array.isArray(metadata.source_segment_indices)
       ? metadata.source_segment_indices.length
       : null;
-  const models = Array.isArray(metadata.overlap_models)
-    ? metadata.overlap_models.map((item) => String(item)).join(", ")
-    : "";
+  const models = stringListValue(metadata.overlap_models);
+  const mappedSpeakers = stringListValue(metadata.mapped_speakers);
+  const pyannoteSpeakers = stringListValue(metadata.pyannote_speakers);
   return [
     "겹침 보호 병합",
     count !== null ? `source segments=${count}` : null,
     models ? `models=${models}` : null,
+    mappedSpeakers ? `mapped speakers=${mappedSpeakers}` : null,
+    pyannoteSpeakers ? `pyannote speakers=${pyannoteSpeakers}` : null,
   ].filter(Boolean).join(" / ");
 }
 

@@ -57,6 +57,7 @@ class ProjectVariantCreate(BaseModel):
     edit_intensity: str
     edit_decision_version: str | None = None
     segmentation_boundary_rule: str | None = None
+    overlap_protection_enabled: bool | None = None
     name: str | None = None
 
 

@@ -61,6 +61,7 @@ export default function NewProjectPage() {
   const [numSpeakers, setNumSpeakers] = useState("");
   const [useLlmSegmentation, setUseLlmSegmentation] = useState(true);
   const [useLlmRefinement, setUseLlmRefinement] = useState(true);
+  const [overlapProtectionEnabled, setOverlapProtectionEnabled] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [progressLabel, setProgressLabel] = useState("");
@@ -126,6 +127,7 @@ export default function NewProjectPage() {
       tag_audio_events: tagAudioEvents,
       use_llm_segmentation: useLlmSegmentation,
       use_llm_refinement: useLlmRefinement,
+      overlap_protection_enabled: overlapProtectionEnabled,
     };
     const speakerCount = Number(numSpeakers);
     if (numSpeakers.trim() && Number.isInteger(speakerCount)) {
@@ -142,6 +144,7 @@ export default function NewProjectPage() {
     editDecisionVersion,
     segmentationBoundaryRule,
     numSpeakers,
+    overlapProtectionEnabled,
     tagAudioEvents,
     useLlmSegmentation,
     useLlmRefinement,
@@ -640,6 +643,19 @@ export default function NewProjectPage() {
                   type="checkbox"
                   checked={useLlmRefinement}
                   onChange={(e) => setUseLlmRefinement(e.target.checked)}
+                  className="h-4 w-4 accent-white"
+                />
+              </label>
+
+              <label className="flex items-center justify-between gap-4 text-sm">
+                <span>
+                  <span className="block font-medium">겹치는 구간 보호</span>
+                  <span className="block text-xs text-gray-500">동시 발화 감지 구간은 최종 segment에서 다시 합치기</span>
+                </span>
+                <input
+                  type="checkbox"
+                  checked={overlapProtectionEnabled}
+                  onChange={(e) => setOverlapProtectionEnabled(e.target.checked)}
                   className="h-4 w-4 accent-white"
                 />
               </label>

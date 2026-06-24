@@ -51,6 +51,9 @@ class Settings(BaseSettings):
 
     # Chalna
     chalna_url: str = "http://localhost:7861"
+    huggingface_cache_dir: Path = Path("/tmp/eogum/hf-cache")
+    hf_token: str = ""
+    huggingface_hub_token: str = ""
 
     # Tools
     yt_dlp_bin: Path | None = None

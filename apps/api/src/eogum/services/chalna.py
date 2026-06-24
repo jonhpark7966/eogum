@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from contextlib import ExitStack
 from collections.abc import Callable
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ class TranscriptionSrtResult:
     metadata: dict[str, Any]
     segmentation_log: list[dict[str, Any]]
     processing_metadata: dict[str, Any]
+    segments_json_path: str | None = None
 
 
 def transcribe_to_srt(
@@ -55,6 +57,7 @@ def transcribe_to_srt(
     use_llm_refinement: bool = True,
     bypass_llm_segmentation_cache: bool = False,
     segmentation_boundary_rule: str = DEFAULT_SEGMENTATION_BOUNDARY_RULE,
+    overlap_intervals_path: str | None = None,
     on_status: StatusCallback | None = None,
     llm_log_path: str | None = None,
     timeout_seconds: float = 7200.0,
@@ -233,11 +236,16 @@ def transcribe_from_scribe_response_to_srt(
     output_root = Path(output_dir) if output_dir else source.parent
     output_root.mkdir(parents=True, exist_ok=True)
     output_path = output_root / "source.srt"
+    segments_json_path = output_root / "source.segments.json"
+    overlap_intervals = Path(overlap_intervals_path) if overlap_intervals_path else None
+    if overlap_intervals is not None and not overlap_intervals.exists():
+        raise ChalnaClientError(f"Overlap intervals JSON not found: {overlap_intervals}")
 
     result_data, _task_id = _submit_and_poll(
         endpoint="/transcribe/from-scribe/async",
         source=source,
         raw_json=raw_json,
+        overlap_intervals=overlap_intervals,
         data={
             "language": language,
             "use_alignment": "false",
@@ -263,8 +271,20 @@ def transcribe_from_scribe_response_to_srt(
         task_id=_task_id,
         endpoint="/transcribe/from-scribe/async",
     )
-    output_path.write_text(_segments_to_srt(result_data.get("segments") or []), encoding="utf-8")
+    result_segments = result_data.get("segments") or []
+    output_path.write_text(_segments_to_srt(result_segments), encoding="utf-8")
     metadata = result_data.get("metadata") if isinstance(result_data.get("metadata"), dict) else {}
+    segments_json_path.write_text(
+        json.dumps(
+            {
+                "segments": result_segments,
+                "metadata": metadata,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     segmentation_log_value = result_data.get("segmentation_log")
     segmentation_log = [item for item in segmentation_log_value if isinstance(item, dict)] if isinstance(segmentation_log_value, list) else []
     return TranscriptionSrtResult(
@@ -279,6 +299,7 @@ def transcribe_from_scribe_response_to_srt(
             bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
             segmentation_boundary_rule=segmentation_boundary_rule,
         ),
+        segments_json_path=str(segments_json_path),
     )
 
 
@@ -351,6 +372,9 @@ def summarize_segmentation_metadata(
     boundary_stats = meta.get("segmentation_boundary_stats")
     if isinstance(boundary_stats, dict):
         result["segmentation_boundary_stats"] = boundary_stats
+    overlap_protection = meta.get("overlap_protection")
+    if isinstance(overlap_protection, dict):
+        result["overlap_protection"] = overlap_protection
     if model:
         result["model"] = model
     if reasoning_effort:
@@ -399,6 +423,7 @@ def _submit_and_poll(
     source: Path,
     data: dict[str, str],
     raw_json: Path | None = None,
+    overlap_intervals: Path | None = None,
     on_status: StatusCallback | None,
     timeout_seconds: float,
     poll_interval_seconds: float,
@@ -406,20 +431,26 @@ def _submit_and_poll(
     base_url = settings.chalna_url.rstrip("/")
 
     with httpx.Client(timeout=60.0) as client:
-        with source.open("rb") as source_file:
+        with ExitStack() as stack:
+            source_file = stack.enter_context(source.open("rb"))
             files: dict[str, Any] = {
                 "file": (source.name, source_file, "application/octet-stream"),
             }
             if raw_json is not None:
-                with raw_json.open("rb") as raw_json_file:
-                    files["scribe_response"] = (
-                        raw_json.name,
-                        raw_json_file,
-                        "application/json",
-                    )
-                    response = client.post(f"{base_url}{endpoint}", files=files, data=data)
-            else:
-                response = client.post(f"{base_url}{endpoint}", files=files, data=data)
+                raw_json_file = stack.enter_context(raw_json.open("rb"))
+                files["scribe_response"] = (
+                    raw_json.name,
+                    raw_json_file,
+                    "application/json",
+                )
+            if overlap_intervals is not None:
+                overlap_file = stack.enter_context(overlap_intervals.open("rb"))
+                files["overlap_intervals"] = (
+                    overlap_intervals.name,
+                    overlap_file,
+                    "application/json",
+                )
+            response = client.post(f"{base_url}{endpoint}", files=files, data=data)
 
     if response.status_code != 200:
         raise ChalnaClientError(f"Chalna submit failed: {response.text[:500]}")

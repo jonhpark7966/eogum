@@ -455,6 +455,7 @@ export const api = {
       edit_intensity: "light" | "normal" | "heavy";
       edit_decision_version?: EditDecisionVersion;
       segmentation_boundary_rule?: SegmentationBoundaryRule;
+      overlap_protection_enabled?: boolean;
       name?: string;
     }
   ) =>

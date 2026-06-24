@@ -250,6 +250,68 @@ function getBoundaryRuleDisplay(project: ProjectDetail): SegmentationDisplay {
   };
 }
 
+function getOverlapProtectionDisplay(project: ProjectDetail): SegmentationDisplay | null {
+  const enabledFromSettings = project.settings?.overlap_protection_enabled === true;
+  const metadataJob = [...project.jobs]
+    .filter((job) => {
+      const value = job.processing_metadata?.overlap_protection;
+      return value && typeof value === "object";
+    })
+    .sort(newestJobFirst)[0];
+  const metadataValue = metadataJob?.processing_metadata?.overlap_protection;
+  const metadata = metadataValue && typeof metadataValue === "object"
+    ? metadataValue as Record<string, unknown>
+    : {};
+  const enabled = enabledFromSettings || metadata.enabled === true;
+  if (!enabled) return null;
+
+  const detection = metadata.detection && typeof metadata.detection === "object"
+    ? metadata.detection as Record<string, unknown>
+    : {};
+  const models = detection.models && typeof detection.models === "object"
+    ? detection.models as Record<string, Record<string, unknown>>
+    : {};
+  const status = typeof detection.status === "string" ? detection.status : "pending";
+  const failedModels = Object.entries(models)
+    .filter(([, value]) => value?.status === "failed")
+    .map(([key]) => key);
+  const intervalCount = typeof detection.interval_count === "number" ? detection.interval_count : null;
+  const modelParts = Object.entries(models).map(([key, value]) => `${key}:${String(value?.status ?? "unknown")}`);
+  const title = [
+    "Overlap protection",
+    `status=${status}`,
+    intervalCount !== null ? `intervals=${intervalCount}` : null,
+    modelParts.length ? `models=${modelParts.join(",")}` : null,
+  ].filter(Boolean).join(" / ");
+
+  if (status === "complete") {
+    return {
+      label: `겹침 보호: 적용${intervalCount !== null ? ` ${intervalCount}개` : ""}`,
+      className: "border-teal-400/20 bg-teal-400/10 text-teal-300",
+      title,
+    };
+  }
+  if (status === "partial") {
+    return {
+      label: `겹침 보호: 부분 적용${failedModels.length ? ` (${failedModels.join(", ")} 실패)` : ""}`,
+      className: "border-amber-400/25 bg-amber-400/10 text-amber-300",
+      title,
+    };
+  }
+  if (status === "failed") {
+    return {
+      label: "겹침 보호: 실패",
+      className: "border-red-400/25 bg-red-400/10 text-red-300",
+      title,
+    };
+  }
+  return {
+    label: "겹침 보호: 켜짐",
+    className: "border-slate-400/20 bg-slate-400/10 text-slate-300",
+    title,
+  };
+}
+
 function getVisibleProcessingJobs(project: ProjectDetail): ProjectJob[] {
   const multicamJobId = project.multicam_state?.job_id;
   if (multicamJobId) {
@@ -436,6 +498,7 @@ export default function ProjectDetailPage() {
   const [variantEditDecisionVersion, setVariantEditDecisionVersion] = useState<EditDecisionVersion>("legacy");
   const [variantSegmentationBoundaryRule, setVariantSegmentationBoundaryRule] =
     useState<SegmentationBoundaryRule>("word_boundary");
+  const [variantOverlapProtectionEnabled, setVariantOverlapProtectionEnabled] = useState(false);
   const [creatingVariant, setCreatingVariant] = useState(false);
   const [sourceCacheReused, setSourceCacheReused] = useState(false);
 
@@ -713,6 +776,7 @@ export default function ProjectDetailPage() {
     setVariantSegmentationBoundaryRule(
       normalizeSegmentationBoundaryRule(project.settings?.segmentation_boundary_rule)
     );
+    setVariantOverlapProtectionEnabled(project.settings?.overlap_protection_enabled === true);
     setVariantModalOpen(true);
     setError("");
   };
@@ -728,6 +792,7 @@ export default function ProjectDetailPage() {
         edit_intensity: variantIntensity,
         edit_decision_version: variantEditDecisionVersion,
         segmentation_boundary_rule: variantSegmentationBoundaryRule,
+        overlap_protection_enabled: variantOverlapProtectionEnabled,
       });
       router.push("/projects/" + variant.id);
     } catch (err) {
@@ -773,6 +838,7 @@ export default function ProjectDetailPage() {
   const currentBoundaryRuleLabel = SEGMENTATION_BOUNDARY_RULE_LABELS[currentBoundaryRule];
   const segmentationDisplay = getSegmentationDisplay(project);
   const boundaryRuleDisplay = getBoundaryRuleDisplay(project);
+  const overlapProtectionDisplay = getOverlapProtectionDisplay(project);
   const isUploadingExtraSources = Boolean(uploadTask);
   const multicamStatus = project.multicam_state?.status || (project.extra_sources.length > 0 ? "pending_apply" : "not_applied");
   const currentMulticamSwitching = normalizeMulticamSwitching(project.settings?.multicam_switching);
@@ -820,6 +886,12 @@ export default function ProjectDetailPage() {
     { key: "report", label: "편집 리포트", icon: "📄", desc: "편집 보고서 (.md)" },
     { key: "project_json", label: "프로젝트 JSON", icon: "📦", desc: "avid 프로젝트 파일" },
     { key: "storyline", label: "스토리라인", icon: "📋", desc: "구조 분석 JSON" },
+    ...(latestResultKeys.segments_json
+      ? [{ key: "segments_json", label: "Segments JSON", icon: "{}", desc: "Chalna final segments" }]
+      : []),
+    ...(latestResultKeys.overlap_protection
+      ? [{ key: "overlap_protection", label: "겹침 보호 JSON", icon: "⧉", desc: "overlap detector 결과" }]
+      : []),
     ...(latestResultKeys.llm_io_log
       ? [{ key: "llm_io_log", label: "LLM 로그", icon: "🧾", desc: "프롬프트/응답 JSONL" }]
       : []),
@@ -886,6 +958,14 @@ export default function ProjectDetailPage() {
                   >
                     Boundary: {boundaryRuleDisplay.label}
                   </span>
+                  {overlapProtectionDisplay && (
+                    <span
+                      className={"inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs font-medium " + overlapProtectionDisplay.className}
+                      title={overlapProtectionDisplay.title}
+                    >
+                      {overlapProtectionDisplay.label}
+                    </span>
+                  )}
                   {project.source_duration_seconds && (
                     <span className="inline-flex items-center gap-1.5">
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><circle cx="12" cy="12" r="10" /><polyline points="12 6 12 12 16 14" /></svg>
@@ -1484,6 +1564,19 @@ export default function ProjectDetailPage() {
               새 프로젝트 이름: <span className="text-gray-300">{project.name} - {EDIT_INTENSITY_LABELS[variantIntensity]} YYYYMMDD-HHMMSS</span><br />
               같은 강도를 선택해도 새 edit decision을 생성합니다.
             </div>
+            <label className="mt-4 flex items-center justify-between gap-4 rounded-xl border border-white/[0.06] bg-white/[0.025] px-4 py-3 text-sm">
+              <span>
+                <span className="block font-medium text-gray-200">겹치는 구간 보호</span>
+                <span className="block text-xs leading-5 text-gray-500">동시 발화 감지 구간의 final segment를 병합합니다.</span>
+              </span>
+              <input
+                type="checkbox"
+                checked={variantOverlapProtectionEnabled}
+                onChange={(event) => setVariantOverlapProtectionEnabled(event.currentTarget.checked)}
+                disabled={creatingVariant}
+                className="h-4 w-4 accent-cyan-400 disabled:opacity-50"
+              />
+            </label>
             <div className="mt-6 flex justify-end gap-3">
               <button
                 onClick={() => setVariantModalOpen(false)}

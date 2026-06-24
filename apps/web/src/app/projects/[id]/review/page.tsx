@@ -124,6 +124,27 @@ function decisionActionForSegment(seg: EvalSegment): "keep" | "cut" {
   return aiActionForSegment(seg);
 }
 
+function overlapProtectionMetadata(seg: EvalSegment): Record<string, unknown> | null {
+  const value = seg.overlap_protection;
+  return value && typeof value === "object" ? value as Record<string, unknown> : null;
+}
+
+function overlapProtectionBadgeTitle(metadata: Record<string, unknown>): string {
+  const count = typeof metadata.source_segment_count === "number"
+    ? metadata.source_segment_count
+    : Array.isArray(metadata.source_segment_indices)
+      ? metadata.source_segment_indices.length
+      : null;
+  const models = Array.isArray(metadata.overlap_models)
+    ? metadata.overlap_models.map((item) => String(item)).join(", ")
+    : "";
+  return [
+    "겹침 보호 병합",
+    count !== null ? `source segments=${count}` : null,
+    models ? `models=${models}` : null,
+  ].filter(Boolean).join(" / ");
+}
+
 type ReviewMetadata = Pick<
   EvaluationSavePayload,
   "schema_version" | "review_scope" | "join_strategy"
@@ -721,6 +742,8 @@ export default function ReviewPage() {
       seg.human !== null &&
       seg.ai !== null &&
       seg.human.action !== seg.ai.action;
+    const overlapMetadata = overlapProtectionMetadata(seg);
+    const isOverlapMerged = overlapMetadata?.merged === true;
 
     return (
       <div
@@ -774,6 +797,14 @@ export default function ReviewPage() {
               aria-label={`세그먼트 ${seg.index} 선택`}
             />
             <span className="text-xs text-gray-500 w-8">#{seg.index}</span>
+            {isOverlapMerged && overlapMetadata && (
+              <span
+                className="shrink-0 rounded border border-amber-400/25 bg-amber-400/10 px-2 py-0.5 text-[11px] font-medium text-amber-200"
+                title={overlapProtectionBadgeTitle(overlapMetadata)}
+              >
+                겹침 보호 병합
+              </span>
+            )}
             <span className="text-xs text-gray-400 font-mono">
               {formatTime(seg.start_ms)}→{formatTime(seg.end_ms)}
             </span>

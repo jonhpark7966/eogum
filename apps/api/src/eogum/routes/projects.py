@@ -396,7 +396,16 @@ def _validate_project_settings(req: ProjectCreate) -> None:
     settings_value["segmentation_boundary_rule"] = segmentation_boundary_rule
     req.settings = settings_value
 
-    for key in ("diarize", "tag_audio_events", "use_llm_segmentation", "use_llm_refinement"):
+    if settings_value.get("overlap_protection_enabled") is None:
+        settings_value["overlap_protection_enabled"] = False
+
+    for key in (
+        "diarize",
+        "tag_audio_events",
+        "use_llm_segmentation",
+        "use_llm_refinement",
+        "overlap_protection_enabled",
+    ):
         value = settings_value.get(key)
         if value is not None and not isinstance(value, bool):
             raise HTTPException(
@@ -535,12 +544,23 @@ def create_project_variant(project_id: str, req: ProjectVariantCreate, current_u
     segmentation_boundary_rule = (
         requested_segmentation_boundary_rule or source_segmentation_boundary_rule
     )
+    if req.overlap_protection_enabled is not None and not isinstance(req.overlap_protection_enabled, bool):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="overlap_protection_enabled 옵션은 true 또는 false여야 합니다",
+        )
+    overlap_protection_enabled = (
+        req.overlap_protection_enabled
+        if req.overlap_protection_enabled is not None
+        else bool(source_settings.get("overlap_protection_enabled", False))
+    )
 
     variant_settings = {
         **source_settings,
         "edit_intensity": req.edit_intensity,
         "edit_decision_version": edit_decision_version,
         "segmentation_boundary_rule": segmentation_boundary_rule,
+        "overlap_protection_enabled": overlap_protection_enabled,
         "bypass_llm_segmentation_cache": True,
     }
     for internal_key in (

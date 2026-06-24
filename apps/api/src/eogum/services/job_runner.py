@@ -12,7 +12,17 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 
 from eogum.config import settings
-from eogum.services import avid, chalna, credit, email, r2, scribe_v2_cache, source_cache, source_derivatives
+from eogum.services import (
+    avid,
+    chalna,
+    credit,
+    email,
+    overlap_protection as overlap_detection,
+    r2,
+    scribe_v2_cache,
+    source_cache,
+    source_derivatives,
+)
 from eogum.services.artifacts import get_latest_artifact_job
 from eogum.services.database import execute_with_retry, get_db
 from eogum.services.final_preview_cache import (
@@ -546,6 +556,13 @@ def _process_project(project_id: str, job_id: str | None) -> None:
         current_stage = "transcription"
         project_settings = project.get("settings") or {}
         transcription_context = project_settings.get("transcription_context")
+        overlap_protection_enabled = _bool_project_setting(
+            project_settings,
+            "overlap_protection_enabled",
+            default=False,
+        )
+        overlap_artifact_path: Path | None = None
+        overlap_detection_metadata: dict | None = None
         use_llm_refinement = _bool_project_setting(
             project_settings,
             "use_llm_refinement",
@@ -556,17 +573,42 @@ def _process_project(project_id: str, job_id: str | None) -> None:
             "use_llm_segmentation",
             default=True,
         )
+        if overlap_protection_enabled:
+            overlap_artifact_path, overlap_detection_metadata = (
+                overlap_detection.build_overlap_protection_artifact(
+                    source_path,
+                    temp_dir / "overlap_protection",
+                )
+            )
+            if overlap_detection_metadata.get("status") == "partial":
+                logger.warning(
+                    "Overlap protection partially succeeded for project %s: %s",
+                    project_id,
+                    {
+                        key: value.get("status")
+                        for key, value in (overlap_detection_metadata.get("models") or {}).items()
+                        if isinstance(value, dict)
+                    },
+                )
+        if resume_state and overlap_protection_enabled:
+            logger.info(
+                "Ignoring podcast-cut resume state for project %s because overlap protection requires segments metadata",
+                project_id,
+            )
+            resume_state = None
         if resume_state:
             srt_path = str(_podcast_cut_resume_srt_path(temp_dir))
             transcription_result = _podcast_cut_resume_transcription_result(srt_path, resume_state)
             logger.info("Resuming project %s from podcast-cut using %s", project_id, srt_path)
         else:
-            transcription_result = _download_reused_transcription_srt(
-                db,
-                job_id=job_id,
-                project_settings=project_settings,
-                output_dir=temp_dir,
-            )
+            transcription_result = None
+            if not overlap_protection_enabled:
+                transcription_result = _download_reused_transcription_srt(
+                    db,
+                    job_id=job_id,
+                    project_settings=project_settings,
+                    output_dir=temp_dir,
+                )
             if transcription_result is None:
                 transcription_result = _transcribe_with_scribe_v2_cache(
                     db,
@@ -589,8 +631,10 @@ def _process_project(project_id: str, job_id: str | None) -> None:
                     ),
                     segmentation_boundary_rule=_output_segmentation_boundary_rule(project),
                     llm_log_path=llm_log_path,
+                    overlap_intervals_path=overlap_artifact_path,
                 )
         srt_path = transcription_result.srt_path
+        segments_json_path = transcription_result.segments_json_path
         _update_progress(db, job_id, 30)
 
         # 4. Transcript overview (Pass 1)
@@ -621,6 +665,7 @@ def _process_project(project_id: str, job_id: str | None) -> None:
         result_paths = cut_fn(
             source_path=source_path,
             srt_path=srt_path,
+            segments_json_path=segments_json_path,
             context_path=storyline_path,
             output_dir=str(output_dir),
             final=True,
@@ -631,6 +676,10 @@ def _process_project(project_id: str, job_id: str | None) -> None:
             llm_log_path=str(llm_log_path),
         )
         result_paths["storyline"] = storyline_path
+        if segments_json_path:
+            result_paths["segments_json"] = segments_json_path
+        if overlap_artifact_path:
+            result_paths["overlap_protection"] = str(overlap_artifact_path)
         _update_progress(db, job_id, 75)
         current_stage = "upload"
 
@@ -671,11 +720,18 @@ def _process_project(project_id: str, job_id: str | None) -> None:
         credit.confirm_usage(user_id, duration, job_id)
 
         # 9. Mark complete
+        processing_metadata = _processing_metadata_with_overlap(
+            transcription_result.processing_metadata,
+            enabled=overlap_protection_enabled,
+            detection_metadata=overlap_detection_metadata,
+            chalna_metadata=transcription_result.metadata,
+        )
+
         db.table("jobs").update({
             "status": "completed",
             "progress": 100,
             "result_r2_keys": r2_keys,
-            "processing_metadata": transcription_result.processing_metadata,
+            "processing_metadata": processing_metadata,
             "completed_at": "now()",
         }).eq("id", job_id).execute()
         db.table("projects").update({"status": "completed"}).eq("id", project_id).execute()
@@ -959,6 +1015,58 @@ def _output_segmentation_boundary_rule(project: dict) -> str:
         if isinstance(value, str) and value in ALLOWED_SEGMENTATION_BOUNDARY_RULES
         else DEFAULT_SEGMENTATION_BOUNDARY_RULE
     )
+
+
+def _processing_metadata_with_overlap(
+    processing_metadata: dict,
+    *,
+    enabled: bool,
+    detection_metadata: dict | None,
+    chalna_metadata: dict | None,
+) -> dict:
+    metadata = dict(processing_metadata or {})
+    if not enabled:
+        return metadata
+
+    detection = _compact_overlap_detection_metadata(detection_metadata or {})
+    segmentation = None
+    if isinstance(chalna_metadata, dict):
+        overlap_summary = chalna_metadata.get("overlap_protection")
+        if isinstance(overlap_summary, dict):
+            segmentation = overlap_summary
+
+    metadata["overlap_protection"] = {
+        "enabled": True,
+        "detection": detection,
+        "segmentation": segmentation,
+    }
+    return metadata
+
+
+def _compact_overlap_detection_metadata(payload: dict) -> dict:
+    models: dict[str, dict] = {}
+    for key, value in (payload.get("models") or {}).items():
+        if not isinstance(value, dict):
+            continue
+        compact = {
+            "status": value.get("status"),
+            "model": value.get("model"),
+            "intervals": value.get("intervals"),
+            "total_overlap_ms": value.get("total_overlap_ms"),
+            "elapsed_seconds": value.get("elapsed_seconds"),
+        }
+        if value.get("status") == "failed":
+            compact["error_type"] = value.get("error_type")
+            compact["error"] = value.get("error")
+        models[str(key)] = compact
+    return {
+        "schema_version": payload.get("schema_version"),
+        "status": payload.get("status"),
+        "interval_count": payload.get("interval_count"),
+        "total_overlap_ms": payload.get("total_overlap_ms"),
+        "elapsed_seconds": payload.get("elapsed_seconds"),
+        "models": models,
+    }
 
 
 def _podcast_cut_resume_marker_path(temp_dir: Path) -> Path:
@@ -2364,6 +2472,7 @@ def _transcribe_with_scribe_v2_cache(
     bypass_llm_segmentation_cache: bool,
     segmentation_boundary_rule: str,
     llm_log_path: Path | None = None,
+    overlap_intervals_path: Path | None = None,
 ) -> chalna.TranscriptionSrtResult:
     source = Path(source_path)
     source_size_bytes = int(project.get("source_size_bytes") or source.stat().st_size)
@@ -2458,6 +2567,7 @@ def _transcribe_with_scribe_v2_cache(
         not use_llm_segmentation
         and not use_llm_refinement
         and segmentation_boundary_rule == DEFAULT_SEGMENTATION_BOUNDARY_RULE
+        and overlap_intervals_path is None
     ):
         output_path = output_dir / "source.srt"
         output_path.write_text(raw_srt_local.read_text(encoding="utf-8"), encoding="utf-8")
@@ -2480,11 +2590,11 @@ def _transcribe_with_scribe_v2_cache(
                 "segmentation_label": "Heuristic",
                 "fallback": False,
                 "cache_hit": False,
-            "cache_bypassed": False,
-            "segmentation_boundary_rule": segmentation_boundary_rule,
-            "segmentation_boundary_effective_rule": segmentation_boundary_rule,
-        },
-    )
+                "cache_bypassed": False,
+                "segmentation_boundary_rule": segmentation_boundary_rule,
+                "segmentation_boundary_effective_rule": segmentation_boundary_rule,
+            },
+        )
 
     return chalna.transcribe_from_scribe_response_to_srt(
         source_path,
@@ -2499,6 +2609,7 @@ def _transcribe_with_scribe_v2_cache(
         use_llm_refinement=use_llm_refinement,
         bypass_llm_segmentation_cache=bypass_llm_segmentation_cache,
         segmentation_boundary_rule=segmentation_boundary_rule,
+        overlap_intervals_path=str(overlap_intervals_path) if overlap_intervals_path else None,
         llm_log_path=str(llm_log_path) if llm_log_path else None,
         on_status=lambda payload: _update_chalna_pipeline_status(
             db,
@@ -2994,6 +3105,8 @@ def _guess_content_type(key: str) -> str:
         "report": "text/markdown",
         "project_json": "application/json",
         "storyline": "application/json",
+        "segments_json": "application/json",
+        "overlap_protection": "application/json",
         "sync_diagnostics": "application/json",
         "llm_io_log": "application/x-ndjson",
         "preview": "video/mp4",

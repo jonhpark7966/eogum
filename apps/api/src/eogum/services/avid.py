@@ -240,6 +240,7 @@ def transcript_overview(
 def subtitle_cut(
     source_path: str,
     srt_path: str,
+    segments_json_path: str | None = None,
     context_path: str | None = None,
     output_dir: str | None = None,
     final: bool = False,
@@ -251,6 +252,8 @@ def subtitle_cut(
 ) -> dict[str, str]:
     """Run avid subtitle-cut (Pass 2). Returns result paths dict."""
     args = _apply_provider_args(["subtitle-cut", source_path, "--srt", srt_path])
+    if segments_json_path:
+        args += ["--segments-json", segments_json_path]
     if context_path:
         args += ["--context", context_path]
     if output_dir:
@@ -274,6 +277,7 @@ def subtitle_cut(
 def podcast_cut(
     source_path: str,
     srt_path: str | None = None,
+    segments_json_path: str | None = None,
     context_path: str | None = None,
     output_dir: str | None = None,
     final: bool = False,
@@ -287,6 +291,8 @@ def podcast_cut(
     args = _apply_provider_args(["podcast-cut", source_path])
     if srt_path:
         args += ["--srt", srt_path]
+    if segments_json_path:
+        args += ["--segments-json", segments_json_path]
     if context_path:
         args += ["--context", context_path]
     if output_dir:

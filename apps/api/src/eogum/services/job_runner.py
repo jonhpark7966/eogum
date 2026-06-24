@@ -26,7 +26,7 @@ from eogum.services.final_preview_cache import (
 
 logger = logging.getLogger(__name__)
 
-_job_lanes = ("project", "source_derive", "cut_decision", "final_preview")
+_job_lanes = ("project", "reprocess", "source_derive", "cut_decision", "final_preview")
 _queues: dict[str, deque[dict[str, str | None]]] = {lane: deque() for lane in _job_lanes}
 _running_lanes: dict[str, bool] = {lane: False for lane in _job_lanes}
 _lock = threading.Lock()
@@ -68,6 +68,8 @@ def enqueue_source_derive(project_id: str, job_id: str) -> None:
 
 
 def _lane_for_kind(kind: str) -> str:
+    if kind == "reprocess":
+        return "reprocess"
     if kind == "source_derive":
         return "source_derive"
     if kind == "cut_decision":

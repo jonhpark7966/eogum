@@ -17,6 +17,11 @@ os.environ.setdefault("SUPABASE_SERVICE_KEY", "test-service-key")
 from eogum.services import job_runner
 
 
+def test_reprocess_jobs_use_dedicated_lane():
+    assert "reprocess" in job_runner._job_lanes
+    assert job_runner._lane_for_kind("reprocess") == "reprocess"
+
+
 class _FakeResult:
     def __init__(self, data):
         self.data = data

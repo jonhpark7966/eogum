@@ -33,7 +33,7 @@ sys.modules.setdefault(
 from eogum.services import source_derivatives
 
 
-def test_source_derivative_media_info_extracts_timecode_from_data_stream():
+def test_source_derivative_media_info_extracts_timecode_from_rtmd_data_stream():
     payload = {
         "format": {"duration": "10.0"},
         "streams": [
@@ -46,7 +46,11 @@ def test_source_derivative_media_info_extracts_timecode_from_data_stream():
                 "duration": "10.0",
                 "nb_frames": "300",
             },
-            {"codec_type": "data", "tags": {"timecode": "05:56:31:16"}},
+            {
+                "codec_type": "data",
+                "codec_tag_string": "rtmd",
+                "tags": {"timecode": "05:56:31:16"},
+            },
             {"codec_type": "audio", "sample_rate": "48000", "channels": 2},
         ],
     }

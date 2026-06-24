@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     supabase_jwt_secret: str = ""  # Not needed for ES256 (JWKS used instead)
     admin_user_ids: str = ""
     admin_emails: str = ""
+    public_project_ids: str = ""
 
     # Cloudflare R2
     r2_account_id: str = ""

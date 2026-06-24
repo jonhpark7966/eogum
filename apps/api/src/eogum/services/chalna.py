@@ -220,6 +220,7 @@ def transcribe_from_scribe_response_to_srt(
     use_llm_refinement: bool = True,
     bypass_llm_segmentation_cache: bool = False,
     segmentation_boundary_rule: str = DEFAULT_SEGMENTATION_BOUNDARY_RULE,
+    overlap_intervals_path: str | None = None,
     on_status: StatusCallback | None = None,
     llm_log_path: str | None = None,
     timeout_seconds: float = 7200.0,

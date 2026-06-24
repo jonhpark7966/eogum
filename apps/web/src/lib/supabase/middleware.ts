@@ -1,5 +1,6 @@
 import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
+import { isPublicProjectPath } from "@/lib/public-projects";
 
 export async function updateSession(request: NextRequest) {
   let supabaseResponse = NextResponse.next({ request });
@@ -31,7 +32,8 @@ export async function updateSession(request: NextRequest) {
 
   // Redirect unauthenticated users to login (except public pages)
   const publicPaths = ["/", "/auth/callback"];
-  const isPublic = publicPaths.some((p) => request.nextUrl.pathname === p);
+  const isPublic = publicPaths.some((p) => request.nextUrl.pathname === p)
+    || isPublicProjectPath(request.nextUrl.pathname);
 
   if (!user && !isPublic) {
     const url = request.nextUrl.clone();

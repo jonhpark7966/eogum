@@ -15,6 +15,7 @@ import {
   type SegmentationBoundaryRule,
 } from "@/lib/api";
 import { useUploads } from "@/lib/upload-provider";
+import { isPublicProjectId } from "@/lib/public-projects";
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -501,6 +502,7 @@ export default function ProjectDetailPage() {
   const [variantOverlapProtectionEnabled, setVariantOverlapProtectionEnabled] = useState(false);
   const [creatingVariant, setCreatingVariant] = useState(false);
   const [sourceCacheReused, setSourceCacheReused] = useState(false);
+  const [sessionUserId, setSessionUserId] = useState<string | null>(null);
 
   // Multicam state
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
@@ -526,11 +528,13 @@ export default function ProjectDetailPage() {
 
   const loadProject = useCallback(async () => {
     const { data: { session } } = await supabase.auth.getSession();
-    if (!session) { router.replace("/"); return; }
+    const token = session?.access_token ?? null;
+    if (!token && !isPublicProjectId(projectId)) { router.replace("/"); return; }
+    setSessionUserId(session?.user?.id ?? null);
     try {
       const [data, projectList] = await Promise.all([
-        api.getProject(session.access_token, projectId),
-        api.listProjects(session.access_token).catch(() => []),
+        api.getProject(token, projectId),
+        token ? api.listProjects(token).catch(() => []) : Promise.resolve([]),
       ]);
       const sourceReused = Boolean(data.source_sha256) && projectList.some((item) =>
         item.id !== data.id &&
@@ -579,10 +583,11 @@ export default function ProjectDetailPage() {
     let canceled = false;
     async function loadSegments() {
       const { data: { session } } = await supabase.auth.getSession();
-      if (!session || canceled) return;
+      const token = session?.access_token ?? null;
+      if ((!token && !isPublicProjectId(projectId)) || canceled) return;
       setReviewSegmentsLoading(true);
       try {
-        const payload = await api.getSegments(session.access_token, projectId);
+        const payload = await api.getSegments(token, projectId);
         if (!canceled) setReviewSegments(payload.segments);
       } catch {
         if (!canceled) setReviewSegments([]);
@@ -624,9 +629,10 @@ export default function ProjectDetailPage() {
 
   const handleDownload = async (fileType: string) => {
     const { data: { session } } = await supabase.auth.getSession();
-    if (!session) return;
+    const token = session?.access_token ?? null;
+    if (!token && !isPublicProjectId(projectId)) return;
     try {
-      const result = await api.getDownload(session.access_token, projectId, fileType);
+      const result = await api.getDownload(token, projectId, fileType);
       window.open(result.download_url, "_blank");
     } catch (err) {
       setError(err instanceof Error ? err.message : "다운로드 링크 생성에 실패했습니다");
@@ -635,9 +641,10 @@ export default function ProjectDetailPage() {
 
   const handleDownloadExtraSource = async (index: number) => {
     const { data: { session } } = await supabase.auth.getSession();
-    if (!session) return;
+    const token = session?.access_token ?? null;
+    if (!token && !isPublicProjectId(projectId)) return;
     try {
-      const result = await api.downloadExtraSource(session.access_token, projectId, index);
+      const result = await api.downloadExtraSource(token, projectId, index);
       window.open(result.download_url, "_blank");
     } catch (err) {
       setError(err instanceof Error ? err.message : "다운로드 링크 생성에 실패했습니다");
@@ -825,6 +832,9 @@ export default function ProjectDetailPage() {
 
   if (!project) return null;
 
+  const viewerCanEdit = Boolean(sessionUserId && project.user_id === sessionUserId);
+  const backPath = viewerCanEdit ? "/dashboard" : "/";
+  const backLabel = viewerCanEdit ? "대시보드" : "홈";
   const statusConfig = STATUS_CONFIG[project.status] ?? { label: project.status, color: "text-gray-400", icon: "○", bg: "bg-gray-400/10" };
   const isProcessing = project.status === "processing" || project.status === "queued";
   const isCompleted = project.status === "completed";
@@ -904,18 +914,18 @@ export default function ProjectDetailPage() {
         <div className="max-w-5xl mx-auto px-6 h-16 flex items-center justify-between">
           <div className="flex items-center gap-4">
             <button
-              onClick={() => router.push("/dashboard")}
+              onClick={() => router.push(backPath)}
               className="flex items-center gap-2 text-gray-500 hover:text-gray-300 transition-colors"
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <polyline points="15 18 9 12 15 6" />
               </svg>
-              <span className="text-sm">대시보드</span>
+              <span className="text-sm">{backLabel}</span>
             </button>
             <div className="w-px h-5 bg-white/10" />
             <span className="text-sm text-gray-400 truncate max-w-[200px]">{project.name}</span>
           </div>
-          <button onClick={() => router.push("/dashboard")} className="flex items-center gap-2">
+          <button onClick={() => router.push(backPath)} className="flex items-center gap-2">
             <Image src="/logo.png" alt="어검" width={24} height={24} className="rounded" />
             <span className="font-bold text-sm tracking-tight hidden sm:inline">어검</span>
           </button>
@@ -977,15 +987,17 @@ export default function ProjectDetailPage() {
                 </div>
               </div>
               <div className="flex flex-wrap items-center justify-end gap-2">
-                <button
-                  onClick={handleRerunCutDecision}
-                  disabled={!canRerunCutDecision}
-                  title={cutDecisionDisabledReason}
-                  className="rounded-lg border border-violet-500/20 bg-violet-500/10 px-3 py-1.5 text-xs font-medium text-violet-300 transition hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  {rerunningCutDecision ? "재실행 중..." : "컷 결정만 재실행"}
-                </button>
-                {isCompleted && (
+                {viewerCanEdit && (
+                  <button
+                    onClick={handleRerunCutDecision}
+                    disabled={!canRerunCutDecision}
+                    title={cutDecisionDisabledReason}
+                    className="rounded-lg border border-violet-500/20 bg-violet-500/10 px-3 py-1.5 text-xs font-medium text-violet-300 transition hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {rerunningCutDecision ? "재실행 중..." : "컷 결정만 재실행"}
+                  </button>
+                )}
+                {viewerCanEdit && isCompleted && (
                   <button
                     onClick={openVariantModal}
                     className="rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-300 transition hover:bg-cyan-500/20"
@@ -993,14 +1005,16 @@ export default function ProjectDetailPage() {
                     새 편집 버전
                   </button>
                 )}
-                <button
-                  onClick={() => setConfirmDelete(true)}
-                  disabled={!canDeleteProject}
-                  className="rounded-lg border border-red-500/20 px-3 py-1.5 text-xs font-medium text-red-300 transition hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-40"
-                  title={canDeleteProject ? "프로젝트 삭제" : "진행 중인 작업이 있어 삭제할 수 없습니다"}
-                >
-                  삭제
-                </button>
+                {viewerCanEdit && (
+                  <button
+                    onClick={() => setConfirmDelete(true)}
+                    disabled={!canDeleteProject}
+                    className="rounded-lg border border-red-500/20 px-3 py-1.5 text-xs font-medium text-red-300 transition hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-40"
+                    title={canDeleteProject ? "프로젝트 삭제" : "진행 중인 작업이 있어 삭제할 수 없습니다"}
+                  >
+                    삭제
+                  </button>
+                )}
                 <span className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium ${statusConfig.color} ${statusConfig.bg}`}>
                   <span className={isProcessing ? "animate-spin" : ""}>{statusConfig.icon}</span>
                   {statusConfig.label}
@@ -1093,14 +1107,16 @@ export default function ProjectDetailPage() {
               <p className="text-xs text-gray-500 mt-3 mb-4">
                 홀딩된 크레딧은 자동으로 복구되었습니다.
               </p>
-              <button
-                onClick={handleRetry}
-                disabled={retrying}
-                className="group relative px-5 py-2 text-sm font-medium rounded-xl overflow-hidden transition-all duration-300 hover:shadow-[0_0_20px_rgba(6,182,212,0.2)] disabled:opacity-50"
-              >
-                <div className="absolute inset-0 bg-gradient-to-r from-cyan-500 to-violet-500" />
-                <span className="relative text-white">{retrying ? "재시도 중..." : "재시도"}</span>
-              </button>
+              {viewerCanEdit && (
+                <button
+                  onClick={handleRetry}
+                  disabled={retrying}
+                  className="group relative px-5 py-2 text-sm font-medium rounded-xl overflow-hidden transition-all duration-300 hover:shadow-[0_0_20px_rgba(6,182,212,0.2)] disabled:opacity-50"
+                >
+                  <div className="absolute inset-0 bg-gradient-to-r from-cyan-500 to-violet-500" />
+                  <span className="relative text-white">{retrying ? "재시도 중..." : "재시도"}</span>
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -1108,12 +1124,12 @@ export default function ProjectDetailPage() {
         {/* ── Downloads ── */}
         {isCompleted && (
           <Section
-            title="다운로드"
+            title={viewerCanEdit ? "다운로드" : "보기"}
             icon={<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>}
           >
             {/* Main downloads */}
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-4">
-              {downloadItems.map(({ key, label, icon, desc }) => (
+              {viewerCanEdit && downloadItems.map(({ key, label, icon, desc }) => (
                 <button
                   key={key}
                   onClick={() => handleDownload(key)}
@@ -1143,7 +1159,7 @@ export default function ProjectDetailPage() {
             </div>
 
             {/* Extra source downloads */}
-            {project.extra_sources.length > 0 && (
+            {viewerCanEdit && project.extra_sources.length > 0 && (
               <div className="mt-5 pt-5 border-t border-white/[0.04]">
                 <p className="text-xs text-gray-500 mb-3 uppercase tracking-wider">멀티캠 소스</p>
                 <div className="space-y-2">
@@ -1205,9 +1221,11 @@ export default function ProjectDetailPage() {
                       <button onClick={() => handleDownloadExtraSource(i)} className="text-cyan-400/70 hover:text-cyan-300 text-xs font-medium transition-colors">
                         다운로드
                       </button>
-                      <button onClick={() => handleRemoveExtraSource(src.r2_key)} className="text-red-400/50 hover:text-red-300 text-xs font-medium transition-colors">
-                        삭제
-                      </button>
+                      {viewerCanEdit && (
+                        <button onClick={() => handleRemoveExtraSource(src.r2_key)} className="text-red-400/50 hover:text-red-300 text-xs font-medium transition-colors">
+                          삭제
+                        </button>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -1230,7 +1248,7 @@ export default function ProjectDetailPage() {
                         </span>
                         <input
                           defaultValue={source.display_name}
-                          disabled={multicamSettingsSaving || canCancelMulticam}
+                          disabled={!viewerCanEdit || multicamSettingsSaving || canCancelMulticam}
                           onBlur={(event) => void handleSourceDisplayNameBlur(source.source_key, event.currentTarget.value)}
                           onKeyDown={(event) => {
                             if (event.key === "Enter") event.currentTarget.blur();
@@ -1256,7 +1274,7 @@ export default function ProjectDetailPage() {
                         <button
                           key={option.value}
                           type="button"
-                          disabled={multicamSettingsSaving || canCancelMulticam}
+                          disabled={!viewerCanEdit || multicamSettingsSaving || canCancelMulticam}
                           onClick={() => void handleMulticamSwitchingChange(option.value)}
                           className={"rounded-lg border px-3 py-2 text-left text-sm transition disabled:cursor-not-allowed disabled:opacity-50 " + (
                             selected
@@ -1296,7 +1314,7 @@ export default function ProjectDetailPage() {
                           </div>
                           <select
                             value={currentSpeakerSourceMap[summary.speaker] || ""}
-                            disabled={multicamSettingsSaving || canCancelMulticam}
+                            disabled={!viewerCanEdit || multicamSettingsSaving || canCancelMulticam}
                             onChange={(event) => void handleSpeakerSourceChange(summary.speaker, event.currentTarget.value)}
                             className="w-full rounded-md border border-white/[0.08] bg-[#050812] px-2.5 py-2 text-sm text-gray-200 outline-none transition focus:border-cyan-400/40 disabled:opacity-50"
                           >
@@ -1374,7 +1392,7 @@ export default function ProjectDetailPage() {
               />
               <button
                 onClick={() => fileInputRef.current?.click()}
-                disabled={isUploadingExtraSources}
+                disabled={!viewerCanEdit || isUploadingExtraSources}
                 className="px-4 py-2 text-sm bg-white/[0.03] border border-white/[0.08] rounded-lg hover:bg-white/[0.06] hover:border-white/[0.12] transition-all disabled:opacity-50"
               >
                 파일 추가
@@ -1382,7 +1400,7 @@ export default function ProjectDetailPage() {
               {pendingFiles.length > 0 && (
                 <button
                   onClick={handleUploadExtraSources}
-                  disabled={isUploadingExtraSources}
+                  disabled={!viewerCanEdit || isUploadingExtraSources}
                   className="px-4 py-2 text-sm font-medium bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 rounded-lg hover:bg-cyan-500/20 transition-all disabled:opacity-50"
                 >
                   {isUploadingExtraSources ? "업로드 중..." : "업로드"}
@@ -1391,7 +1409,7 @@ export default function ProjectDetailPage() {
               {hasActiveSourceDerivatives && (
                 <span className="px-3 py-2 text-xs text-gray-400">오디오 준비 중...</span>
               )}
-              {canRetryDerivatives && (
+              {viewerCanEdit && canRetryDerivatives && (
                 <button
                   onClick={handleRetryDerivatives}
                   disabled={derivativesRetrying}
@@ -1400,7 +1418,7 @@ export default function ProjectDetailPage() {
                   {derivativesRetrying ? "재생성 중..." : derivativesFailed ? "오디오 재생성" : "오디오 준비"}
                 </button>
               )}
-              {canApplyMulticam && (
+              {viewerCanEdit && canApplyMulticam && (
                 <button
                   onClick={handleMulticamReprocess}
                   disabled={multicamProcessing}
@@ -1412,7 +1430,7 @@ export default function ProjectDetailPage() {
                   <span className="relative text-white">{multicamProcessing ? "적용 중..." : "멀티캠 적용"}</span>
                 </button>
               )}
-              {canCancelMulticam && (
+              {viewerCanEdit && canCancelMulticam && (
                 <button
                   onClick={handleCancelMulticam}
                   disabled={multicamProcessing || multicamStatus === "canceling"}
@@ -1478,8 +1496,9 @@ export default function ProjectDetailPage() {
           </Section>
         )}
 
-        <Section
-          title="프로젝트 관리"
+        {viewerCanEdit && (
+          <Section
+            title="프로젝트 관리"
           icon={<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M3 6h18" /><path d="M8 6V4h8v2" /><path d="M19 6l-1 14H6L5 6" /></svg>}
         >
           <div className="flex items-center justify-between gap-4">
@@ -1492,7 +1511,8 @@ export default function ProjectDetailPage() {
               프로젝트 삭제
             </button>
           </div>
-        </Section>
+          </Section>
+        )}
       </main>
 
 

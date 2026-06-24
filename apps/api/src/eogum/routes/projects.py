@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from eogum.auth import CurrentUser, get_current_user, get_user_id
+from eogum.auth import CurrentUser, get_current_user, get_optional_current_user, get_user_id
 from eogum.models.schemas import (
     ProjectCreate,
     ProjectDetailResponse,
@@ -15,6 +15,7 @@ from eogum.models.schemas import (
     UpdateExtraSourcesRequest,
     UpdateMulticamSettingsRequest,
 )
+from eogum.public_access import is_public_project_id
 from eogum.services.artifacts import get_latest_artifact_job
 from eogum.services.credit import get_balance
 from eogum.services.database import get_db
@@ -177,11 +178,79 @@ def _project_access_query(db, current_user: CurrentUser, select: str = "*"):
     return query
 
 
-def _get_accessible_project(db, project_id: str, current_user: CurrentUser, select: str = "*") -> dict:
-    project = _project_access_query(db, current_user, select).eq("id", project_id).single().execute()
+def _select_with_access_columns(select: str) -> str:
+    if select.strip() == "*":
+        return select
+    columns = [column.strip() for column in select.split(",") if column.strip()]
+    for required in ("id", "user_id"):
+        if required not in columns:
+            columns.append(required)
+    return ", ".join(columns)
+
+
+def _has_project_owner_access(project: dict, current_user: CurrentUser | None) -> bool:
+    if current_user is None:
+        return False
+    return current_user.is_admin or project.get("user_id") == current_user.id
+
+
+def _get_accessible_project(
+    db,
+    project_id: str,
+    current_user: CurrentUser | None,
+    select: str = "*",
+    *,
+    allow_public_read: bool = False,
+) -> dict:
+    project = (
+        db.table("projects")
+        .select(_select_with_access_columns(select))
+        .eq("id", project_id)
+        .single()
+        .execute()
+    )
     if not project.data:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
-    return project.data
+    if _has_project_owner_access(project.data, current_user):
+        return project.data
+    if allow_public_read and is_public_project_id(project_id):
+        return project.data
+    raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
+
+
+def _public_source_derived(source_derived: dict | None) -> dict:
+    if not isinstance(source_derived, dict):
+        return {}
+    public_value = dict(source_derived)
+    public_value.pop("media_info_r2_key", None)
+    public_value.pop("audio_proxy_r2_key", None)
+    return public_value
+
+
+def _public_extra_sources(extra_sources: list[dict]) -> list[dict]:
+    public_sources = []
+    for index, source in enumerate(extra_sources):
+        public_source = dict(source)
+        public_source["r2_key"] = f"public-extra-source-{index}"
+        public_source.pop("source_sha256", None)
+        public_source["derived"] = _public_source_derived(public_source.get("derived"))
+        public_sources.append(public_source)
+    return public_sources
+
+
+def _sanitize_public_project_detail(project: dict) -> dict:
+    public_project = dict(project)
+    public_project["source_r2_key"] = None
+    public_project["source_derived"] = _public_source_derived(public_project.get("source_derived"))
+    public_project["extra_sources"] = _public_extra_sources(public_project.get("extra_sources") or [])
+    public_jobs = []
+    for job in public_project.get("jobs") or []:
+        public_job = dict(job)
+        public_job["external_task_ids"] = {}
+        public_job["result_r2_keys"] = None
+        public_jobs.append(public_job)
+    public_project["jobs"] = public_jobs
+    return public_project
 
 
 def _upsert_project_source_asset_best_effort(db, project: dict) -> None:
@@ -614,17 +683,27 @@ def list_projects(current_user: CurrentUser = Depends(get_current_user)):
 
 
 @router.get("/{project_id}", response_model=ProjectDetailResponse)
-def get_project(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
+def get_project(
+    project_id: str,
+    current_user: CurrentUser | None = Depends(get_optional_current_user),
+):
     db = get_db()
 
-    project_data = _get_accessible_project(db, project_id, current_user)
+    project_data = _get_accessible_project(
+        db,
+        project_id,
+        current_user,
+        allow_public_read=True,
+    )
 
     jobs = db.table("jobs").select("*").eq("project_id", project_id).order("created_at").execute()
     report = db.table("edit_reports").select("*").eq("project_id", project_id).limit(1).execute()
 
-    data = project_data
+    data = dict(project_data)
     data["jobs"] = jobs.data
     data["report"] = report.data[0] if report.data else None
+    if not _has_project_owner_access(project_data, current_user):
+        data = _sanitize_public_project_detail(data)
     return data
 
 

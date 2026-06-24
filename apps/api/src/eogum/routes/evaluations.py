@@ -10,7 +10,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from eogum.auth import CurrentUser, get_current_user
+from eogum.auth import CurrentUser, get_current_user, get_optional_current_user
 from eogum.config import settings
 from eogum.models.schemas import (
     ConfusionMatrix,
@@ -25,6 +25,7 @@ from eogum.models.schemas import (
     SegmentsResponse,
     VideoUrlResponse,
 )
+from eogum.public_access import is_public_project_id
 from eogum.services import avid
 from eogum.services.artifacts import get_latest_artifact_job
 from eogum.services.database import get_db
@@ -43,18 +44,44 @@ router = APIRouter(prefix="/projects/{project_id}", tags=["evaluations"])
 STREAM_CHUNK_SIZE = 1024 * 1024
 
 
-def _project_access_query(db, current_user: CurrentUser, select: str = "*"):
-    query = db.table("projects").select(select)
-    if not current_user.is_admin:
-        query = query.eq("user_id", current_user.id)
-    return query
+def _select_with_access_columns(select: str) -> str:
+    if select.strip() == "*":
+        return select
+    columns = [column.strip() for column in select.split(",") if column.strip()]
+    for required in ("id", "user_id"):
+        if required not in columns:
+            columns.append(required)
+    return ", ".join(columns)
 
 
-def _get_accessible_project(db, project_id: str, current_user: CurrentUser, select: str = "*") -> dict:
-    project = _project_access_query(db, current_user, select).eq("id", project_id).single().execute()
+def _has_project_owner_access(project: dict, current_user: CurrentUser | None) -> bool:
+    if current_user is None:
+        return False
+    return current_user.is_admin or project.get("user_id") == current_user.id
+
+
+def _get_accessible_project(
+    db,
+    project_id: str,
+    current_user: CurrentUser | None,
+    select: str = "*",
+    *,
+    allow_public_read: bool = False,
+) -> dict:
+    project = (
+        db.table("projects")
+        .select(_select_with_access_columns(select))
+        .eq("id", project_id)
+        .single()
+        .execute()
+    )
     if not project.data:
         raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
-    return project.data
+    if _has_project_owner_access(project.data, current_user):
+        return project.data
+    if allow_public_read and is_public_project_id(project_id):
+        return project.data
+    raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다")
 
 
 def _api_public_base(request: Request) -> str:
@@ -345,9 +372,22 @@ def _evaluation_response_from_row(row: dict) -> EvaluationResponse:
     )
 
 
-def _get_completed_job(db, project_id: str, current_user: CurrentUser, project_select: str = "id, user_id"):
+def _get_completed_job(
+    db,
+    project_id: str,
+    current_user: CurrentUser | None,
+    project_select: str = "id, user_id",
+    *,
+    allow_public_read: bool = False,
+):
     """Get the latest completed job for a project, verifying access."""
-    project_data = _get_accessible_project(db, project_id, current_user, project_select)
+    project_data = _get_accessible_project(
+        db,
+        project_id,
+        current_user,
+        project_select,
+        allow_public_read=allow_public_read,
+    )
 
     job = get_latest_artifact_job(db, project_id, user_id=project_data["user_id"], select="result_r2_keys")
     if not job:
@@ -357,10 +397,10 @@ def _get_completed_job(db, project_id: str, current_user: CurrentUser, project_s
 
 
 @router.get("/segments", response_model=SegmentsResponse)
-def get_segments(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
+def get_segments(project_id: str, current_user: CurrentUser | None = Depends(get_optional_current_user)):
     """Get engine-native review segments from avid-cli."""
     db = get_db()
-    r2_keys, _ = _get_completed_job(db, project_id, current_user)
+    r2_keys, _ = _get_completed_job(db, project_id, current_user, allow_public_read=True)
 
     project_json_key = r2_keys.get("project_json")
     if not project_json_key:
@@ -390,7 +430,7 @@ def get_segments(project_id: str, current_user: CurrentUser = Depends(get_curren
 
 
 @router.get("/video-url", response_model=VideoUrlResponse)
-def get_video_url(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
+def get_video_url(project_id: str, current_user: CurrentUser | None = Depends(get_optional_current_user)):
     """Get presigned streaming URL for the preview video."""
     db = get_db()
     r2_keys, project_data = _get_completed_job(
@@ -398,6 +438,7 @@ def get_video_url(project_id: str, current_user: CurrentUser = Depends(get_curre
         project_id,
         current_user,
         "id, user_id, source_duration_seconds, source_r2_key",
+        allow_public_read=True,
     )
 
     preview_key = r2_keys.get("preview")
@@ -413,11 +454,17 @@ def get_video_url(project_id: str, current_user: CurrentUser = Depends(get_curre
 
 
 @router.get("/evaluation", response_model=EvaluationResponse)
-def get_evaluation(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
+def get_evaluation(project_id: str, current_user: CurrentUser | None = Depends(get_optional_current_user)):
     """Get existing evaluation for this project owner."""
     db = get_db()
 
-    project_data = _get_accessible_project(db, project_id, current_user, "id, user_id")
+    project_data = _get_accessible_project(
+        db,
+        project_id,
+        current_user,
+        "id, user_id",
+        allow_public_read=True,
+    )
     owner_user_id = project_data["user_id"]
 
     result = (
@@ -578,10 +625,16 @@ def start_junction_preview(
 
 
 @router.get("/final-preview/{job_id}", response_model=FinalPreviewJobResponse)
-def get_final_preview(project_id: str, job_id: str, request: Request, current_user: CurrentUser = Depends(get_current_user)):
+def get_final_preview(project_id: str, job_id: str, request: Request, current_user: CurrentUser | None = Depends(get_optional_current_user)):
     db = get_db()
 
-    project_data = _get_accessible_project(db, project_id, current_user, "id, user_id")
+    project_data = _get_accessible_project(
+        db,
+        project_id,
+        current_user,
+        "id, user_id",
+        allow_public_read=True,
+    )
 
     job = (
         db.table("jobs")
@@ -633,11 +686,17 @@ def stream_final_preview_timeline_map(
 
 
 @router.get("/eval-report", response_model=EvalReportResponse)
-def get_eval_report(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
+def get_eval_report(project_id: str, current_user: CurrentUser | None = Depends(get_optional_current_user)):
     """Compare AI decisions vs human ground truth and produce a report."""
     db = get_db()
 
-    project_data = _get_accessible_project(db, project_id, current_user, "id, user_id")
+    project_data = _get_accessible_project(
+        db,
+        project_id,
+        current_user,
+        "id, user_id",
+        allow_public_read=True,
+    )
 
     # Get evaluation
     eval_result = (

@@ -3,6 +3,7 @@
 export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
+import { isPublicProjectId } from "@/lib/public-projects";
 import {
   api,
   type EvalSegment,
@@ -183,6 +184,7 @@ export default function ReviewPage() {
   const [showReport, setShowReport] = useState(false);
   const [loadingReport, setLoadingReport] = useState(false);
   const [saveError, setSaveError] = useState("");
+  const [viewerCanEdit, setViewerCanEdit] = useState(false);
   const [finalPreviewJobId, setFinalPreviewJobId] = useState<string | null>(null);
   const [finalPreviewStatus, setFinalPreviewStatus] = useState<string | null>(null);
   const [finalPreviewProgress, setFinalPreviewProgress] = useState(0);
@@ -204,18 +206,20 @@ export default function ReviewPage() {
     const {
       data: { session },
     } = await supabase.auth.getSession();
-    if (!session) {
+    const token = session?.access_token ?? null;
+    if (!token && !isPublicProjectId(projectId)) {
       router.replace("/");
       return;
     }
-    const token = session.access_token;
 
     try {
-      const [segRes, vidRes, evalRes] = await Promise.all([
+      const [projectRes, segRes, vidRes, evalRes] = await Promise.all([
+        api.getProject(token, projectId).catch(() => null),
         api.getSegments(token, projectId),
         api.getVideoUrl(token, projectId).catch(() => null),
         api.getEvaluation(token, projectId),
       ]);
+      setViewerCanEdit(Boolean(session && projectRes?.user_id === session.user.id));
 
       if (vidRes) {
         setVideoUrl(vidRes.video_url);
@@ -531,6 +535,7 @@ export default function ReviewPage() {
 
   // Save
   const handleSave = async () => {
+    if (!viewerCanEdit) return;
     setSaving(true);
     setSaveError("");
     try {
@@ -550,6 +555,7 @@ export default function ReviewPage() {
   };
 
   const handleGenerateFinalPreview = async () => {
+    if (!viewerCanEdit) return;
     setFinalPreviewError("");
     setPreviewJobKind("final");
     setFinalPreviewStatus("pending");
@@ -591,6 +597,7 @@ export default function ReviewPage() {
 
 
   const handleGenerateJunctionPreview = async () => {
+    if (!viewerCanEdit) return;
     setFinalPreviewError("");
     setPreviewJobKind("junction");
     setFinalPreviewStatus("pending");
@@ -695,8 +702,9 @@ export default function ReviewPage() {
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      if (!session) { setLoadingReport(false); return; }
-      const r = await api.getEvalReport(session.access_token, projectId);
+      const token = session?.access_token ?? null;
+      if (!token && !isPublicProjectId(projectId)) { setLoadingReport(false); return; }
+      const r = await api.getEvalReport(token, projectId);
       setReport(r);
       setShowReport(true);
     } catch (err) {
@@ -839,6 +847,7 @@ export default function ReviewPage() {
             <span className="text-xs text-gray-500 mr-1">내 평가:</span>
             <button
               onClick={() => setHumanAction(seg.index, "keep")}
+              disabled={!viewerCanEdit}
               className={`text-xs px-2 py-1 rounded transition ${
                 seg.human?.action === "keep"
                   ? "bg-green-600 text-white"
@@ -849,6 +858,7 @@ export default function ReviewPage() {
             </button>
             <button
               onClick={() => setHumanAction(seg.index, "cut")}
+              disabled={!viewerCanEdit}
               className={`text-xs px-2 py-1 rounded transition ${
                 seg.human?.action === "cut"
                   ? "bg-red-600 text-white"
@@ -865,7 +875,8 @@ export default function ReviewPage() {
                   onChange={(e) =>
                     setHumanReason(seg.index, e.target.value)
                   }
-                  className="text-xs bg-gray-800 text-gray-300 rounded px-2 py-1 border border-gray-700"
+                  disabled={!viewerCanEdit}
+                  className="text-xs bg-gray-800 text-gray-300 rounded px-2 py-1 border border-gray-700 disabled:opacity-60"
                 >
                   <option value="">이유 선택</option>
                   {(seg.human.action === "cut" ? CUT_REASONS : KEEP_REASONS).map((r) => (
@@ -880,8 +891,9 @@ export default function ReviewPage() {
                   onChange={(e) =>
                     setHumanNote(seg.index, e.target.value)
                   }
+                  disabled={!viewerCanEdit}
                   placeholder="메모"
-                  className="text-xs bg-gray-800 text-gray-300 rounded px-2 py-1 border border-gray-700 flex-1 min-w-[100px]"
+                  className="text-xs bg-gray-800 text-gray-300 rounded px-2 py-1 border border-gray-700 flex-1 min-w-[100px] disabled:opacity-60"
                 />
               </>
             )}
@@ -922,15 +934,17 @@ export default function ReviewPage() {
             {dirty && (
               <span className="text-amber-400 text-xs">● 변경사항 있음</span>
             )}
-            <button
-              onClick={handleGenerateFinalPreview}
-              disabled={isPreviewRendering}
-              className="px-4 py-1.5 rounded-lg text-sm font-medium transition bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-50"
-            >
-              {isPreviewRendering && previewJobKind === "final"
-                ? `생성 중 ${finalPreviewProgress}%`
-                : "완성본 미리보기 생성"}
-            </button>
+            {viewerCanEdit && (
+              <button
+                onClick={handleGenerateFinalPreview}
+                disabled={isPreviewRendering}
+                className="px-4 py-1.5 rounded-lg text-sm font-medium transition bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-50"
+              >
+                {isPreviewRendering && previewJobKind === "final"
+                  ? `생성 중 ${finalPreviewProgress}%`
+                  : "완성본 미리보기 생성"}
+              </button>
+            )}
             {usingFinalPreview && (
               <button
                 onClick={restoreOriginalPreview}
@@ -952,17 +966,19 @@ export default function ReviewPage() {
             >
               {loadingReport ? "분석 중..." : showReport ? "목록으로" : "리포트"}
             </button>
-            <button
-              onClick={handleSave}
-              disabled={saving || !dirty}
-              className={`px-4 py-1.5 rounded-lg text-sm font-medium transition ${
-                dirty
-                  ? "bg-white text-black hover:bg-gray-200"
-                  : "bg-gray-800 text-gray-500 cursor-not-allowed"
-              }`}
-            >
-              {saving ? "저장 중..." : "저장"}
-            </button>
+            {viewerCanEdit && (
+              <button
+                onClick={handleSave}
+                disabled={saving || !dirty}
+                className={`px-4 py-1.5 rounded-lg text-sm font-medium transition ${
+                  dirty
+                    ? "bg-white text-black hover:bg-gray-200"
+                    : "bg-gray-800 text-gray-500 cursor-not-allowed"
+                }`}
+              >
+                {saving ? "저장 중..." : "저장"}
+              </button>
+            )}
             <span className="text-[11px] text-gray-500">
               {reviewMetadata.schema_version ?? "review-unknown"} / {reviewMetadata.join_strategy ?? "join-unknown"}
             </span>
@@ -1089,16 +1105,18 @@ export default function ReviewPage() {
             >
               {showJunctionOnly ? "전체 보기" : "연결부만 골라보기"}
             </button>
-            <button
-              type="button"
-              onClick={handleGenerateJunctionPreview}
-              disabled={junctionMetadata.pairs.length === 0 || isPreviewRendering}
-              className="px-2.5 py-1 rounded bg-cyan-500/10 text-cyan-300 text-xs font-medium transition hover:bg-cyan-500/20 disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              {isPreviewRendering && previewJobKind === "junction"
-                ? `영상 생성 중 ${finalPreviewProgress}%`
-                : "연결부 미리보기 생성"}
-            </button>
+            {viewerCanEdit && (
+              <button
+                type="button"
+                onClick={handleGenerateJunctionPreview}
+                disabled={junctionMetadata.pairs.length === 0 || isPreviewRendering}
+                className="px-2.5 py-1 rounded bg-cyan-500/10 text-cyan-300 text-xs font-medium transition hover:bg-cyan-500/20 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {isPreviewRendering && previewJobKind === "junction"
+                  ? `영상 생성 중 ${finalPreviewProgress}%`
+                  : "연결부 미리보기 생성"}
+              </button>
+            )}
             <button
               type="button"
               onClick={selectVisibleSegments}

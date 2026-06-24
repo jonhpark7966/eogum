@@ -2,16 +2,16 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1
 
 export async function apiFetch<T>(
   path: string,
-  token: string,
+  token: string | null | undefined,
   options?: RequestInit
 ): Promise<T> {
+  const headers = new Headers(options?.headers);
+  headers.set("Content-Type", "application/json");
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+
   const res = await fetch(`${API_URL}${path}`, {
     ...options,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-      ...options?.headers,
-    },
+    headers,
   });
 
   if (!res.ok) {
@@ -426,7 +426,7 @@ export const api = {
 
   listProjects: (token: string) => apiFetch<Project[]>("/projects", token),
 
-  getProject: (token: string, id: string) =>
+  getProject: (token: string | null | undefined, id: string) =>
     apiFetch<ProjectDetail>(`/projects/${id}`, token),
 
   createProject: (
@@ -501,26 +501,26 @@ export const api = {
   getCredits: (token: string) => apiFetch<CreditBalance>("/credits", token),
 
   // Downloads
-  getDownload: (token: string, projectId: string, fileType: string) =>
+  getDownload: (token: string | null | undefined, projectId: string, fileType: string) =>
     apiFetch<DownloadResponse>(
       `/projects/${projectId}/download/${fileType}`,
       token
     ),
 
-  downloadExtraSource: (token: string, projectId: string, index: number) =>
+  downloadExtraSource: (token: string | null | undefined, projectId: string, index: number) =>
     apiFetch<DownloadResponse>(
       `/projects/${projectId}/download/extra-source/${index}`,
       token
     ),
 
   // Evaluations
-  getSegments: (token: string, projectId: string) =>
+  getSegments: (token: string | null | undefined, projectId: string) =>
     apiFetch<SegmentsResponse>(`/projects/${projectId}/segments`, token),
 
-  getVideoUrl: (token: string, projectId: string) =>
+  getVideoUrl: (token: string | null | undefined, projectId: string) =>
     apiFetch<VideoUrlResponse>(`/projects/${projectId}/video-url`, token),
 
-  getEvaluation: async (token: string, projectId: string): Promise<EvaluationResponse | null> => {
+  getEvaluation: async (token: string | null | undefined, projectId: string): Promise<EvaluationResponse | null> => {
     try {
       return await apiFetch<EvaluationResponse>(`/projects/${projectId}/evaluation`, token);
     } catch (err) {
@@ -548,10 +548,10 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  getFinalPreview: (token: string, projectId: string, jobId: string) =>
+  getFinalPreview: (token: string | null | undefined, projectId: string, jobId: string) =>
     apiFetch<FinalPreviewJobResponse>(`/projects/${projectId}/final-preview/${jobId}`, token),
 
-  getEvalReport: (token: string, projectId: string) =>
+  getEvalReport: (token: string | null | undefined, projectId: string) =>
     apiFetch<EvalReportResponse>(`/projects/${projectId}/eval-report`, token),
 
   // YouTube

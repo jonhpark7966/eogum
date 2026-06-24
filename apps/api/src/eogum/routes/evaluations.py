@@ -244,13 +244,40 @@ def _normalize_evaluation_payload(segments_value) -> dict:
     return {"segments": segments_value or []}
 
 
+def _effective_ai_decision(ai: dict | None) -> dict:
+    if not isinstance(ai, dict):
+        return {}
+    effective = dict(ai)
+    repair = effective.get("junction_repair")
+    if not isinstance(repair, dict):
+        return effective
+    if repair.get("user_apply_junction_repair") is not False:
+        repaired_to = repair.get("repaired_to")
+        if repaired_to in {"keep", "cut"}:
+            effective["action"] = repaired_to
+        return effective
+
+    original_action = repair.get("original_action") or repair.get("repaired_from")
+    if original_action in {"keep", "cut"}:
+        effective["action"] = original_action
+    if repair.get("original_reason") is not None:
+        effective["reason"] = repair.get("original_reason")
+    if repair.get("original_note") is not None:
+        effective["note"] = repair.get("original_note")
+    if repair.get("original_edit_type") is not None:
+        effective["edit_type"] = repair.get("original_edit_type")
+    if repair.get("original_origin_kind") is not None:
+        effective["origin_kind"] = repair.get("original_origin_kind")
+    return effective
+
+
 
 
 def _effective_segment_action(segment: dict) -> str:
     human = segment.get("human")
     if isinstance(human, dict) and human.get("action") in {"keep", "cut"}:
         return human["action"]
-    ai = segment.get("ai")
+    ai = _effective_ai_decision(segment.get("ai"))
     if isinstance(ai, dict) and ai.get("action") == "cut":
         return "cut"
     return "keep"
@@ -727,7 +754,7 @@ def get_eval_report(project_id: str, current_user: CurrentUser | None = Depends(
     disagreements: list[DisagreementDetail] = []
 
     for seg in segments:
-        ai = seg.get("ai") or {}
+        ai = _effective_ai_decision(seg.get("ai") or {})
         human = seg.get("human")
         ai_action = ai.get("action", "keep")
         ai_reason = ai.get("reason", "")

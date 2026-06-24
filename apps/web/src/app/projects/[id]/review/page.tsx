@@ -116,7 +116,8 @@ function previewMsToSourceMs(previewMs: number, map: FinalPreviewTimelineMap | n
 }
 
 function aiActionForSegment(seg: EvalSegment): "keep" | "cut" {
-  return seg.ai?.action === "cut" ? "cut" : "keep";
+  const ai = effectiveAiDecision(seg.ai);
+  return ai?.action === "cut" ? "cut" : "keep";
 }
 
 function decisionActionForSegment(seg: EvalSegment): "keep" | "cut" {
@@ -128,6 +129,47 @@ function decisionActionForSegment(seg: EvalSegment): "keep" | "cut" {
 function overlapProtectionMetadata(seg: EvalSegment): Record<string, unknown> | null {
   const value = seg.overlap_protection;
   return value && typeof value === "object" ? value as Record<string, unknown> : null;
+}
+
+function junctionRepairMetadata(seg: EvalSegment): Record<string, unknown> | null {
+  const repair = seg.ai?.junction_repair;
+  return repair && typeof repair === "object" ? repair as Record<string, unknown> : null;
+}
+
+function effectiveAiDecision(ai: EvalSegment["ai"]): EvalSegment["ai"] {
+  if (!ai) return ai;
+  const repair = ai.junction_repair;
+  if (!repair || typeof repair !== "object") return ai;
+  const metadata = repair as Record<string, unknown>;
+  const applyRepair = metadata.user_apply_junction_repair !== false;
+  if (applyRepair) {
+    const repairedTo = metadata.repaired_to;
+    if (repairedTo !== "cut" && repairedTo !== "keep") return ai;
+    return {
+      ...ai,
+      action: repairedTo,
+    };
+  }
+  const originalAction = metadata.original_action ?? metadata.repaired_from;
+  return {
+    ...ai,
+    action: originalAction === "cut" ? "cut" : "keep",
+    reason: typeof metadata.original_reason === "string" ? metadata.original_reason : ai.reason,
+    note: typeof metadata.original_note === "string" ? metadata.original_note : ai.note,
+    edit_type: typeof metadata.original_edit_type === "string" ? metadata.original_edit_type : ai.edit_type,
+    origin_kind: typeof metadata.original_origin_kind === "string" ? metadata.original_origin_kind : ai.origin_kind,
+  };
+}
+
+function junctionRepairTitle(metadata: Record<string, unknown>): string {
+  const linked = stringListValue(metadata.linked_segment_indices);
+  return [
+    "AI 자동 보정",
+    metadata.type ? `type=${String(metadata.type)}` : null,
+    `${String(metadata.original_action ?? metadata.repaired_from ?? "unknown").toUpperCase()} -> ${String(metadata.repaired_to ?? "unknown").toUpperCase()}`,
+    linked ? `linked=${linked}` : null,
+    metadata.reason ? `reason=${String(metadata.reason)}` : null,
+  ].filter(Boolean).join(" / ");
 }
 
 function stringListValue(value: unknown): string {
@@ -188,10 +230,12 @@ export default function ReviewPage() {
   const [currentIndex, setCurrentIndex] = useState(-1);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [regeneratingExports, setRegeneratingExports] = useState(false);
   const [report, setReport] = useState<EvalReportResponse | null>(null);
   const [showReport, setShowReport] = useState(false);
   const [loadingReport, setLoadingReport] = useState(false);
   const [saveError, setSaveError] = useState("");
+  const [statusMessage, setStatusMessage] = useState("");
   const [viewerCanEdit, setViewerCanEdit] = useState(false);
   const [finalPreviewJobId, setFinalPreviewJobId] = useState<string | null>(null);
   const [finalPreviewStatus, setFinalPreviewStatus] = useState<string | null>(null);
@@ -541,7 +585,53 @@ export default function ReviewPage() {
     setDirty(true);
   };
 
+  const setJunctionRepairApplied = (index: number, applied: boolean) => {
+    setSegments((prev) =>
+      prev.map((seg) => {
+        if (seg.index !== index || !seg.ai) return seg;
+        const repair = junctionRepairMetadata(seg);
+        if (!repair) return seg;
+        const updatedRepair: Record<string, unknown> = {
+          ...repair,
+          user_apply_junction_repair: applied,
+        };
+        const action = applied
+          ? (updatedRepair.repaired_to === "cut" ? "cut" : "keep")
+          : ((updatedRepair.original_action ?? updatedRepair.repaired_from) === "cut" ? "cut" : "keep");
+        return {
+          ...seg,
+          ai: {
+            ...seg.ai,
+            action,
+            reason: applied
+              ? String(updatedRepair.type ?? seg.ai.reason ?? "")
+              : String(updatedRepair.original_reason ?? seg.ai.reason ?? ""),
+            note: applied
+              ? seg.ai.note
+              : (typeof updatedRepair.original_note === "string" ? updatedRepair.original_note : seg.ai.note),
+            edit_type: applied
+              ? seg.ai.edit_type
+              : (typeof updatedRepair.original_edit_type === "string" ? updatedRepair.original_edit_type : seg.ai.edit_type),
+            origin_kind: applied
+              ? seg.ai.origin_kind
+              : (typeof updatedRepair.original_origin_kind === "string" ? updatedRepair.original_origin_kind : seg.ai.origin_kind),
+            junction_repair: updatedRepair,
+          },
+        };
+      })
+    );
+    setDirty(true);
+    setStatusMessage("");
+  };
+
   // Save
+  const saveCurrentEvaluation = async (token: string) => {
+    return api.saveEvaluation(token, projectId, {
+      ...reviewMetadata,
+      segments,
+    });
+  };
+
   const handleSave = async () => {
     if (!viewerCanEdit) return;
     setSaving(true);
@@ -551,15 +641,35 @@ export default function ReviewPage() {
         data: { session },
       } = await supabase.auth.getSession();
       if (!session) { setSaving(false); return; }
-      await api.saveEvaluation(session.access_token, projectId, {
-        ...reviewMetadata,
-        segments,
-      });
+      await saveCurrentEvaluation(session.access_token);
       setDirty(false);
+      setStatusMessage("리뷰가 저장되었습니다");
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : "저장 실패");
     }
     setSaving(false);
+  };
+
+  const handleRegenerateExports = async () => {
+    if (!viewerCanEdit) return;
+    setRegeneratingExports(true);
+    setSaveError("");
+    setStatusMessage("");
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      if (!session) { setRegeneratingExports(false); return; }
+      if (dirty) {
+        await saveCurrentEvaluation(session.access_token);
+        setDirty(false);
+      }
+      await api.regenerateExports(session.access_token, projectId);
+      setStatusMessage("최종 산출물 재생성을 시작했습니다. 완료 후 프로젝트 페이지의 다운로드가 갱신됩니다.");
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : "최종 산출물 재생성 실패");
+    }
+    setRegeneratingExports(false);
   };
 
   const handleGenerateFinalPreview = async () => {
@@ -724,9 +834,9 @@ export default function ReviewPage() {
   // Stats
   const totalSegments = segments.length;
   const reviewedCount = segments.filter((s) => s.human !== null).length;
-  const aiCutCount = segments.filter((s) => s.ai?.action === "cut").length;
+  const aiCutCount = segments.filter((s) => aiActionForSegment(s) === "cut").length;
   const agreeCount = segments.filter(
-    (s) => s.human && s.ai && s.human.action === s.ai.action
+    (s) => s.human && s.ai && s.human.action === aiActionForSegment(s)
   ).length;
   const agreePct = reviewedCount > 0 ? Math.round((agreeCount / reviewedCount) * 100) : 0;
 
@@ -757,9 +867,13 @@ export default function ReviewPage() {
     const disagree =
       seg.human !== null &&
       seg.ai !== null &&
-      seg.human.action !== seg.ai.action;
+      seg.human.action !== aiAction;
     const overlapMetadata = overlapProtectionMetadata(seg);
     const isOverlapMerged = overlapMetadata?.merged === true;
+    const junctionRepair = junctionRepairMetadata(seg);
+    const hasJunctionRepair = junctionRepair !== null;
+    const junctionRepairApplied = junctionRepair?.user_apply_junction_repair !== false;
+    const effectiveAi = effectiveAiDecision(seg.ai);
 
     return (
       <div
@@ -821,6 +935,14 @@ export default function ReviewPage() {
                 겹침 보호 병합
               </span>
             )}
+            {hasJunctionRepair && junctionRepair && (
+              <span
+                className="shrink-0 rounded border border-cyan-400/25 bg-cyan-400/10 px-2 py-0.5 text-[11px] font-medium text-cyan-200"
+                title={junctionRepairTitle(junctionRepair)}
+              >
+                AI 자동 보정
+              </span>
+            )}
             <span className="text-xs text-gray-400 font-mono">
               {formatTime(seg.start_ms)}→{formatTime(seg.end_ms)}
             </span>
@@ -841,13 +963,45 @@ export default function ReviewPage() {
               >
                 AI: {aiAction.toUpperCase()}
               </span>
-              {seg.ai?.reason && (
+              {effectiveAi?.reason && (
                 <span className="text-xs text-gray-500">
-                  {seg.ai.reason}
+                  {effectiveAi.reason}
                 </span>
               )}
             </div>
           </div>
+
+          {hasJunctionRepair && junctionRepair && (
+            <div className="mb-2 flex flex-wrap items-center gap-2 pl-14 text-xs text-cyan-100">
+              <label
+                className={`flex items-center gap-2 rounded border px-2 py-1 ${
+                  seg.human
+                    ? "border-gray-700 bg-gray-900/70 text-gray-500"
+                    : "border-cyan-400/20 bg-cyan-400/10 text-cyan-200"
+                }`}
+                title={seg.human ? "수동 평가가 AI 자동 보정보다 우선합니다" : "체크하면 보정된 decision이 final preview/export에 적용됩니다"}
+              >
+                <input
+                  type="checkbox"
+                  checked={junctionRepairApplied}
+                  disabled={!viewerCanEdit || Boolean(seg.human)}
+                  onChange={(event) => setJunctionRepairApplied(seg.index, event.target.checked)}
+                  className="h-3.5 w-3.5 rounded border-gray-600 bg-gray-950 accent-cyan-400 disabled:opacity-50"
+                />
+                <span>Final에 적용</span>
+              </label>
+              <span className="text-gray-400">
+                AI 원판정 {String(junctionRepair.original_action ?? junctionRepair.repaired_from ?? "unknown").toUpperCase()}
+                {" → "}
+                보정 {String(junctionRepair.repaired_to ?? "unknown").toUpperCase()}
+              </span>
+              {Array.isArray(junctionRepair.linked_segment_indices) && (
+                <span className="text-gray-500">
+                  연결 #{junctionRepair.linked_segment_indices.map((value) => String(value)).join(", #")}
+                </span>
+              )}
+            </div>
+          )}
 
           <p className="text-sm text-gray-300 mb-2 pl-14">{seg.text}</p>
 
@@ -953,6 +1107,15 @@ export default function ReviewPage() {
                   : "완성본 미리보기 생성"}
               </button>
             )}
+            {viewerCanEdit && (
+              <button
+                onClick={handleRegenerateExports}
+                disabled={regeneratingExports || isPreviewRendering}
+                className="px-4 py-1.5 rounded-lg text-sm font-medium transition bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-50"
+              >
+                {regeneratingExports ? "재생성 요청 중..." : "최종 산출물 재생성"}
+              </button>
+            )}
             {usingFinalPreview && (
               <button
                 onClick={restoreOriginalPreview}
@@ -1009,6 +1172,14 @@ export default function ReviewPage() {
           <div className="bg-red-900/50 border border-red-700 rounded-lg px-4 py-2 text-red-200 text-sm flex items-center justify-between">
             <span>{finalPreviewError}</span>
             <button onClick={() => setFinalPreviewError("")} className="text-red-400 hover:text-red-200 ml-3">✕</button>
+          </div>
+        </div>
+      )}
+
+      {statusMessage && (
+        <div className="max-w-6xl mx-auto px-6 py-2">
+          <div className="rounded-lg border border-cyan-700 bg-cyan-900/30 px-4 py-2 text-sm text-cyan-100">
+            {statusMessage}
           </div>
         </div>
       )}

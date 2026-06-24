@@ -473,6 +473,9 @@ export const api = {
   rerunCutDecision: (token: string, id: string) =>
     apiFetch<Project>(`/projects/${id}/cut-decision`, token, { method: "POST" }),
 
+  regenerateExports: (token: string, id: string) =>
+    apiFetch<Project>(`/projects/${id}/exports/regenerate`, token, { method: "POST" }),
+
   updateExtraSources: (token: string, id: string, extra_sources: ExtraSource[]) =>
     apiFetch<Project>(`/projects/${id}/extra-sources`, token, {
       method: "PUT",

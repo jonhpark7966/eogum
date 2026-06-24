@@ -1022,6 +1022,88 @@ def multicam_reprocess(project_id: str, current_user: CurrentUser = Depends(get_
     return db.table("projects").select("*").eq("id", project_id).single().execute().data
 
 
+@router.post("/{project_id}/exports/regenerate", response_model=ProjectResponse)
+def regenerate_exports(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
+    """Regenerate downloadable FCPXML/SRT/project JSON from the saved review evaluation."""
+    db = get_db()
+
+    project_data = _get_accessible_project(db, project_id, current_user)
+    owner_user_id = project_data["user_id"]
+
+    if project_data["status"] not in ("completed", "failed", "reprocess_failed"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="완료 또는 실패한 프로젝트만 최종 산출물을 재생성할 수 있습니다",
+        )
+
+    existing_reprocess = (
+        db.table("jobs")
+        .select("id")
+        .eq("project_id", project_id)
+        .eq("type", "reprocess_multicam")
+        .in_("status", ["pending", "running"])
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if _first_row(existing_reprocess):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="이미 재생성 작업이 진행 중입니다",
+        )
+
+    job = get_latest_artifact_job(db, project_id, select="id, result_r2_keys")
+    if not job or not (job["result_r2_keys"] or {}).get("project_json"):
+        raise HTTPException(status_code=404, detail="프로젝트 JSON이 없습니다. 전체 재처리가 필요합니다.")
+
+    eval_result = (
+        db.table("evaluations")
+        .select("segments")
+        .eq("project_id", project_id)
+        .eq("evaluator_id", owner_user_id)
+        .limit(1)
+        .execute()
+    )
+    evaluation_payload = eval_result.data[0]["segments"] if eval_result.data else None
+    eval_segments = (
+        evaluation_payload.get("segments") if isinstance(evaluation_payload, dict)
+        else evaluation_payload
+    )
+    if not eval_segments:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="저장된 리뷰 데이터가 없어 재생성할 수 없습니다",
+        )
+
+    if project_data.get("extra_sources"):
+        _ensure_multicam_derivatives_ready_or_raise(db, project_data)
+
+    queued_job = db.table("jobs").insert({
+        "project_id": project_id,
+        "user_id": owner_user_id,
+        "type": "reprocess_multicam",
+        "status": "pending",
+        "progress": 0,
+    }).execute().data[0]
+
+    update_values = {"status": "processing"}
+    if project_data.get("extra_sources"):
+        desired_hash = _extra_sources_hash(project_data.get("extra_sources") or [])
+        update_values["multicam_state"] = {
+            **(project_data.get("multicam_state") or {}),
+            "status": "queued",
+            "desired_sources_hash": desired_hash,
+            "source_count": len(project_data.get("extra_sources") or []),
+            "job_id": queued_job["id"],
+            "error": None,
+        }
+
+    db.table("projects").update(update_values).eq("id", project_id).execute()
+    enqueue_reprocess(project_id, queued_job["id"])
+
+    return db.table("projects").select("*").eq("id", project_id).single().execute().data
+
+
 @router.post("/{project_id}/multicam/cancel", response_model=ProjectResponse)
 def cancel_multicam_reprocess(project_id: str, current_user: CurrentUser = Depends(get_current_user)):
     db = get_db()

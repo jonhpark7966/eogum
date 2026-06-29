@@ -30,7 +30,7 @@ sys.modules.setdefault(
     ),
 )
 
-from eogum.services import source_derivatives
+from eogum.services import source_derivatives  # noqa: E402
 
 
 def test_source_derivative_media_info_extracts_timecode_from_rtmd_data_stream():

@@ -39,7 +39,14 @@ logger = logging.getLogger(__name__)
 
 _job_lanes = ("project", "reprocess", "source_derive", "cut_decision", "final_preview")
 _queues: dict[str, deque[dict[str, str | None]]] = {lane: deque() for lane in _job_lanes}
-_running_lanes: dict[str, bool] = {lane: False for lane in _job_lanes}
+_running_lanes: dict[str, int] = {lane: 0 for lane in _job_lanes}
+_worker_limit_settings = {
+    "project": "project_worker_count",
+    "reprocess": "reprocess_worker_count",
+    "source_derive": "source_derive_worker_count",
+    "cut_decision": "cut_decision_worker_count",
+    "final_preview": "final_preview_worker_count",
+}
 _lock = threading.Lock()
 _initial_job_types = {"subtitle_cut", "podcast_cut"}
 _incomplete_job_statuses = ["queued", "pending", "running"]
@@ -92,23 +99,40 @@ def _lane_for_kind(kind: str) -> str:
 
 def _enqueue(kind: str, project_id: str, job_id: str | None) -> None:
     lane = _lane_for_kind(kind)
-    _queues[lane].append({"kind": kind, "project_id": project_id, "job_id": job_id})
-    _maybe_start_worker(lane)
-
-
-def _maybe_start_worker(lane: str) -> None:
     with _lock:
-        if _running_lanes[lane]:
-            return
-        _running_lanes[lane] = True
-    thread = threading.Thread(target=_worker_loop, args=(lane,), daemon=True)
-    thread.start()
+        _queues[lane].append({"kind": kind, "project_id": project_id, "job_id": job_id})
+    _maybe_start_workers(lane)
+
+
+def _lane_worker_limit(lane: str) -> int:
+    value = getattr(settings, _worker_limit_settings[lane], 1)
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        logger.warning("Invalid worker limit for lane %s: %r; using 1", lane, value)
+        return 1
+
+
+def _maybe_start_workers(lane: str) -> None:
+    threads_to_start = 0
+    with _lock:
+        limit = _lane_worker_limit(lane)
+        while _queues[lane] and _running_lanes[lane] < limit:
+            _running_lanes[lane] += 1
+            threads_to_start += 1
+
+    for _ in range(threads_to_start):
+        thread = threading.Thread(target=_worker_loop, args=(lane,), daemon=True)
+        thread.start()
 
 
 def _worker_loop(lane: str) -> None:
-    queue = _queues[lane]
-    while queue:
-        item = queue.popleft()
+    while True:
+        with _lock:
+            if not _queues[lane]:
+                _running_lanes[lane] -= 1
+                return
+            item = _queues[lane].popleft()
         project_id = item["project_id"]
         try:
             if item["kind"] == "reprocess":
@@ -123,14 +147,6 @@ def _worker_loop(lane: str) -> None:
                 _process_project(project_id, item["job_id"])
         except Exception:
             logger.exception("Fatal error processing project %s", project_id)
-    restart = False
-    with _lock:
-        if queue:
-            restart = True
-        else:
-            _running_lanes[lane] = False
-    if restart:
-        threading.Thread(target=_worker_loop, args=(lane,), daemon=True).start()
 
 
 def create_initial_job(db, project: dict) -> dict:
@@ -1552,7 +1568,6 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
             eval_segments = evaluation_payload
 
         has_extra_sources = bool(project.get("extra_sources"))
-        extra_offsets = _resolve_extra_source_offsets(project.get("extra_sources") or [])
 
         if not eval_segments and not has_extra_sources and not current_project_has_extra_sources:
             raise RuntimeError("평가 데이터 또는 적용할 extra source 변경이 필요합니다")
@@ -1736,11 +1751,12 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
             logger.exception("Failed to persist reprocess cancellation state for project %s job %s", project_id, job_id)
     except Exception as exc:
         logger.exception("Project reprocess failed for project %s", project_id)
+        error_message = str(exc)[:1000]
         try:
             execute_with_retry(
                 lambda: db.table("jobs").update({
                     "status": "failed",
-                    "error_message": str(exc)[:1000],
+                    "error_message": error_message,
                     "completed_at": "now()",
                 }).eq("id", job_id).execute(),
                 operation_name=f"jobs.update.reprocess_failed job_id={job_id}",
@@ -1749,7 +1765,7 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
                 lambda: db.table("projects").update({"status": "reprocess_failed"}).eq("id", project_id).execute(),
                 operation_name=f"projects.update.reprocess_failed project_id={project_id}",
             )
-            _update_multicam_state(db, project_id, status="failed", job_id=job_id, error=str(exc)[:1000])
+            _update_multicam_state(db, project_id, status="failed", job_id=job_id, error=error_message)
         except Exception:
             logger.exception("Failed to persist reprocess failure state for project %s job %s", project_id, job_id)
         raise

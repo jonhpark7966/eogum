@@ -67,6 +67,13 @@ class Settings(BaseSettings):
     port: int = 8000
     api_public_url: str = ""
 
+    # Job workers
+    project_worker_count: int = 1
+    reprocess_worker_count: int = 1
+    source_derive_worker_count: int = 1
+    cut_decision_worker_count: int = 1
+    final_preview_worker_count: int = 1
+
     # Local preview cache
     final_preview_cache_dir: Path = Path("/tmp/eogum/final-previews")
     source_cache_dir: Path = Path("/tmp/eogum/sources")

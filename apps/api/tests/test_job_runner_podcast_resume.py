@@ -14,7 +14,7 @@ if str(SRC_DIR) not in sys.path:
 os.environ.setdefault("SUPABASE_URL", "http://localhost")
 os.environ.setdefault("SUPABASE_SERVICE_KEY", "test-service-key")
 
-from eogum.services import job_runner
+from eogum.services import job_runner  # noqa: E402
 
 
 def test_reprocess_jobs_use_dedicated_lane():

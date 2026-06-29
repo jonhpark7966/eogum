@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from eogum.auth import CurrentUser, get_current_user, get_optional_current_user, get_user_id
+from eogum.auth import CurrentUser, get_current_user, get_optional_current_user
 from eogum.models.schemas import (
     ProjectCreate,
     ProjectDetailResponse,
@@ -192,6 +192,12 @@ def _has_project_owner_access(project: dict, current_user: CurrentUser | None) -
     if current_user is None:
         return False
     return current_user.is_admin or project.get("user_id") == current_user.id
+
+
+def _annotate_project_access(project: dict, current_user: CurrentUser | None) -> dict:
+    data = dict(project)
+    data["viewer_can_edit"] = _has_project_owner_access(project, current_user)
+    return data
 
 
 def _get_accessible_project(
@@ -505,8 +511,9 @@ def _validate_project_settings(req: ProjectCreate) -> None:
 
 
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
-def create_project(req: ProjectCreate, user_id: str = Depends(get_user_id)):
+def create_project(req: ProjectCreate, current_user: CurrentUser = Depends(get_current_user)):
     _validate_project_settings(req)
+    user_id = current_user.id
 
     # Check credits
     balance = get_balance(user_id)
@@ -544,7 +551,7 @@ def create_project(req: ProjectCreate, user_id: str = Depends(get_user_id)):
     # Enqueue for processing only after the durable job exists.
     enqueue(project["id"], job["id"])
 
-    return project
+    return _annotate_project_access(project, current_user)
 
 
 @router.post("/{project_id}/variants", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
@@ -672,14 +679,14 @@ def create_project_variant(project_id: str, req: ProjectVariantCreate, current_u
 
     job = _create_initial_job_or_fail(db, project)
     enqueue(project["id"], job["id"])
-    return project
+    return _annotate_project_access(project, current_user)
 
 
 @router.get("", response_model=list[ProjectResponse])
 def list_projects(current_user: CurrentUser = Depends(get_current_user)):
     db = get_db()
     result = _project_access_query(db, current_user).order("created_at", desc=True).execute()
-    return result.data
+    return [_annotate_project_access(project, current_user) for project in result.data or []]
 
 
 @router.get("/{project_id}", response_model=ProjectDetailResponse)
@@ -702,6 +709,7 @@ def get_project(
     data = dict(project_data)
     data["jobs"] = jobs.data
     data["report"] = report.data[0] if report.data else None
+    data = _annotate_project_access(data, current_user)
     if not _has_project_owner_access(project_data, current_user):
         data = _sanitize_public_project_detail(data)
     return data
@@ -740,7 +748,7 @@ def retry_project(project_id: str, current_user: CurrentUser = Depends(get_curre
     # Enqueue for processing
     enqueue(project_id, job["id"])
 
-    return updated
+    return _annotate_project_access(updated, current_user)
 
 
 @router.post("/{project_id}/cut-decision", response_model=ProjectResponse)
@@ -806,7 +814,7 @@ def rerun_cut_decision(project_id: str, current_user: CurrentUser = Depends(get_
         .data[0]
     )
     enqueue_cut_decision(project_id, job["id"])
-    return updated
+    return _annotate_project_access(updated, current_user)
 
 
 @router.put("/{project_id}/extra-sources", response_model=ProjectResponse)
@@ -851,7 +859,7 @@ def update_extra_sources(
         .data[0]
     )
     _queue_source_derive_if_needed(db, updated, source_keys=source_keys)
-    return updated
+    return _annotate_project_access(updated, current_user)
 
 
 @router.post("/{project_id}/extra-sources/derive", response_model=ProjectResponse)
@@ -869,11 +877,11 @@ def retry_extra_source_derivatives(
             detail="처리 중인 프로젝트의 파생 파일은 재생성할 수 없습니다",
         )
     if not project_data.get("extra_sources"):
-        return project_data
+        return _annotate_project_access(project_data, current_user)
 
     source_keys = source_derivatives.source_keys_needing_derivatives(project_data, force=req.force)
     if not source_keys:
-        return project_data
+        return _annotate_project_access(project_data, current_user)
 
     queued_project = _mark_derivatives_queued(project_data, source_keys)
     updated = (
@@ -887,7 +895,7 @@ def retry_extra_source_derivatives(
         .data[0]
     )
     _queue_source_derive_if_needed(db, updated, source_keys=source_keys, force=req.force)
-    return updated
+    return _annotate_project_access(updated, current_user)
 
 
 @router.put("/{project_id}/multicam-settings", response_model=ProjectResponse)
@@ -927,7 +935,7 @@ def update_multicam_settings(
         .execute()
         .data[0]
     )
-    return updated
+    return _annotate_project_access(updated, current_user)
 
 
 @router.post("/{project_id}/multicam", response_model=ProjectResponse)
@@ -1019,7 +1027,8 @@ def multicam_reprocess(project_id: str, current_user: CurrentUser = Depends(get_
     db.table("projects").update({"status": "processing", "multicam_state": multicam_state}).eq("id", project_id).execute()
     enqueue_reprocess(project_id, queued_job["id"])
 
-    return db.table("projects").select("*").eq("id", project_id).single().execute().data
+    updated = db.table("projects").select("*").eq("id", project_id).single().execute().data
+    return _annotate_project_access(updated, current_user)
 
 
 @router.post("/{project_id}/exports/regenerate", response_model=ProjectResponse)
@@ -1101,7 +1110,8 @@ def regenerate_exports(project_id: str, current_user: CurrentUser = Depends(get_
     db.table("projects").update(update_values).eq("id", project_id).execute()
     enqueue_reprocess(project_id, queued_job["id"])
 
-    return db.table("projects").select("*").eq("id", project_id).single().execute().data
+    updated = db.table("projects").select("*").eq("id", project_id).single().execute().data
+    return _annotate_project_access(updated, current_user)
 
 
 @router.post("/{project_id}/multicam/cancel", response_model=ProjectResponse)
@@ -1148,7 +1158,7 @@ def cancel_multicam_reprocess(project_id: str, current_user: CurrentUser = Depen
         .execute()
         .data[0]
     )
-    return updated
+    return _annotate_project_access(updated, current_user)
 
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)

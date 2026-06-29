@@ -64,6 +64,7 @@ class ProjectVariantCreate(BaseModel):
 class ProjectResponse(BaseModel):
     id: str
     user_id: str
+    viewer_can_edit: bool = False
     name: str
     status: str
     cut_type: str

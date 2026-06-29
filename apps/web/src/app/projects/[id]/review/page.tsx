@@ -271,7 +271,7 @@ export default function ReviewPage() {
         api.getVideoUrl(token, projectId).catch(() => null),
         api.getEvaluation(token, projectId),
       ]);
-      setViewerCanEdit(Boolean(session && projectRes?.user_id === session.user.id));
+      setViewerCanEdit(Boolean(projectRes?.viewer_can_edit ?? (session && projectRes?.user_id === session.user.id)));
 
       if (vidRes) {
         setVideoUrl(vidRes.video_url);

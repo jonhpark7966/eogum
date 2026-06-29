@@ -64,6 +64,7 @@ export interface UpdateMulticamSettingsPayload {
 export interface Project {
   id: string;
   user_id: string;
+  viewer_can_edit: boolean;
   name: string;
   status: string;
   cut_type: string;

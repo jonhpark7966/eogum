@@ -832,7 +832,7 @@ export default function ProjectDetailPage() {
 
   if (!project) return null;
 
-  const viewerCanEdit = Boolean(sessionUserId && project.user_id === sessionUserId);
+  const viewerCanEdit = Boolean(project.viewer_can_edit ?? (sessionUserId && project.user_id === sessionUserId));
   const backPath = viewerCanEdit ? "/dashboard" : "/";
   const backLabel = viewerCanEdit ? "대시보드" : "홈";
   const statusConfig = STATUS_CONFIG[project.status] ?? { label: project.status, color: "text-gray-400", icon: "○", bg: "bg-gray-400/10" };

@@ -1,5 +1,6 @@
 const BUILTIN_PUBLIC_PROJECT_IDS = new Set([
   "3d2587aa-f65a-4746-a454-30bba7611ddc",
+  "b094cf1c-bf9b-49f1-8a45-c646e3734692",
 ]);
 
 function configuredPublicProjectIds(): Set<string> {

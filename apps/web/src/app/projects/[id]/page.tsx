@@ -17,7 +17,7 @@ import {
 import { useUploads } from "@/lib/upload-provider";
 import { isPublicProjectId } from "@/lib/public-projects";
 import { useParams, useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import Image from "next/image";
@@ -52,6 +52,8 @@ const JOB_TYPE_LABELS: Record<string, string> = {
   final_preview: "완성본 미리보기",
   source_derive: "오디오 준비",
 };
+
+const PROJECT_NAME_MAX_LENGTH = 120;
 
 
 type EditIntensity = "light" | "normal" | "heavy";
@@ -503,6 +505,9 @@ export default function ProjectDetailPage() {
   const [creatingVariant, setCreatingVariant] = useState(false);
   const [sourceCacheReused, setSourceCacheReused] = useState(false);
   const [sessionUserId, setSessionUserId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+  const [renaming, setRenaming] = useState(false);
 
   // Multicam state
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
@@ -512,6 +517,7 @@ export default function ProjectDetailPage() {
   const [reviewSegments, setReviewSegments] = useState<SegmentWithDecision[]>([]);
   const [reviewSegmentsLoading, setReviewSegmentsLoading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const projectNameInputRef = useRef<HTMLInputElement>(null);
 
   const projectId = params.id as string;
   const uploadTask = tasks.find((task) => task.projectId === projectId && ["queued", "uploading", "registering"].includes(task.status));
@@ -573,6 +579,14 @@ export default function ProjectDetailPage() {
     }
   }, [latestUploadTaskStatus, loadProject]);
 
+  useEffect(() => {
+    if (!editingName) return;
+    window.setTimeout(() => {
+      projectNameInputRef.current?.focus();
+      projectNameInputRef.current?.select();
+    }, 0);
+  }, [editingName]);
+
 
   useEffect(() => {
     if (!project || project.status !== "completed" || project.extra_sources.length === 0) {
@@ -624,6 +638,65 @@ export default function ProjectDetailPage() {
       setError(err instanceof Error ? err.message : "컷 결정 재실행에 실패했습니다");
     } finally {
       setRerunningCutDecision(false);
+    }
+  };
+
+  const startEditingName = () => {
+    if (!project || !viewerCanEdit) return;
+    setNameDraft(project.name);
+    setEditingName(true);
+    setError("");
+  };
+
+  const cancelEditingName = () => {
+    if (renaming) return;
+    setEditingName(false);
+    setNameDraft("");
+  };
+
+  const handleRenameProject = async () => {
+    if (!project || !viewerCanEdit || renaming) return;
+    const normalizedName = nameDraft.trim();
+    if (!normalizedName) {
+      setError("프로젝트 이름을 입력해주세요");
+      return;
+    }
+    if (normalizedName.length > PROJECT_NAME_MAX_LENGTH) {
+      setError(`프로젝트 이름은 ${PROJECT_NAME_MAX_LENGTH}자 이하여야 합니다`);
+      return;
+    }
+    if (normalizedName === project.name) {
+      cancelEditingName();
+      return;
+    }
+
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    setRenaming(true);
+    setError("");
+    try {
+      const updated = await api.updateProject(session.access_token, projectId, { name: normalizedName });
+      setProject((current) => current ? {
+        ...current,
+        name: updated.name,
+        updated_at: updated.updated_at,
+      } : current);
+      setEditingName(false);
+      setNameDraft("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "프로젝트 이름 변경에 실패했습니다");
+    } finally {
+      setRenaming(false);
+    }
+  };
+
+  const handleProjectNameKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void handleRenameProject();
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      cancelEditingName();
     }
   };
 
@@ -889,6 +962,13 @@ export default function ProjectDetailPage() {
     && !canCancelMulticam
     && !isUploadingExtraSources
     && !rerunningCutDecision;
+  const trimmedNameDraft = nameDraft.trim();
+  const nameDraftTooLong = trimmedNameDraft.length > PROJECT_NAME_MAX_LENGTH;
+  const canSaveProjectName = editingName
+    && !renaming
+    && trimmedNameDraft.length > 0
+    && !nameDraftTooLong
+    && trimmedNameDraft !== project.name;
   const downloadItems = [
     { key: "source", label: "원본 소스", icon: "📁", desc: "원본 영상 파일" },
     { key: "fcpxml", label: "FCPXML", icon: "🎬", desc: "Final Cut Pro 프로젝트" },
@@ -939,7 +1019,57 @@ export default function ProjectDetailPage() {
           <div className="relative bg-[#0a0f1a] border border-white/[0.06] rounded-2xl p-6">
             <div className="flex items-start justify-between gap-4">
               <div className="flex-1 min-w-0">
-                <h1 className="text-2xl font-bold mb-3">{project.name}</h1>
+                {editingName ? (
+                  <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start">
+                    <input
+                      ref={projectNameInputRef}
+                      value={nameDraft}
+                      onChange={(event) => setNameDraft(event.currentTarget.value)}
+                      onKeyDown={handleProjectNameKeyDown}
+                      disabled={renaming}
+                      aria-label="프로젝트 이름"
+                      className="min-h-10 flex-1 rounded-lg border border-white/[0.10] bg-[#050812] px-3 py-2 text-xl font-semibold leading-tight text-white outline-none transition focus:border-cyan-400/50 disabled:opacity-60"
+                    />
+                    <div className="flex shrink-0 gap-2">
+                      <button
+                        onClick={() => void handleRenameProject()}
+                        disabled={!canSaveProjectName}
+                        className="rounded-lg border border-cyan-500/20 bg-cyan-500/10 px-3 py-2 text-xs font-medium text-cyan-300 transition hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {renaming ? "저장 중..." : "저장"}
+                      </button>
+                      <button
+                        onClick={cancelEditingName}
+                        disabled={renaming}
+                        className="rounded-lg border border-white/[0.08] px-3 py-2 text-xs font-medium text-gray-400 transition hover:bg-white/[0.04] hover:text-gray-200 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        취소
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mb-3 flex items-start gap-2">
+                    <h1
+                      className={"min-w-0 text-2xl font-bold leading-tight " + (viewerCanEdit ? "cursor-pointer" : "")}
+                      onClick={viewerCanEdit ? startEditingName : undefined}
+                    >
+                      {project.name}
+                    </h1>
+                    {viewerCanEdit && (
+                      <button
+                        onClick={startEditingName}
+                        className="mt-1.5 rounded-md border border-white/[0.08] p-1.5 text-gray-500 transition hover:border-white/[0.14] hover:bg-white/[0.04] hover:text-gray-300"
+                        aria-label="프로젝트 이름 수정"
+                        title="프로젝트 이름 수정"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7">
+                          <path d="M12 20h9" />
+                          <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5Z" />
+                        </svg>
+                      </button>
+                    )}
+                  </div>
+                )}
                 <div className="flex flex-wrap items-center gap-3 text-sm text-gray-500">
                   <span className="inline-flex items-center gap-1.5">
                     {project.cut_type === "subtitle_cut" ? (

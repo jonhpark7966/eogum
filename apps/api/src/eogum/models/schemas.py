@@ -61,6 +61,10 @@ class ProjectVariantCreate(BaseModel):
     name: str | None = None
 
 
+class ProjectUpdateRequest(BaseModel):
+    name: str
+
+
 class ProjectResponse(BaseModel):
     id: str
     user_id: str

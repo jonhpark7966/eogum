@@ -10,6 +10,7 @@ from eogum.models.schemas import (
     ProjectCreate,
     ProjectDetailResponse,
     ProjectResponse,
+    ProjectUpdateRequest,
     ProjectVariantCreate,
     SourceDeriveRequest,
     UpdateExtraSourcesRequest,
@@ -47,6 +48,7 @@ ALLOWED_MULTICAM_SWITCHING = {
     "follow_speaker",
     "conservative_follow_speaker",
 }
+PROJECT_NAME_MAX_LENGTH = 120
 EDIT_INTENSITY_LABELS = {
     "light": "적게 편집",
     "normal": "일반 편집",
@@ -510,6 +512,21 @@ def _validate_project_settings(req: ProjectCreate) -> None:
         )
 
 
+def _normalize_project_name(name: str) -> str:
+    normalized = name.strip()
+    if not normalized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="프로젝트 이름을 입력해주세요",
+        )
+    if len(normalized) > PROJECT_NAME_MAX_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"프로젝트 이름은 {PROJECT_NAME_MAX_LENGTH}자 이하여야 합니다",
+        )
+    return normalized
+
+
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
 def create_project(req: ProjectCreate, current_user: CurrentUser = Depends(get_current_user)):
     _validate_project_settings(req)
@@ -713,6 +730,26 @@ def get_project(
     if not _has_project_owner_access(project_data, current_user):
         data = _sanitize_public_project_detail(data)
     return data
+
+
+@router.patch("/{project_id}", response_model=ProjectResponse)
+def update_project(
+    project_id: str,
+    req: ProjectUpdateRequest,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    db = get_db()
+    _get_accessible_project(db, project_id, current_user)
+    normalized_name = _normalize_project_name(req.name)
+
+    updated = (
+        db.table("projects")
+        .update({"name": normalized_name})
+        .eq("id", project_id)
+        .execute()
+        .data[0]
+    )
+    return _annotate_project_access(updated, current_user)
 
 
 @router.post("/{project_id}/retry", response_model=ProjectResponse)

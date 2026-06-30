@@ -465,6 +465,12 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
+  updateProject: (token: string, id: string, data: { name: string }) =>
+    apiFetch<Project>(`/projects/${id}`, token, {
+      method: "PATCH",
+      body: JSON.stringify(data),
+    }),
+
   deleteProject: (token: string, id: string) =>
     apiFetch<void>("/projects/" + id, token, { method: "DELETE" }),
 

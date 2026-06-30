@@ -7,7 +7,7 @@ from pathlib import Path
 
 from eogum.config import settings
 
-FINAL_PREVIEW_RENDER_VERSION = 2
+FINAL_PREVIEW_RENDER_VERSION = 3
 
 
 def decision_hash(payload: dict) -> str:

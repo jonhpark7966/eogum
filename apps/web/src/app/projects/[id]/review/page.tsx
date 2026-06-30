@@ -321,9 +321,10 @@ export default function ReviewPage() {
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      if (!session || canceled) return;
+      const token = session?.access_token ?? null;
+      if ((!token && !isPublicProjectId(projectId)) || canceled) return;
       try {
-        const job = await api.getFinalPreview(session.access_token, projectId, finalPreviewJobId);
+        const job = await api.getFinalPreview(token, projectId, finalPreviewJobId);
         if (canceled) return;
         setFinalPreviewStatus(job.status);
         setFinalPreviewProgress(job.progress);
@@ -672,8 +673,10 @@ export default function ReviewPage() {
     setRegeneratingExports(false);
   };
 
+  const canCreateFinalPreview = viewerCanEdit || isPublicProjectId(projectId);
+
   const handleGenerateFinalPreview = async () => {
-    if (!viewerCanEdit) return;
+    if (!canCreateFinalPreview) return;
     setFinalPreviewError("");
     setPreviewJobKind("final");
     setFinalPreviewStatus("pending");
@@ -682,8 +685,9 @@ export default function ReviewPage() {
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      if (!session) return;
-      const job = await api.startFinalPreview(session.access_token, projectId, {
+      const token = session?.access_token ?? null;
+      if (!token && !isPublicProjectId(projectId)) return;
+      const job = await api.startFinalPreview(token, projectId, {
         ...reviewMetadata,
         segments,
       });
@@ -706,7 +710,7 @@ export default function ReviewPage() {
         setActivePreviewKind("final");
         if (job.duration_ms) setDurationMs(job.duration_ms);
       }
-      setDirty(false);
+      if (viewerCanEdit) setDirty(false);
     } catch (err) {
       setFinalPreviewStatus("failed");
       setFinalPreviewError(err instanceof Error ? err.message : "완성본 미리보기 생성에 실패했습니다");
@@ -1096,7 +1100,7 @@ export default function ReviewPage() {
             {dirty && (
               <span className="text-amber-400 text-xs">● 변경사항 있음</span>
             )}
-            {viewerCanEdit && (
+            {canCreateFinalPreview && (
               <button
                 onClick={handleGenerateFinalPreview}
                 disabled={isPreviewRendering}

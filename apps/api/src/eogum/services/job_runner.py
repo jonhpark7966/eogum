@@ -58,6 +58,7 @@ ALLOWED_SEGMENTATION_BOUNDARY_RULES = {
     "low_energy_gap_v1",
 }
 DEFAULT_SEGMENTATION_BOUNDARY_RULE = "word_boundary"
+FINAL_PREVIEW_MERGE_GAP_MS = 500
 
 
 def enqueue(project_id: str, job_id: str) -> None:
@@ -2013,6 +2014,267 @@ def _primary_intervals_from_fcpxml(fcpxml_path: Path) -> list[tuple[float, float
     return intervals
 
 
+def _int_value(value: object) -> int | None:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _merge_time_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    valid_ranges = sorted((start, end) for start, end in ranges if end > start)
+    if not valid_ranges:
+        return []
+
+    merged: list[tuple[int, int]] = []
+    current_start, current_end = valid_ranges[0]
+    for start, end in valid_ranges[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+            continue
+        merged.append((current_start, current_end))
+        current_start, current_end = start, end
+    merged.append((current_start, current_end))
+    return merged
+
+
+def _subtract_time_ranges(
+    start_ms: int,
+    end_ms: int,
+    protected_ranges: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    pieces: list[tuple[int, int]] = []
+    cursor = start_ms
+    for protected_start, protected_end in protected_ranges:
+        if protected_end <= cursor:
+            continue
+        if protected_start >= end_ms:
+            break
+        if protected_start > cursor:
+            pieces.append((cursor, min(protected_start, end_ms)))
+        cursor = max(cursor, protected_end)
+        if cursor >= end_ms:
+            break
+    if cursor < end_ms:
+        pieces.append((cursor, end_ms))
+    return pieces
+
+
+def _range_overlaps_any(start_ms: int, end_ms: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(range_start < end_ms and start_ms < range_end for range_start, range_end in ranges)
+
+
+def _primary_video_track(project_data: dict) -> dict | None:
+    for track in project_data.get("tracks") or []:
+        if track.get("track_type") == "video":
+            return track
+    return None
+
+
+def _source_duration_ms(project_data: dict, primary_track: dict | None) -> int:
+    source_file_id = primary_track.get("source_file_id") if primary_track else None
+    duration_candidates: list[int] = []
+
+    for source_file in project_data.get("source_files") or []:
+        info = source_file.get("info") or {}
+        duration_ms = _int_value(info.get("duration_ms"))
+        if duration_ms and duration_ms > 0:
+            duration_candidates.append(duration_ms)
+            if source_file_id and source_file.get("id") == source_file_id:
+                return duration_ms
+
+    transcription = project_data.get("transcription") or {}
+    for segment in transcription.get("segments") or []:
+        end_ms = _int_value(segment.get("end_ms"))
+        if end_ms and end_ms > 0:
+            duration_candidates.append(end_ms)
+
+    for decision in project_data.get("edit_decisions") or []:
+        range_data = decision.get("range") or {}
+        end_ms = _int_value(range_data.get("end_ms"))
+        if end_ms and end_ms > 0:
+            duration_candidates.append(end_ms)
+
+    return max(duration_candidates, default=0)
+
+
+def _review_segment_ranges(project_data: dict) -> list[tuple[int, int, int, str | None]]:
+    transcription = project_data.get("transcription") or {}
+    raw_segments = transcription.get("segments") or []
+    valid_segments: list[tuple[int, int, int, int, str | None]] = []
+
+    for position, segment in enumerate(raw_segments):
+        start_ms = _int_value(segment.get("start_ms"))
+        end_ms = _int_value(segment.get("end_ms"))
+        if start_ms is None or end_ms is None or end_ms <= start_ms:
+            continue
+        segment_index = _int_value(segment.get("index"))
+        if segment_index is None:
+            segment_index = position + 1
+        speaker = segment.get("speaker")
+        valid_segments.append((
+            position,
+            segment_index,
+            start_ms,
+            end_ms,
+            str(speaker) if speaker else None,
+        ))
+
+    if not valid_segments:
+        return []
+
+    if project_data.get("segmentation_boundary_rule") != "word_boundary":
+        return [
+            (segment_index, start_ms, end_ms, speaker)
+            for _, segment_index, start_ms, end_ms, speaker in valid_segments
+        ]
+
+    starts = {position: start_ms for position, _, start_ms, _, _ in valid_segments}
+    ends = {position: end_ms for position, _, _, end_ms, _ in valid_segments}
+
+    for current, following in zip(valid_segments, valid_segments[1:]):
+        current_position, _, _, current_end, _ = current
+        next_position, _, next_start, _, _ = following
+        boundary = (current_end + next_start) // 2
+        ends[current_position] = boundary
+        starts[next_position] = boundary
+
+    ranges: list[tuple[int, int, int, str | None]] = []
+    for position, segment_index, raw_start, raw_end, speaker in valid_segments:
+        start_ms = starts[position]
+        end_ms = ends[position]
+        if end_ms <= start_ms:
+            start_ms = raw_start
+            end_ms = raw_end
+        ranges.append((segment_index, start_ms, end_ms, speaker))
+    return ranges
+
+
+def _final_preview_removed_ranges(
+    project_data: dict,
+    primary_track_id: str,
+    review_ranges: list[tuple[int, int, int, str | None]],
+) -> list[tuple[int, int]]:
+    ranges_by_index = {
+        segment_index: (start_ms, end_ms)
+        for segment_index, start_ms, end_ms, _speaker in review_ranges
+    }
+    protected_ranges = _merge_time_ranges([
+        (start_ms, end_ms)
+        for _segment_index, start_ms, end_ms, _speaker in review_ranges
+    ])
+
+    removed_ranges: list[tuple[int, int]] = []
+    for decision in project_data.get("edit_decisions") or []:
+        if decision.get("active_video_track_id") != primary_track_id:
+            continue
+        if decision.get("edit_type") not in {"cut", "mute"}:
+            continue
+
+        range_data = decision.get("range") or {}
+        start_ms = _int_value(range_data.get("start_ms"))
+        end_ms = _int_value(range_data.get("end_ms"))
+        if start_ms is None or end_ms is None or end_ms <= start_ms:
+            continue
+
+        if decision.get("reason") == "silence":
+            removed_ranges.extend(_subtract_time_ranges(start_ms, end_ms, protected_ranges))
+            continue
+
+        source_segment_index = _int_value(decision.get("source_segment_index"))
+        review_range = ranges_by_index.get(source_segment_index) if source_segment_index is not None else None
+        if review_range is not None:
+            removed_ranges.append(review_range)
+        else:
+            removed_ranges.append((start_ms, end_ms))
+
+    return _merge_time_ranges(removed_ranges)
+
+
+def _merge_adjacent_final_preview_segments(
+    segments: list[tuple[int, int, int, str, str | None]],
+) -> list[tuple[int, int, str]]:
+    merged: list[tuple[int, int, int, str, str | None]] = []
+    for segment in segments:
+        segment_index, start_ms, end_ms, state, speaker = segment
+        if not merged:
+            merged.append(segment)
+            continue
+
+        prev_index, prev_start, prev_end, prev_state, prev_speaker = merged[-1]
+        gap_ms = max(0, start_ms - prev_end)
+        if (
+            prev_state == state == "enabled"
+            and prev_speaker is not None
+            and prev_speaker == speaker
+            and gap_ms < FINAL_PREVIEW_MERGE_GAP_MS
+        ):
+            merged[-1] = (prev_index, prev_start, end_ms, prev_state, prev_speaker)
+            continue
+        merged.append((segment_index, start_ms, end_ms, state, speaker))
+
+    return [(start_ms, end_ms, state) for _index, start_ms, end_ms, state, _speaker in merged]
+
+
+def _invert_removed_ranges(
+    removed_ranges: list[tuple[int, int]],
+    total_duration_ms: int,
+) -> list[tuple[int, int]]:
+    keep_ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for start_ms, end_ms in _merge_time_ranges(removed_ranges):
+        start_ms = max(0, min(start_ms, total_duration_ms))
+        end_ms = max(0, min(end_ms, total_duration_ms))
+        if end_ms <= start_ms:
+            continue
+        if start_ms > cursor:
+            keep_ranges.append((cursor, start_ms))
+        cursor = max(cursor, end_ms)
+    if cursor < total_duration_ms:
+        keep_ranges.append((cursor, total_duration_ms))
+    return keep_ranges
+
+
+def _final_preview_intervals_from_project_json(project_json_path: Path) -> list[tuple[float, float]]:
+    project_data = json.loads(project_json_path.read_text(encoding="utf-8"))
+    primary_track = _primary_video_track(project_data)
+    if not primary_track:
+        return []
+
+    primary_track_id = str(primary_track.get("id") or "")
+    if not primary_track_id:
+        return []
+
+    total_duration_ms = _source_duration_ms(project_data, primary_track)
+    review_ranges = _review_segment_ranges(project_data)
+    removed_ranges = _final_preview_removed_ranges(project_data, primary_track_id, review_ranges)
+
+    if review_ranges:
+        review_segments: list[tuple[int, int, int, str, str | None]] = []
+        for segment_index, start_ms, end_ms, speaker in review_ranges:
+            if total_duration_ms > 0:
+                start_ms = max(0, min(start_ms, total_duration_ms))
+                end_ms = max(0, min(end_ms, total_duration_ms))
+            if end_ms <= start_ms:
+                continue
+            state = "removed" if _range_overlaps_any(start_ms, end_ms, removed_ranges) else "enabled"
+            review_segments.append((segment_index, start_ms, end_ms, state, speaker))
+
+        keep_ranges = [
+            (start_ms, end_ms)
+            for start_ms, end_ms, state in _merge_adjacent_final_preview_segments(review_segments)
+            if state != "removed"
+        ]
+    else:
+        keep_ranges = _invert_removed_ranges(removed_ranges, total_duration_ms)
+
+    return [
+        (start_ms / 1000.0, (end_ms - start_ms) / 1000.0)
+        for start_ms, end_ms in keep_ranges
+        if end_ms > start_ms
+    ]
+
+
 def _has_audio_stream(source_path: Path) -> bool:
     result = subprocess.run(
         [
@@ -2393,16 +2655,7 @@ def _render_final_preview(project_id: str, job_id: str | None) -> None:
         )
         db.table("jobs").update({"progress": 35}).eq("id", job_id).execute()
 
-        export_payload = avid.export_project(
-            project_json_path=str(applied_project_json),
-            output_dir=str(output_dir),
-            silence_mode="cut",
-            content_mode="cut",
-            **_multicam_export_options(project, temp_dir),
-        )
-        artifacts = export_payload.get("artifacts") or {}
-        fcpxml_path = Path(artifacts["fcpxml"])
-        intervals = _primary_intervals_from_fcpxml(fcpxml_path)
+        intervals = _final_preview_intervals_from_project_json(applied_project_json)
         if not intervals:
             raise RuntimeError("미리보기로 렌더링할 keep 구간이 없습니다")
         db.table("jobs").update({"progress": 50}).eq("id", job_id).execute()

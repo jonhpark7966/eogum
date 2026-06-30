@@ -546,7 +546,7 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  startFinalPreview: (token: string, projectId: string, payload: EvaluationSavePayload) =>
+  startFinalPreview: (token: string | null | undefined, projectId: string, payload: EvaluationSavePayload) =>
     apiFetch<FinalPreviewJobResponse>(`/projects/${projectId}/final-preview`, token, {
       method: "POST",
       body: JSON.stringify(payload),

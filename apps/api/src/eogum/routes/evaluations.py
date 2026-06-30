@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/projects/{project_id}", tags=["evaluations"])
 
 STREAM_CHUNK_SIZE = 1024 * 1024
+PUBLIC_READONLY_ACTIVE_PREVIEW_LIMIT = 3
+REVIEW_METADATA_KEYS = ("schema_version", "review_scope", "join_strategy")
 
 
 def _select_with_access_columns(select: str) -> str:
@@ -152,6 +154,49 @@ def _find_completed_cached_preview_job(db, project_id: str, user_id: str, hash_v
     return None
 
 
+def _find_reusable_preview_job(db, project_id: str, user_id: str, hash_value: str) -> dict | None:
+    result = (
+        db.table("jobs")
+        .select("id,status,progress,error_message,result_r2_keys,created_at")
+        .eq("project_id", project_id)
+        .eq("user_id", user_id)
+        .eq("type", "final_preview")
+        .in_("status", ["queued", "pending", "running", "completed"])
+        .order("created_at", desc=True)
+        .limit(20)
+        .execute()
+    )
+    for job in result.data or []:
+        result_keys = job.get("result_r2_keys") or {}
+        if result_keys.get("decision_hash") != hash_value:
+            continue
+        if job.get("status") == "completed":
+            if preview_cache_ready(project_id, hash_value) or result_keys.get("final_preview"):
+                return job
+            continue
+        return job
+    return None
+
+
+def _active_public_readonly_preview_count(db, project_id: str, user_id: str) -> int:
+    result = (
+        db.table("jobs")
+        .select("id,result_r2_keys")
+        .eq("project_id", project_id)
+        .eq("user_id", user_id)
+        .eq("type", "final_preview")
+        .in_("status", ["queued", "pending", "running"])
+        .order("created_at", desc=True)
+        .limit(50)
+        .execute()
+    )
+    return sum(
+        1
+        for job in result.data or []
+        if (job.get("result_r2_keys") or {}).get("preview_scope") == "public_readonly"
+    )
+
+
 def _verify_cached_preview_job(project_id: str, job_id: str, token: str) -> tuple[Path, Path, Path]:
     db = get_db()
     job = (
@@ -242,6 +287,82 @@ def _normalize_evaluation_payload(segments_value) -> dict:
         payload["segments"] = payload.get("segments") or []
         return payload
     return {"segments": segments_value or []}
+
+
+def _source_duration_ms(avid_data: dict) -> int:
+    source_duration_ms = 0
+    for sf in avid_data.get("source_files", []):
+        info = sf.get("info", {})
+        if info.get("duration_ms"):
+            source_duration_ms = max(source_duration_ms, info["duration_ms"])
+    return source_duration_ms
+
+
+def _review_segments_payload_from_project_json(project_id: str, raw: bytes) -> dict:
+    avid_data = json.loads(raw)
+
+    transcription = avid_data.get("transcription")
+    if not transcription or not transcription.get("segments"):
+        raise HTTPException(status_code=404, detail="자막 데이터가 없습니다")
+
+    settings.avid_temp_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f"review_segments_{project_id}_", dir=str(settings.avid_temp_dir)) as temp_dir:
+        local_project_json = Path(temp_dir) / "input.project.avid.json"
+        local_project_json.write_bytes(raw)
+        payload = avid.review_segments(str(local_project_json))
+
+    payload["source_duration_ms"] = _source_duration_ms(avid_data)
+    return payload
+
+
+def _owner_evaluation_payload(db, project_id: str, owner_user_id: str) -> dict | None:
+    result = (
+        db.table("evaluations")
+        .select("segments")
+        .eq("project_id", project_id)
+        .eq("evaluator_id", owner_user_id)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        return None
+    return _normalize_evaluation_payload(result.data[0].get("segments"))
+
+
+def _canonical_final_preview_payload(db, project_id: str, owner_user_id: str) -> dict:
+    job = get_latest_artifact_job(db, project_id, user_id=owner_user_id, select="result_r2_keys")
+    if not job:
+        raise HTTPException(status_code=404, detail="완료된 작업이 없습니다")
+
+    project_json_key = (job.get("result_r2_keys") or {}).get("project_json")
+    if not project_json_key:
+        raise HTTPException(status_code=404, detail="프로젝트 JSON을 찾을 수 없습니다")
+
+    base_payload = _review_segments_payload_from_project_json(project_id, download_to_bytes(project_json_key))
+    owner_payload = _owner_evaluation_payload(db, project_id, owner_user_id)
+
+    owner_segments_by_index = {}
+    if owner_payload:
+        owner_segments_by_index = {
+            _segment_index(segment): segment
+            for segment in owner_payload.get("segments") or []
+            if _segment_index(segment) is not None
+        }
+
+    merged_segments = []
+    for segment in base_payload.get("segments") or []:
+        merged = dict(segment)
+        owner_segment = owner_segments_by_index.get(_segment_index(merged))
+        owner_human = owner_segment.get("human") if isinstance(owner_segment, dict) else None
+        merged["human"] = owner_human if isinstance(owner_human, dict) else None
+        merged_segments.append(merged)
+
+    payload = {}
+    for key in REVIEW_METADATA_KEYS:
+        value = owner_payload.get(key) if owner_payload else None
+        payload[key] = value if value is not None else base_payload.get(key)
+    payload["segments"] = merged_segments
+    return payload
 
 
 def _effective_ai_decision(ai: dict | None) -> dict:
@@ -434,26 +555,7 @@ def get_segments(project_id: str, current_user: CurrentUser | None = Depends(get
         raise HTTPException(status_code=404, detail="프로젝트 JSON을 찾을 수 없습니다")
 
     raw = download_to_bytes(project_json_key)
-    avid_data = json.loads(raw)
-
-    transcription = avid_data.get("transcription")
-    if not transcription or not transcription.get("segments"):
-        raise HTTPException(status_code=404, detail="자막 데이터가 없습니다")
-
-    source_duration_ms = 0
-    for sf in avid_data.get("source_files", []):
-        info = sf.get("info", {})
-        if info.get("duration_ms"):
-            source_duration_ms = max(source_duration_ms, info["duration_ms"])
-
-    settings.avid_temp_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=f"review_segments_{project_id}_", dir=str(settings.avid_temp_dir)) as temp_dir:
-        local_project_json = Path(temp_dir) / "input.project.avid.json"
-        local_project_json.write_bytes(raw)
-        payload = avid.review_segments(str(local_project_json))
-
-    payload["source_duration_ms"] = source_duration_ms
-    return payload
+    return _review_segments_payload_from_project_json(project_id, raw)
 
 
 @router.get("/video-url", response_model=VideoUrlResponse)
@@ -561,20 +663,40 @@ def start_final_preview(
     project_id: str,
     req: FinalPreviewRequest,
     request: Request,
-    current_user: CurrentUser = Depends(get_current_user),
+    current_user: CurrentUser | None = Depends(get_optional_current_user),
 ):
     db = get_db()
 
-    project_data = _get_accessible_project(db, project_id, current_user, "id, user_id, source_duration_seconds")
+    project_data = _get_accessible_project(
+        db,
+        project_id,
+        current_user,
+        "id, user_id, source_duration_seconds",
+        allow_public_read=True,
+    )
     owner_user_id = project_data["user_id"]
+    viewer_can_edit = _has_project_owner_access(project_data, current_user)
 
-    payload = req.model_dump()
-    _save_evaluation_payload(db, project_id, owner_user_id, payload)
+    if viewer_can_edit:
+        payload = req.model_dump()
+        _save_evaluation_payload(db, project_id, owner_user_id, payload)
+        preview_scope = "owner"
+    else:
+        payload = _canonical_final_preview_payload(db, project_id, owner_user_id)
+        preview_scope = "public_readonly"
     hash_value = final_preview_decision_hash(payload)
 
-    cached_job = _find_completed_cached_preview_job(db, project_id, owner_user_id, hash_value)
-    if cached_job:
-        return _response_from_final_preview_job(cached_job, request, project_id)
+    reusable_job = _find_reusable_preview_job(db, project_id, owner_user_id, hash_value)
+    if reusable_job:
+        return _response_from_final_preview_job(reusable_job, request, project_id)
+
+    if not viewer_can_edit:
+        active_count = _active_public_readonly_preview_count(db, project_id, owner_user_id)
+        if active_count >= PUBLIC_READONLY_ACTIVE_PREVIEW_LIMIT:
+            raise HTTPException(
+                status_code=429,
+                detail="공개 미리보기 생성 작업이 이미 진행 중입니다. 잠시 후 다시 시도해 주세요.",
+            )
 
     job = (
         db.table("jobs")
@@ -587,6 +709,7 @@ def start_final_preview(
             "input_payload": payload,
             "result_r2_keys": {
                 "decision_hash": hash_value,
+                "preview_scope": preview_scope,
             },
         })
         .execute()

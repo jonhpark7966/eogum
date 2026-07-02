@@ -13,16 +13,7 @@ from typing import Any
 
 from eogum.config import settings
 
-OSD_MODEL_ID = "pyannote/overlapped-speech-detection"
 DIARIZATION_MODEL_ID = "pyannote/speaker-diarization-community-1"
-SEGMENTATION_MODEL_ID = "pyannote/segmentation"
-SEGMENTATION_REVISION = "Interspeech2021"
-OSD_PARAMS = {
-    "onset": 0.8104268538848918,
-    "offset": 0.4806866463041527,
-    "min_duration_on": 0.05537587440407595,
-    "min_duration_off": 0.09791355693027545,
-}
 
 
 class OverlapProtectionError(RuntimeError):
@@ -37,7 +28,7 @@ def build_overlap_protection_artifact(
     source_path: str | Path,
     output_dir: str | Path,
 ) -> tuple[Path, dict[str, Any]]:
-    """Run both overlap detectors and write the OR-merged artifact JSON."""
+    """Run the community diarization overlap detector and write the artifact JSON."""
     source = Path(source_path)
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -52,34 +43,30 @@ def build_overlap_protection_artifact(
     model_results: dict[str, dict[str, Any]] = {}
     model_intervals: list[dict[str, Any]] = []
 
-    for model_key, runner in (
-        ("community1", _run_community1_detector),
-        ("osd", _run_osd_detector),
-    ):
-        model_started = time.time()
-        try:
-            intervals = runner(wav_path, cache_dir)
-            for interval in intervals:
-                model_intervals.append({**interval, "models": [model_key]})
-            model_results[model_key] = {
-                "status": "succeeded",
-                "model": DIARIZATION_MODEL_ID if model_key == "community1" else OSD_MODEL_ID,
-                "intervals": len(intervals),
-                "total_overlap_ms": _total_ms(intervals),
-                "elapsed_seconds": round(time.time() - model_started, 3),
-            }
-        except Exception as exc:
-            model_results[model_key] = {
-                "status": "failed",
-                "model": DIARIZATION_MODEL_ID if model_key == "community1" else OSD_MODEL_ID,
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-                "traceback": traceback.format_exc(limit=20),
-                "elapsed_seconds": round(time.time() - model_started, 3),
-            }
+    model_key = "community1"
+    model_started = time.time()
+    try:
+        intervals = _run_community1_detector(wav_path, cache_dir)
+        for interval in intervals:
+            model_intervals.append({**interval, "models": [model_key]})
+        model_results[model_key] = {
+            "status": "succeeded",
+            "model": DIARIZATION_MODEL_ID,
+            "intervals": len(intervals),
+            "total_overlap_ms": _total_ms(intervals),
+            "elapsed_seconds": round(time.time() - model_started, 3),
+        }
+    except Exception as exc:
+        model_results[model_key] = {
+            "status": "failed",
+            "model": DIARIZATION_MODEL_ID,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "traceback": traceback.format_exc(limit=20),
+            "elapsed_seconds": round(time.time() - model_started, 3),
+        }
 
-    succeeded = [key for key, value in model_results.items() if value.get("status") == "succeeded"]
-    status = "complete" if len(succeeded) == 2 else "partial" if succeeded else "failed"
+    status = "complete" if model_results[model_key].get("status") == "succeeded" else "failed"
     payload = {
         "schema_version": "overlap_protection/v1",
         "enabled": True,
@@ -99,8 +86,8 @@ def build_overlap_protection_artifact(
     artifact_path = output_root / "overlap_protection.json"
     artifact_path.write_text(_json_dumps(payload), encoding="utf-8")
 
-    if not succeeded:
-        raise OverlapProtectionError("All overlap detectors failed", payload)
+    if status == "failed":
+        raise OverlapProtectionError("Overlap detector failed", payload)
 
     return artifact_path, payload
 
@@ -141,32 +128,6 @@ def _run_community1_detector(wav_path: Path, cache_dir: Path) -> list[dict[str, 
     output = pipeline(str(wav_path))
     annotation = getattr(output, "speaker_diarization", output)
     return _infer_overlaps_from_turns(_annotation_to_turns(annotation))
-
-
-def _run_osd_detector(wav_path: Path, cache_dir: Path) -> list[dict[str, Any]]:
-    import numpy as np
-    import torch
-    from pyannote.audio import Inference, Model
-    from pyannote.audio.utils.signal import Binarize
-
-    model = _from_pretrained(
-        Model,
-        SEGMENTATION_MODEL_ID,
-        cache_dir=cache_dir,
-        revision=SEGMENTATION_REVISION,
-    )
-    if model is None:
-        raise RuntimeError(f"Model.from_pretrained returned None for {SEGMENTATION_MODEL_ID}")
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    model.to(device)
-
-    def second_highest(scores):
-        return np.partition(scores, -2, axis=-1)[:, :, -2, np.newaxis]
-
-    inference = Inference(model, pre_aggregation_hook=second_highest, device=device)
-    scores = inference(str(wav_path))
-    overlapped_speech = Binarize(**OSD_PARAMS)(scores)
-    return _timeline_to_intervals(overlapped_speech)
 
 
 def _from_pretrained(factory: Any, model_id: str, *, cache_dir: Path, **kwargs: Any) -> Any:
@@ -227,19 +188,6 @@ def _infer_overlaps_from_turns(turns: list[dict[str, Any]]) -> list[dict[str, An
             active.add(index)
         previous_time = current_time
     return _merge_intervals(overlaps, require_same_models=False)
-
-
-def _timeline_to_intervals(output: Any) -> list[dict[str, Any]]:
-    if hasattr(output, "get_timeline"):
-        timeline = output.get_timeline().support()
-    elif hasattr(output, "support"):
-        timeline = output.support()
-    else:
-        raise TypeError(f"Cannot extract timeline from {type(output)!r}")
-    return sorted(
-        [_interval(segment.start, segment.end) for segment in timeline],
-        key=lambda item: (item["start_ms"], item["end_ms"]),
-    )
 
 
 def _interval(start: float, end: float, **extra: Any) -> dict[str, Any]:

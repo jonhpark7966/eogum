@@ -19,7 +19,7 @@ AUDIO_PROXY_SAMPLE_RATE = 16000
 AUDIO_PROXY_CHANNELS = 1
 AUDIO_PROXY_CODEC = "flac"
 READY_STATUS = "ready"
-MEDIA_INFO_SCHEMA_VERSION = 2
+MEDIA_INFO_SCHEMA_VERSION = 3
 
 
 def is_ready(derived: dict | None) -> bool:
@@ -403,10 +403,15 @@ def _normalize_media_info(payload: dict) -> dict[str, Any]:
         audio_sample_count = _int_or_none(stream.get("duration_ts"))
         if audio_sample_count is not None:
             break
-    timecode = _extract_timecode(payload)
+    timecode, timecode_source_kind = _extract_timecode_info(payload)
     parsed_timecode = (
         _parse_timecode_start(timecode, timecode_rate_fraction)
         if timecode and timecode_rate_fraction else None
+    )
+    timecode_start_seconds = parsed_timecode[1] if parsed_timecode else None
+    fcpxml_timecode_start_seconds = (
+        timecode_start_seconds
+        if timecode_source_kind in {"video", "tmcd"} else None
     )
 
     return {
@@ -440,7 +445,9 @@ def _normalize_media_info(payload: dict) -> dict[str, Any]:
             if timecode and timecode_rate_fraction else None
         ),
         "timecode_start_frames": parsed_timecode[0] if parsed_timecode else None,
-        "timecode_start_seconds": parsed_timecode[1] if parsed_timecode else None,
+        "timecode_start_seconds": timecode_start_seconds,
+        "timecode_source_kind": timecode_source_kind,
+        "fcpxml_timecode_start_seconds": fcpxml_timecode_start_seconds,
     }
 
 
@@ -481,24 +488,40 @@ def _stream_timecode(stream: dict) -> str | None:
     return str(value).strip() if value else None
 
 
-def _extract_timecode(payload: dict) -> str | None:
+def _data_stream_kind(stream: dict) -> str | None:
+    value = stream.get("codec_tag_string")
+    if not value:
+        return None
+    kind = str(value).strip().lower()
+    return kind if kind in {"tmcd", "rtmd"} else None
+
+
+def _extract_timecode_info(payload: dict) -> tuple[str | None, str | None]:
     streams = payload.get("streams") or []
     for stream in streams:
         if stream.get("codec_type") == "video":
             value = _stream_timecode(stream)
             if value:
-                return value
-    for stream in streams:
-        if stream.get("codec_type") == "data":
+                return value, "video"
+    for expected_kind in ("tmcd", "rtmd"):
+        for stream in streams:
+            if stream.get("codec_type") != "data":
+                continue
+            if _data_stream_kind(stream) != expected_kind:
+                continue
             value = _stream_timecode(stream)
             if value:
-                return value
+                return value, expected_kind
     format_tags = payload.get("format", {}).get("tags")
     if isinstance(format_tags, dict):
         value = format_tags.get("timecode") or format_tags.get("TIMECODE")
         if value:
-            return str(value).strip()
-    return None
+            return str(value).strip(), "format"
+    return None, None
+
+
+def _extract_timecode(payload: dict) -> str | None:
+    return _extract_timecode_info(payload)[0]
 
 
 def _parse_timecode_start(timecode: str, rate: Fraction) -> tuple[int, str] | None:

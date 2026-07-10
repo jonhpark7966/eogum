@@ -1,29 +1,45 @@
 import logging
+import threading
 import time
 from collections.abc import Callable
 from typing import TypeVar
 
 import httpx
 from postgrest.exceptions import APIError
-from supabase import Client, create_client
+from supabase import Client, ClientOptions, create_client
 
 from eogum.config import settings
 
 logger = logging.getLogger(__name__)
 
-_client: Client | None = None
+_thread_local = threading.local()
 T = TypeVar("T")
 
 _SUPABASE_MAX_RETRIES = 3
 _SUPABASE_RETRY_DELAY_SECONDS = 5
 
 
+def _create_db_client() -> Client:
+    http_client = httpx.Client(
+        http2=False,
+        timeout=httpx.Timeout(120.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+    )
+    options = ClientOptions(
+        postgrest_client_timeout=httpx.Timeout(120.0),
+        storage_client_timeout=120,
+        httpx_client=http_client,
+    )
+    return create_client(settings.supabase_url, settings.supabase_service_key, options)
+
+
 def get_db() -> Client:
     """Get Supabase client (service role for backend operations)."""
-    global _client
-    if _client is None:
-        _client = create_client(settings.supabase_url, settings.supabase_service_key)
-    return _client
+    client = getattr(_thread_local, "client", None)
+    if client is None:
+        client = _create_db_client()
+        _thread_local.client = client
+    return client
 
 
 def _is_retryable_supabase_error(exc: Exception) -> bool:

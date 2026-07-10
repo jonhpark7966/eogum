@@ -11,6 +11,7 @@ from typing import Any
 
 
 SCRIBE_API_VERSION = "scribe_v2"
+AUTO_DETECT_LANGUAGE = "auto"
 RUNNING_POLL_INTERVAL_SECONDS = 5.0
 RUNNING_POLL_TIMEOUT_SECONDS = 2 * 60 * 60.0
 _EXPECTED_VALUE_UNSET = object()
@@ -25,6 +26,19 @@ class ScribeV2CacheParams:
     num_speakers: int | None
     tag_audio_events: bool
     scribe_api_version: str = SCRIBE_API_VERSION
+
+
+def language_hint(language: object) -> str | None:
+    """Convert the persisted project language into a Scribe language hint."""
+    normalized = str(language or "").strip()
+    if not normalized or normalized.lower() == AUTO_DETECT_LANGUAGE:
+        return None
+    return normalized
+
+
+def cache_language(language: object) -> str:
+    """Return the non-null language value used by the raw Scribe cache row."""
+    return language_hint(language) or ""
 
 
 def build_scribe_v2_cache_key(params: ScribeV2CacheParams) -> str:

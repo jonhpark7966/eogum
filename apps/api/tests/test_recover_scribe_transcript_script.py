@@ -58,6 +58,10 @@ def _raw_srt():
     )
 
 
+def test_auto_detect_language_accepts_the_provider_detected_language():
+    assert recovery._language_matches("auto", "kor")
+
+
 def test_normalized_contract_accepts_diarized_overlap():
     stats = recovery._validate_transcript(
         _provider_payload(),

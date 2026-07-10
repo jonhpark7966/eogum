@@ -144,6 +144,39 @@ def test_chalna_multipart_content_type_is_flac_for_audio_proxy(tmp_path):
     assert job_runner.chalna._source_content_type(tmp_path / "source.mp4") == "application/octet-stream"
 
 
+def test_auto_language_uses_no_scribe_hint_and_empty_cache_language():
+    assert job_runner.scribe_v2_cache.language_hint("auto") is None
+    assert job_runner.scribe_v2_cache.cache_language("auto") == ""
+    assert job_runner.scribe_v2_cache.language_hint("ko") == "ko"
+
+
+def test_raw_scribe_submission_omits_language_when_hint_is_none(monkeypatch, tmp_path):
+    source_path = tmp_path / "source.flac"
+    source_path.write_bytes(b"audio")
+    submitted = {}
+
+    def fake_submit_and_poll(**kwargs):
+        submitted.update(kwargs)
+        return (
+            {
+                "scribe_response": {"language_code": "kor", "words": []},
+                "raw_srt": "1\n00:00:00,000 --> 00:00:01,000\n안녕하세요\n",
+            },
+            "task-1",
+            {},
+        )
+
+    monkeypatch.setattr(job_runner.chalna, "_submit_and_poll", fake_submit_and_poll)
+
+    job_runner.chalna.transcribe_raw_scribe_to_files(
+        str(source_path),
+        language=None,
+        output_dir=str(tmp_path),
+    )
+
+    assert "language" not in submitted["data"]
+
+
 def test_chalna_provider_recovery_contract_writes_raw_files(monkeypatch, tmp_path):
     class Response:
         status_code = 200

@@ -224,7 +224,7 @@ def _scribe_cache_params(project: dict) -> scribe_v2_cache.ScribeV2CacheParams |
     return scribe_v2_cache.ScribeV2CacheParams(
         source_sha256=str(source_sha256),
         source_size_bytes=int(source_size_bytes),
-        language=str(project.get("language") or ""),
+        language=scribe_v2_cache.cache_language(project.get("language")),
         diarize=_bool_project_setting(project_settings, "diarize", default=True),
         num_speakers=_optional_int_project_setting(project_settings, "num_speakers"),
         tag_audio_events=_bool_project_setting(project_settings, "tag_audio_events", default=True),

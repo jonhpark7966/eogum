@@ -1184,7 +1184,15 @@ export default function ProjectDetailPage() {
                       {formatDuration(project.source_duration_seconds)}
                     </span>
                   )}
-                  <span>{project.language === "ko" ? "한국어" : project.language === "en" ? "English" : project.language}</span>
+                  <span>
+                    {project.language === "ko"
+                      ? "한국어"
+                      : project.language === "en"
+                        ? "English"
+                        : project.language === "auto"
+                          ? "자동 감지"
+                          : project.language}
+                  </span>
                   <span>{new Date(project.created_at).toLocaleDateString("ko-KR")}</span>
                 </div>
               </div>

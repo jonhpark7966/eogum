@@ -54,7 +54,7 @@ class TranscriptionSrtResult:
 def transcribe_to_srt(
     source_path: str,
     *,
-    language: str = "ko",
+    language: str | None = "ko",
     output_dir: str | None = None,
     context: str | None = None,
     diarize: bool = True,
@@ -84,7 +84,7 @@ def transcribe_to_srt(
 
     base_url = settings.chalna_url.rstrip("/")
     form_data = {
-        "language": language,
+        **({"language": language} if language else {}),
         "use_alignment": "false",
         "use_llm_segmentation": str(use_llm_segmentation).lower(),
         "use_llm_refinement": str(use_llm_refinement).lower(),
@@ -154,7 +154,7 @@ def transcribe_to_srt(
 def transcribe_raw_scribe_to_files(
     source_path: str,
     *,
-    language: str = "ko",
+    language: str | None = "ko",
     output_dir: str | None = None,
     diarize: bool = True,
     tag_audio_events: bool = True,
@@ -177,7 +177,7 @@ def transcribe_raw_scribe_to_files(
         endpoint="/transcribe/async",
         source=source,
         data={
-            "language": language,
+            **({"language": language} if language else {}),
             "use_alignment": "false",
             "use_llm_segmentation": "false",
             "use_llm_refinement": "false",
@@ -355,7 +355,7 @@ def transcribe_from_scribe_response_to_srt(
     source_path: str,
     raw_json_path: str,
     *,
-    language: str = "ko",
+    language: str | None = "ko",
     output_dir: str | None = None,
     context: str | None = None,
     diarize: bool = True,
@@ -393,7 +393,7 @@ def transcribe_from_scribe_response_to_srt(
         raw_json=raw_json,
         overlap_intervals=overlap_intervals,
         data={
-            "language": language,
+            **({"language": language} if language else {}),
             "use_alignment": "false",
             "use_llm_segmentation": str(use_llm_segmentation).lower(),
             "use_llm_refinement": str(use_llm_refinement).lower(),

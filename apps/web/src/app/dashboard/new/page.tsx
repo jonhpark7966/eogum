@@ -588,6 +588,7 @@ export default function NewProjectPage() {
             >
               <option value="ko">한국어</option>
               <option value="en">English</option>
+              <option value="auto">자동 감지</option>
               <option value="ja">日本語</option>
             </select>
           </div>

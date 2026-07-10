@@ -112,8 +112,11 @@ def _expected_duration(project: dict[str, Any]) -> float:
 
 
 def _language_matches(requested: str, actual: str) -> bool:
-    requested = requested.lower().strip()
+    requested_hint = scribe_v2_cache.language_hint(requested)
     actual = actual.lower().strip()
+    if requested_hint is None:
+        return bool(actual)
+    requested = requested_hint.lower()
     return actual in LANGUAGE_ALIASES.get(requested, {requested})
 
 
@@ -268,7 +271,7 @@ def _load_project_and_cache(db, project_id: str) -> tuple[dict[str, Any], str, d
     params = scribe_v2_cache.ScribeV2CacheParams(
         source_sha256=source_sha256,
         source_size_bytes=source_size_bytes,
-        language=str(project.get("language") or ""),
+        language=scribe_v2_cache.cache_language(project.get("language")),
         diarize=bool(project_settings.get("diarize", True)),
         num_speakers=_optional_int(project_settings.get("num_speakers")),
         tag_audio_events=bool(project_settings.get("tag_audio_events", True)),

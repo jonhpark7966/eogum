@@ -173,10 +173,16 @@ def _worker_loop(lane: str) -> None:
             logger.exception("Fatal error processing project %s", project_id)
 
 
-def create_initial_job(db, project: dict) -> dict:
+def create_initial_job(
+    db,
+    project: dict,
+    *,
+    retry_of_job_id: str | None = None,
+    attempt_number: int = 1,
+) -> dict:
     """Create the durable queue record for an initial project run."""
     project_settings = project.get("settings") or {}
-    job = db.table("jobs").insert({
+    payload = {
         "project_id": project["id"],
         "user_id": project["user_id"],
         "type": project["cut_type"],
@@ -195,7 +201,11 @@ def create_initial_job(db, project: dict) -> dict:
             ),
         ),
         "external_task_ids": {},
-    }).execute().data[0]
+        "attempt_number": max(1, int(attempt_number)),
+    }
+    if retry_of_job_id:
+        payload["retry_of_job_id"] = retry_of_job_id
+    job = db.table("jobs").insert(payload).execute().data[0]
     return job
 
 
@@ -2898,6 +2908,7 @@ def _transcribe_with_scribe_v2_cache(
 
     entry = scribe_v2_cache.get_cache_entry(db, cache_key)
     cache_owner = False
+    cache_owner_token: str | None = None
     if entry and entry.get("status") == "completed":
         _download_completed_scribe_cache(db, entry, raw_json_local, raw_srt_local)
         _write_scribe_cache_pipeline_status(
@@ -2917,26 +2928,160 @@ def _transcribe_with_scribe_v2_cache(
             detail="동일 파일 raw Scribe V2 캐시 생성 대기 중",
             completed=False,
         )
-        entry = scribe_v2_cache.wait_for_running_entry(db, cache_key=cache_key)
-        if entry.get("status") != "completed":
-            raise RuntimeError(entry.get("error_message") or "Scribe V2 cache generation failed")
-        _download_completed_scribe_cache(db, entry, raw_json_local, raw_srt_local)
-    elif entry and entry.get("status") == "failed":
-        if retry_failed_size_cache and _is_chalna_file_size_cache_error(entry):
-            cache_owner = scribe_v2_cache.claim_failed_entry_for_retry(db, cache_key=cache_key) is not None
+        recovered = _recover_existing_raw_scribe_result(
+            db,
+            cache_key=cache_key,
+            entry=entry,
+            job_id=job_id,
+            output_dir=output_dir,
+            use_llm_segmentation=use_llm_segmentation,
+            use_llm_refinement=use_llm_refinement,
+            owner_token=entry.get("owner_token"),
+            expected_status="running",
+        )
+        if recovered is not None:
+            try:
+                published = _complete_raw_scribe_cache(
+                    db,
+                    cache_key=cache_key,
+                    result=recovered,
+                    fallback_external_task_id=entry.get("external_task_id"),
+                    owner_token=entry.get("owner_token"),
+                    expected_status="running",
+                )
+            except Exception as exc:
+                owner_token = entry.get("owner_token")
+                if isinstance(owner_token, str) and owner_token:
+                    scribe_v2_cache.mark_cache_failed(
+                        db,
+                        cache_key=cache_key,
+                        owner_token=owner_token,
+                        error_message=str(exc),
+                        failure_kind="artifact_publish",
+                        retryable=True,
+                        resubmit_safe=False,
+                    )
+                raise
+            if published:
+                raw_json_local = Path(recovered.raw_json_path)
+                raw_srt_local = Path(recovered.raw_srt_path)
+            else:
+                _download_authoritative_cache_after_owner_loss(
+                    db,
+                    cache_key=cache_key,
+                    raw_json_local=raw_json_local,
+                    raw_srt_local=raw_srt_local,
+                )
+        else:
+            entry = scribe_v2_cache.get_cache_entry(db, cache_key) or entry
+            if (
+                entry.get("status") == "failed"
+                and entry.get("retryable") is True
+                and entry.get("resubmit_safe") is True
+            ):
+                candidate_token = scribe_v2_cache.new_owner_token()
+                claimed_entry = scribe_v2_cache.claim_failed_entry_for_retry(
+                    db,
+                    cache_key=cache_key,
+                    owner_token=candidate_token,
+                    expected_attempt_count=int(entry.get("attempt_count") or 0),
+                )
+                cache_owner = claimed_entry is not None
+                if claimed_entry is not None:
+                    entry = claimed_entry
+                    cache_owner_token = candidate_token
             if not cache_owner:
                 entry = scribe_v2_cache.wait_for_running_entry(db, cache_key=cache_key)
                 if entry.get("status") != "completed":
                     raise RuntimeError(entry.get("error_message") or "Scribe V2 cache generation failed")
                 _download_completed_scribe_cache(db, entry, raw_json_local, raw_srt_local)
+    elif entry and entry.get("status") == "failed":
+        recovered = _recover_existing_raw_scribe_result(
+            db,
+            cache_key=cache_key,
+            entry=entry,
+            job_id=job_id,
+            output_dir=output_dir,
+            use_llm_segmentation=use_llm_segmentation,
+            use_llm_refinement=use_llm_refinement,
+            owner_token=entry.get("owner_token"),
+            expected_status="failed",
+        )
+        if recovered is not None:
+            published = _complete_raw_scribe_cache(
+                db,
+                cache_key=cache_key,
+                result=recovered,
+                fallback_external_task_id=entry.get("external_task_id"),
+                owner_token=entry.get("owner_token"),
+                expected_status="failed",
+                expected_attempt_count=int(entry.get("attempt_count") or 0),
+            )
+            if published:
+                raw_json_local = Path(recovered.raw_json_path)
+                raw_srt_local = Path(recovered.raw_srt_path)
+            else:
+                _download_authoritative_cache_after_owner_loss(
+                    db,
+                    cache_key=cache_key,
+                    raw_json_local=raw_json_local,
+                    raw_srt_local=raw_srt_local,
+                )
         else:
-            raise RuntimeError(entry.get("error_message") or "Scribe V2 cache entry is failed")
+            entry = scribe_v2_cache.get_cache_entry(db, cache_key) or entry
+            if entry.get("status") == "completed":
+                _download_completed_scribe_cache(db, entry, raw_json_local, raw_srt_local)
+            elif entry.get("status") == "running":
+                entry = scribe_v2_cache.wait_for_running_entry(db, cache_key=cache_key)
+                if entry.get("status") != "completed":
+                    raise RuntimeError(entry.get("error_message") or "Scribe V2 cache generation failed")
+                _download_completed_scribe_cache(db, entry, raw_json_local, raw_srt_local)
+            else:
+                legacy_rejected = retry_failed_size_cache and _is_chalna_file_size_cache_error(entry)
+                if legacy_rejected:
+                    # These legacy rows predate recovery metadata. The provider rejected
+                    # the oversized request before accepting work, so resubmission of the
+                    # newly generated audio proxy is known to be safe.
+                    entry = {
+                        **entry,
+                        "retryable": True,
+                        "resubmit_safe": True,
+                        "failure_kind": "input_rejected_file_size",
+                    }
+
+                if entry.get("retryable") is True and entry.get("resubmit_safe") is True:
+                    candidate_token = scribe_v2_cache.new_owner_token()
+                    claimed_entry = scribe_v2_cache.claim_failed_entry_for_retry(
+                        db,
+                        cache_key=cache_key,
+                        owner_token=candidate_token,
+                        expected_attempt_count=int(entry.get("attempt_count") or 0),
+                        require_resubmit_safe=not legacy_rejected,
+                    )
+                    cache_owner = claimed_entry is not None
+                    if claimed_entry is not None:
+                        entry = claimed_entry
+                        cache_owner_token = candidate_token
+                else:
+                    raise RuntimeError(entry.get("error_message") or "Scribe V2 cache entry is failed")
+
+                if not cache_owner:
+                    entry = scribe_v2_cache.wait_for_running_entry(db, cache_key=cache_key)
+                    if entry.get("status") != "completed":
+                        raise RuntimeError(entry.get("error_message") or "Scribe V2 cache generation failed")
+                    _download_completed_scribe_cache(db, entry, raw_json_local, raw_srt_local)
     else:
-        cache_owner = scribe_v2_cache.create_running_entry(
+        candidate_token = scribe_v2_cache.new_owner_token()
+        created_entry = scribe_v2_cache.create_running_entry(
             db,
             cache_key=cache_key,
             params=cache_params,
-        ) is not None
+            owner_token=candidate_token,
+        )
+        cache_owner = created_entry is not None
+        if created_entry is not None:
+            entry = created_entry
+            cache_owner_token = candidate_token
         if not cache_owner:
             entry = scribe_v2_cache.wait_for_running_entry(db, cache_key=cache_key)
             if entry.get("status") != "completed":
@@ -2944,6 +3089,26 @@ def _transcribe_with_scribe_v2_cache(
             _download_completed_scribe_cache(db, entry, raw_json_local, raw_srt_local)
 
     if cache_owner:
+        if not cache_owner_token:
+            raise RuntimeError("Scribe V2 cache owner token is missing")
+
+        def _on_raw_scribe_status(payload: dict[str, object]) -> None:
+            _update_chalna_pipeline_status(
+                db,
+                job_id,
+                {
+                    **payload,
+                    "use_llm_segmentation": False,
+                    "use_llm_refinement": False,
+                },
+            )
+            scribe_v2_cache.record_provider_status(
+                db,
+                cache_key=cache_key,
+                owner_token=cache_owner_token,
+                payload=payload,
+            )
+
         try:
             raw_result = chalna.transcribe_raw_scribe_to_files(
                 source_path,
@@ -2952,32 +3117,74 @@ def _transcribe_with_scribe_v2_cache(
                 diarize=diarize,
                 tag_audio_events=tag_audio_events,
                 num_speakers=num_speakers,
-                on_status=lambda payload: _update_chalna_pipeline_status(
-                    db,
-                    job_id,
-                    {
-                        **payload,
-                        "use_llm_segmentation": False,
-                        "use_llm_refinement": False,
-                    },
-                ),
+                on_status=_on_raw_scribe_status,
             )
-            raw_json_key = scribe_v2_cache.raw_json_r2_key(cache_key)
-            raw_srt_key = scribe_v2_cache.raw_srt_r2_key(cache_key)
-            r2.upload_file(raw_result.raw_json_path, raw_json_key, "application/json")
-            r2.upload_file(raw_result.raw_srt_path, raw_srt_key, "text/plain")
-            scribe_v2_cache.mark_cache_completed(
+        except Exception as exc:
+            details = exc.details if isinstance(exc, chalna.ChalnaClientError) else {}
+            if details:
+                scribe_v2_cache.record_provider_status(
+                    db,
+                    cache_key=cache_key,
+                    owner_token=cache_owner_token,
+                    payload=details,
+                )
+            failure_published = scribe_v2_cache.mark_cache_failed(
                 db,
                 cache_key=cache_key,
-                raw_json_key=raw_json_key,
-                raw_srt_key=raw_srt_key,
-                external_task_id=raw_result.external_task_id,
+                owner_token=cache_owner_token,
+                error_message=str(exc),
+                failure_kind=details.get("failure_kind"),
+                retryable=details.get("retryable"),
+                resubmit_safe=details.get("resubmit_safe"),
             )
-            raw_json_local = Path(raw_result.raw_json_path)
-            raw_srt_local = Path(raw_result.raw_srt_path)
-        except Exception as exc:
-            scribe_v2_cache.mark_cache_failed(db, cache_key=cache_key, error_message=str(exc))
-            raise
+            if failure_published:
+                raise
+            _download_authoritative_cache_after_owner_loss(
+                db,
+                cache_key=cache_key,
+                raw_json_local=raw_json_local,
+                raw_srt_local=raw_srt_local,
+            )
+        else:
+            authoritative_downloaded = False
+            try:
+                published = _complete_raw_scribe_cache(
+                    db,
+                    cache_key=cache_key,
+                    result=raw_result,
+                    owner_token=cache_owner_token,
+                    expected_status="running",
+                )
+            except Exception as exc:
+                failure_published = scribe_v2_cache.mark_cache_failed(
+                    db,
+                    cache_key=cache_key,
+                    owner_token=cache_owner_token,
+                    error_message=str(exc),
+                    failure_kind="artifact_publish",
+                    retryable=True,
+                    resubmit_safe=False,
+                )
+                if failure_published:
+                    raise
+                _download_authoritative_cache_after_owner_loss(
+                    db,
+                    cache_key=cache_key,
+                    raw_json_local=raw_json_local,
+                    raw_srt_local=raw_srt_local,
+                )
+                authoritative_downloaded = True
+                published = False
+            if published:
+                raw_json_local = Path(raw_result.raw_json_path)
+                raw_srt_local = Path(raw_result.raw_srt_path)
+            elif not authoritative_downloaded:
+                _download_authoritative_cache_after_owner_loss(
+                    db,
+                    cache_key=cache_key,
+                    raw_json_local=raw_json_local,
+                    raw_srt_local=raw_srt_local,
+                )
 
     if (
         not use_llm_segmentation
@@ -3037,6 +3244,212 @@ def _transcribe_with_scribe_v2_cache(
             },
         ),
     )
+
+
+def _recover_existing_raw_scribe_result(
+    db,
+    *,
+    cache_key: str,
+    entry: dict,
+    job_id: str,
+    output_dir: Path,
+    use_llm_segmentation: bool,
+    use_llm_refinement: bool,
+    owner_token: str | None,
+    expected_status: str,
+) -> chalna.RawScribeResult | None:
+    """Recover accepted provider work before considering another provider POST."""
+
+    def _persist_status(payload: dict[str, object]) -> None:
+        _update_chalna_pipeline_status(
+            db,
+            job_id,
+            {
+                **payload,
+                "use_llm_segmentation": use_llm_segmentation,
+                "use_llm_refinement": use_llm_refinement,
+            },
+        )
+        if owner_token:
+            scribe_v2_cache.record_provider_status(
+                db,
+                cache_key=cache_key,
+                owner_token=owner_token,
+                payload=payload,
+                expected_status=expected_status,
+            )
+
+    transcription_id = entry.get("provider_transcription_id")
+    if isinstance(transcription_id, str) and transcription_id:
+        recovered = chalna.recover_provider_transcript_to_files(
+            transcription_id,
+            output_dir=str(output_dir),
+            include_audio_events=bool(entry.get("tag_audio_events", True)),
+        )
+        if recovered is not None:
+            logger.info(
+                "Recovered Scribe cache %s from provider transcript %s without resubmission",
+                cache_key,
+                transcription_id,
+            )
+            return recovered
+
+    external_task_id = entry.get("external_task_id")
+    if not isinstance(external_task_id, str) or not external_task_id:
+        return None
+
+    try:
+        recovered = chalna.resume_raw_scribe_job_to_files(
+            external_task_id,
+            output_dir=str(output_dir),
+            on_status=_persist_status,
+        )
+    except chalna.ChalnaClientError as exc:
+        details = exc.details
+        if details and owner_token:
+            scribe_v2_cache.record_provider_status(
+                db,
+                cache_key=cache_key,
+                owner_token=owner_token,
+                payload=details,
+                expected_status=expected_status,
+            )
+        recovered_transcription_id = details.get("provider_transcription_id")
+        if isinstance(recovered_transcription_id, str) and recovered_transcription_id:
+            recovered = chalna.recover_provider_transcript_to_files(
+                recovered_transcription_id,
+                output_dir=str(output_dir),
+                include_audio_events=bool(entry.get("tag_audio_events", True)),
+            )
+            if recovered is not None:
+                return recovered
+        if expected_status == "running" and owner_token:
+            failure_published = scribe_v2_cache.mark_cache_failed(
+                db,
+                cache_key=cache_key,
+                owner_token=owner_token,
+                error_message=str(exc),
+                failure_kind=details.get("failure_kind"),
+                retryable=details.get("retryable"),
+                resubmit_safe=details.get("resubmit_safe"),
+            )
+            if not failure_published:
+                return None
+        if details.get("resubmit_safe") is True:
+            return None
+        raise
+
+    if recovered is not None:
+        logger.info(
+            "Recovered Scribe cache %s from accepted Chalna task %s without resubmission",
+            cache_key,
+            external_task_id,
+        )
+        return recovered
+
+    # A missing Chalna task is not permission to duplicate accepted provider work.
+    if entry.get("resubmit_safe") is not True:
+        raise RuntimeError(
+            "기존 Chalna 전사 작업을 찾을 수 없으며 provider 재요청의 안전성이 확인되지 않았습니다"
+        )
+    return None
+
+
+def _complete_raw_scribe_cache(
+    db,
+    *,
+    cache_key: str,
+    result: chalna.RawScribeResult,
+    fallback_external_task_id: str | None = None,
+    owner_token: str | None,
+    expected_status: str,
+    expected_attempt_count: int | None = None,
+) -> bool:
+    raw_json_path = Path(result.raw_json_path)
+    raw_srt_path = Path(result.raw_srt_path)
+    if not raw_json_path.is_file() or raw_json_path.stat().st_size == 0:
+        raise RuntimeError("Recovered Scribe raw JSON is missing or empty")
+    if not raw_srt_path.is_file() or raw_srt_path.stat().st_size == 0:
+        raise RuntimeError("Recovered Scribe raw SRT is missing or empty")
+
+    if not owner_token:
+        # Legacy failed rows are recovered by the explicit verified recovery
+        # command. A live owner must always have a generation token.
+        return False
+
+    raw_json_key = scribe_v2_cache.attempt_raw_json_r2_key(cache_key, owner_token)
+    raw_srt_key = scribe_v2_cache.attempt_raw_srt_r2_key(cache_key, owner_token)
+    _upload_and_verify_scribe_cache_artifact(
+        raw_json_path,
+        raw_json_key,
+        content_type="application/json",
+    )
+    _upload_and_verify_scribe_cache_artifact(
+        raw_srt_path,
+        raw_srt_key,
+        content_type="text/plain",
+    )
+    completion_kwargs = {
+        "cache_key": cache_key,
+        "raw_json_key": raw_json_key,
+        "raw_srt_key": raw_srt_key,
+        "external_task_id": result.external_task_id or fallback_external_task_id,
+        "provider_request_id": result.provider_request_id,
+        "provider_transcription_id": result.provider_transcription_id,
+        "provider_trace_id": result.provider_trace_id,
+    }
+    if expected_status == "failed":
+        recovery_kwargs = {
+            "expected_owner_token": owner_token,
+            **completion_kwargs,
+        }
+        if expected_attempt_count is not None:
+            recovery_kwargs["expected_attempt_count"] = expected_attempt_count
+        return scribe_v2_cache.recover_failed_cache_as_completed(
+            db,
+            **recovery_kwargs,
+        ) is not None
+    return scribe_v2_cache.mark_cache_completed(
+        db,
+        owner_token=owner_token,
+        **completion_kwargs,
+    )
+
+
+def _upload_and_verify_scribe_cache_artifact(
+    local_path: Path,
+    r2_key: str,
+    *,
+    content_type: str,
+) -> None:
+    local_bytes = local_path.read_bytes()
+    local_sha256 = hashlib.sha256(local_bytes).hexdigest()
+    r2.upload_file(str(local_path), r2_key, content_type)
+    remote_bytes = r2.download_to_bytes(r2_key)
+    remote_sha256 = hashlib.sha256(remote_bytes).hexdigest()
+    if remote_sha256 != local_sha256:
+        raise RuntimeError(
+            f"Scribe cache artifact verification failed for {r2_key}: "
+            f"local={local_sha256} remote={remote_sha256}"
+        )
+
+
+def _download_authoritative_cache_after_owner_loss(
+    db,
+    *,
+    cache_key: str,
+    raw_json_local: Path,
+    raw_srt_local: Path,
+) -> dict:
+    entry = scribe_v2_cache.get_cache_entry(db, cache_key)
+    if not entry:
+        raise RuntimeError("Scribe V2 cache row disappeared after owner generation changed")
+    if entry.get("status") == "running":
+        entry = scribe_v2_cache.wait_for_running_entry(db, cache_key=cache_key)
+    if entry.get("status") != "completed":
+        raise RuntimeError(entry.get("error_message") or "Newer Scribe V2 cache generation failed")
+    _download_completed_scribe_cache(db, entry, raw_json_local, raw_srt_local)
+    return entry
 
 
 def _download_completed_scribe_cache(

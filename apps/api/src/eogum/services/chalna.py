@@ -24,7 +24,11 @@ DEFAULT_SEGMENTATION_BOUNDARY_RULE = "word_boundary"
 
 
 class ChalnaClientError(RuntimeError):
-    """Raised when the Chalna API fails or returns an unusable response."""
+    """Raised when Chalna fails, with machine-readable recovery details."""
+
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.details = details or {}
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,9 @@ class RawScribeResult:
     raw_json_path: str
     raw_srt_path: str
     external_task_id: str
+    provider_request_id: str | None = None
+    provider_transcription_id: str | None = None
+    provider_trace_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -166,7 +173,7 @@ def transcribe_raw_scribe_to_files(
     raw_json_path = output_root / "source.scribe.raw.json"
     raw_srt_path = output_root / "source.scribe.raw.srt"
 
-    result_data, task_id = _submit_and_poll(
+    result_data, task_id, completed_status = _submit_and_poll(
         endpoint="/transcribe/async",
         source=source,
         data={
@@ -186,23 +193,161 @@ def transcribe_raw_scribe_to_files(
         poll_interval_seconds=poll_interval_seconds,
     )
 
-    scribe_response = result_data.get("scribe_response")
-    if not isinstance(scribe_response, dict):
-        raise ChalnaClientError("Chalna raw transcription completed without Scribe raw JSON")
-
-    raw_srt = result_data.get("raw_srt")
-    if not isinstance(raw_srt, str) or not raw_srt.strip():
-        raw_srt = _segments_to_srt(result_data.get("segments") or [])
-
-    raw_json_path.write_text(
-        json.dumps(scribe_response, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    raw_srt_path.write_text(raw_srt, encoding="utf-8")
+    _write_raw_scribe_files(result_data, raw_json_path=raw_json_path, raw_srt_path=raw_srt_path)
     return RawScribeResult(
         raw_json_path=str(raw_json_path),
         raw_srt_path=str(raw_srt_path),
         external_task_id=task_id,
+        provider_request_id=_nonempty_string(completed_status.get("provider_request_id")),
+        provider_transcription_id=_nonempty_string(completed_status.get("provider_transcription_id")),
+        provider_trace_id=_nonempty_string(completed_status.get("provider_trace_id")),
+    )
+
+
+def get_job_status(job_id: str) -> dict[str, Any] | None:
+    """Read a previously accepted Chalna task without creating provider work."""
+    base_url = settings.chalna_url.rstrip("/")
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            response = client.get(f"{base_url}/jobs/{job_id}")
+    except httpx.HTTPError as exc:
+        raise ChalnaClientError(
+            f"Chalna status lookup failed for accepted task {job_id}: {exc}",
+            details={
+                "external_task_id": job_id,
+                "failure_kind": "chalna_status_connection",
+                "retryable": True,
+                "resubmit_safe": False,
+            },
+        ) from exc
+    if response.status_code == 404:
+        return None
+    if response.status_code != 200:
+        raise ChalnaClientError(
+            f"Chalna status lookup failed: {response.text[:500]}",
+            details={
+                "external_task_id": job_id,
+                "failure_kind": "chalna_status_http",
+                "retryable": response.status_code >= 500,
+                "resubmit_safe": False,
+            },
+        )
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ChalnaClientError("Chalna status response is not a JSON object")
+    return payload
+
+
+def resume_raw_scribe_job_to_files(
+    job_id: str,
+    *,
+    output_dir: str,
+    on_status: StatusCallback | None = None,
+    timeout_seconds: float = 7200.0,
+    poll_interval_seconds: float = 1.0,
+) -> RawScribeResult | None:
+    """Resume polling an accepted Chalna task; never submits a replacement."""
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    raw_json_path = output_root / "source.scribe.raw.json"
+    raw_srt_path = output_root / "source.scribe.raw.srt"
+    started = time.monotonic()
+
+    while True:
+        if time.monotonic() - started > timeout_seconds:
+            raise ChalnaClientError(
+                f"Chalna transcription timed out after {timeout_seconds:.0f}s",
+                details={
+                    "external_task_id": job_id,
+                    "failure_kind": "chalna_status_timeout",
+                    "retryable": True,
+                    "resubmit_safe": False,
+                },
+            )
+        payload = get_job_status(job_id)
+        if payload is None:
+            return None
+        if on_status:
+            on_status(payload)
+        status = payload.get("status")
+        if status == "completed":
+            result_data = _coerce_result(payload.get("result"))
+            _write_raw_scribe_files(
+                result_data,
+                raw_json_path=raw_json_path,
+                raw_srt_path=raw_srt_path,
+            )
+            return RawScribeResult(
+                raw_json_path=str(raw_json_path),
+                raw_srt_path=str(raw_srt_path),
+                external_task_id=job_id,
+                provider_request_id=_nonempty_string(payload.get("provider_request_id")),
+                provider_transcription_id=_nonempty_string(payload.get("provider_transcription_id")),
+                provider_trace_id=_nonempty_string(payload.get("provider_trace_id")),
+            )
+        if status == "failed":
+            details = _recovery_details(payload, external_task_id=job_id)
+            raise ChalnaClientError(
+                str(payload.get("error") or payload.get("error_message") or "Chalna transcription failed"),
+                details=details,
+            )
+        time.sleep(poll_interval_seconds)
+
+
+def recover_provider_transcript_to_files(
+    transcription_id: str,
+    *,
+    output_dir: str,
+    include_audio_events: bool = True,
+) -> RawScribeResult | None:
+    """Fetch an existing provider result through Chalna's local recovery API."""
+    base_url = settings.chalna_url.rstrip("/")
+    try:
+        with httpx.Client(timeout=120.0) as client:
+            response = client.get(
+                f"{base_url}/provider/transcripts/{transcription_id}",
+                params={"include_audio_events": str(include_audio_events).lower()},
+            )
+    except httpx.HTTPError as exc:
+        raise ChalnaClientError(
+            f"Chalna provider transcript recovery failed: {exc}",
+            details={
+                "provider_transcription_id": transcription_id,
+                "failure_kind": "provider_recovery_connection",
+                "retryable": True,
+                "resubmit_safe": False,
+            },
+        ) from exc
+    if response.status_code == 404:
+        return None
+    if response.status_code != 200:
+        raise ChalnaClientError(
+            f"Chalna provider transcript recovery failed: {response.text[:500]}",
+            details={
+                "provider_transcription_id": transcription_id,
+                "failure_kind": "provider_recovery_http",
+                "retryable": response.status_code >= 500,
+                "resubmit_safe": False,
+            },
+        )
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ChalnaClientError("Chalna provider recovery response is not a JSON object")
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    raw_json_path = output_root / "source.scribe.raw.json"
+    raw_srt_path = output_root / "source.scribe.raw.srt"
+    _write_raw_scribe_files(payload, raw_json_path=raw_json_path, raw_srt_path=raw_srt_path)
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    return RawScribeResult(
+        raw_json_path=str(raw_json_path),
+        raw_srt_path=str(raw_srt_path),
+        external_task_id="",
+        provider_request_id=_nonempty_string(metadata.get("provider_request_id")),
+        provider_transcription_id=(
+            _nonempty_string(metadata.get("provider_transcription_id")) or transcription_id
+        ),
+        provider_trace_id=_nonempty_string(metadata.get("provider_trace_id")),
     )
 
 
@@ -242,7 +387,7 @@ def transcribe_from_scribe_response_to_srt(
     if overlap_intervals is not None and not overlap_intervals.exists():
         raise ChalnaClientError(f"Overlap intervals JSON not found: {overlap_intervals}")
 
-    result_data, _task_id = _submit_and_poll(
+    result_data, _task_id, _completed_status = _submit_and_poll(
         endpoint="/transcribe/from-scribe/async",
         source=source,
         raw_json=raw_json,
@@ -428,33 +573,48 @@ def _submit_and_poll(
     on_status: StatusCallback | None,
     timeout_seconds: float,
     poll_interval_seconds: float,
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
     base_url = settings.chalna_url.rstrip("/")
 
-    with httpx.Client(timeout=60.0) as client:
-        with ExitStack() as stack:
-            source_file = stack.enter_context(source.open("rb"))
-            files: dict[str, Any] = {
-                "file": (source.name, source_file, _source_content_type(source)),
-            }
-            if raw_json is not None:
-                raw_json_file = stack.enter_context(raw_json.open("rb"))
-                files["scribe_response"] = (
-                    raw_json.name,
-                    raw_json_file,
-                    "application/json",
-                )
-            if overlap_intervals is not None:
-                overlap_file = stack.enter_context(overlap_intervals.open("rb"))
-                files["overlap_intervals"] = (
-                    overlap_intervals.name,
-                    overlap_file,
-                    "application/json",
-                )
-            response = client.post(f"{base_url}{endpoint}", files=files, data=data)
+    try:
+        with httpx.Client(timeout=60.0) as client:
+            with ExitStack() as stack:
+                source_file = stack.enter_context(source.open("rb"))
+                files: dict[str, Any] = {
+                    "file": (source.name, source_file, _source_content_type(source)),
+                }
+                if raw_json is not None:
+                    raw_json_file = stack.enter_context(raw_json.open("rb"))
+                    files["scribe_response"] = (
+                        raw_json.name,
+                        raw_json_file,
+                        "application/json",
+                    )
+                if overlap_intervals is not None:
+                    overlap_file = stack.enter_context(overlap_intervals.open("rb"))
+                    files["overlap_intervals"] = (
+                        overlap_intervals.name,
+                        overlap_file,
+                        "application/json",
+                    )
+                response = client.post(f"{base_url}{endpoint}", files=files, data=data)
+    except httpx.HTTPError as exc:
+        raise ChalnaClientError(
+            f"Chalna submit connection failed: {exc}",
+            details={
+                "failure_kind": "chalna_submit_connection",
+                "retryable": True,
+                # The POST may have reached Chalna. Only Chalna can later mark it safe.
+                "resubmit_safe": False,
+            },
+        ) from exc
 
     if response.status_code != 200:
-        raise ChalnaClientError(f"Chalna submit failed: {response.text[:500]}")
+        response_payload = _response_json_object(response)
+        raise ChalnaClientError(
+            f"Chalna submit failed: {response.text[:500]}",
+            details=_recovery_details(response_payload),
+        )
 
     submitted = response.json()
     job_id = submitted.get("job_id") or submitted.get("task_id")
@@ -468,11 +628,37 @@ def _submit_and_poll(
     with httpx.Client(timeout=60.0) as client:
         while True:
             if time.monotonic() - started > timeout_seconds:
-                raise ChalnaClientError(f"Chalna transcription timed out after {timeout_seconds:.0f}s")
+                raise ChalnaClientError(
+                    f"Chalna transcription timed out after {timeout_seconds:.0f}s",
+                    details={
+                        "external_task_id": str(job_id),
+                        "failure_kind": "chalna_status_timeout",
+                        "retryable": True,
+                        "resubmit_safe": False,
+                    },
+                )
 
-            status_response = client.get(f"{base_url}/jobs/{job_id}")
+            try:
+                status_response = client.get(f"{base_url}/jobs/{job_id}")
+            except httpx.HTTPError as exc:
+                raise ChalnaClientError(
+                    f"Chalna status failed for accepted task {job_id}: {exc}",
+                    details={
+                        "external_task_id": str(job_id),
+                        "failure_kind": "chalna_status_connection",
+                        "retryable": True,
+                        "resubmit_safe": False,
+                    },
+                ) from exc
             if status_response.status_code != 200:
-                raise ChalnaClientError(f"Chalna status failed: {status_response.text[:500]}")
+                response_payload = _response_json_object(status_response)
+                raise ChalnaClientError(
+                    f"Chalna status failed: {status_response.text[:500]}",
+                    details=_recovery_details(
+                        response_payload,
+                        external_task_id=str(job_id),
+                    ),
+                )
 
             payload = status_response.json()
             if on_status:
@@ -480,10 +666,13 @@ def _submit_and_poll(
 
             status = payload.get("status")
             if status == "completed":
-                return _coerce_result(payload.get("result")), str(job_id)
+                return _coerce_result(payload.get("result")), str(job_id), payload
 
             if status == "failed":
-                raise ChalnaClientError(payload.get("error") or "Chalna transcription failed")
+                raise ChalnaClientError(
+                    str(payload.get("error") or payload.get("error_message") or "Chalna transcription failed"),
+                    details=_recovery_details(payload, external_task_id=str(job_id)),
+                )
 
             time.sleep(poll_interval_seconds)
 
@@ -505,6 +694,65 @@ def _coerce_result(value: Any) -> dict[str, Any]:
         if isinstance(parsed, dict):
             return parsed
     raise ChalnaClientError("Chalna completed without usable result")
+
+
+def _write_raw_scribe_files(
+    result_data: dict[str, Any],
+    *,
+    raw_json_path: Path,
+    raw_srt_path: Path,
+) -> None:
+    scribe_response = result_data.get("scribe_response")
+    if not isinstance(scribe_response, dict):
+        raise ChalnaClientError("Chalna raw transcription completed without Scribe raw JSON")
+
+    raw_srt = result_data.get("raw_srt")
+    if not isinstance(raw_srt, str) or not raw_srt.strip():
+        raw_srt = _segments_to_srt(result_data.get("segments") or [])
+    if not raw_srt.strip():
+        raise ChalnaClientError("Chalna raw transcription completed without raw SRT")
+
+    raw_json_path.write_text(
+        json.dumps(scribe_response, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    raw_srt_path.write_text(raw_srt, encoding="utf-8")
+
+
+def _response_json_object(response: httpx.Response) -> dict[str, Any]:
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _recovery_details(
+    payload: dict[str, Any],
+    *,
+    external_task_id: str | None = None,
+) -> dict[str, Any]:
+    details: dict[str, Any] = {}
+    if external_task_id:
+        details["external_task_id"] = external_task_id
+    for key in (
+        "provider_request_id",
+        "provider_transcription_id",
+        "provider_trace_id",
+        "failure_kind",
+    ):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            details[key] = value
+    for key in ("retryable", "resubmit_safe"):
+        value = payload.get(key)
+        if isinstance(value, bool):
+            details[key] = value
+    return details
+
+
+def _nonempty_string(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def _segments_to_srt(segments: list[dict[str, Any]]) -> str:

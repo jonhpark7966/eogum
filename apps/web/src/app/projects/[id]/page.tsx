@@ -221,6 +221,20 @@ function newestJobFirst(a: ProjectJob, b: ProjectJob): number {
   return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
 }
 
+function jobAttemptNumber(job: ProjectJob): number {
+  return Number.isInteger(job.attempt_number) && job.attempt_number > 0
+    ? job.attempt_number
+    : 1;
+}
+
+function newestAttemptFirst(a: ProjectJob, b: ProjectJob): number {
+  return jobAttemptNumber(b) - jobAttemptNumber(a) || newestJobFirst(a, b);
+}
+
+function jobAttemptLabel(job: ProjectJob): string {
+  return `${JOB_TYPE_LABELS[job.type] ?? job.type} · ${jobAttemptNumber(job)}차 시도`;
+}
+
 type SegmentationDisplay = {
   label: string;
   className: string;
@@ -362,7 +376,12 @@ function getVisibleProcessingJobs(project: ProjectDetail): ProjectJob[] {
     if (multicamJob && isActiveJob(multicamJob)) return [multicamJob];
   }
 
-  const activeJobs = project.jobs.filter(isActiveJob).sort(newestJobFirst);
+  const activeJobs = project.jobs.filter(isActiveJob).sort((a, b) => {
+    const aIsPrimaryPipeline = a.type === project.cut_type;
+    const bIsPrimaryPipeline = b.type === project.cut_type;
+    if (aIsPrimaryPipeline !== bIsPrimaryPipeline) return aIsPrimaryPipeline ? -1 : 1;
+    return aIsPrimaryPipeline ? newestAttemptFirst(a, b) : newestJobFirst(a, b);
+  });
   if (activeJobs.length > 0) return activeJobs;
 
   if (project.status === "processing" || project.status === "queued") {
@@ -982,6 +1001,18 @@ export default function ProjectDetailPage() {
   const scribeV2CacheHit = hasScribeV2CacheHit(project);
   const showCacheReuseInfo = sourceCacheReused || scribeV2CacheHit;
   const visibleProcessingJobs = getVisibleProcessingJobs(project);
+  const pipelineAttempts = project.jobs
+    .filter((job) => job.type === project.cut_type)
+    .sort(newestAttemptFirst);
+  const latestPipelineAttempt = pipelineAttempts[0] ?? null;
+  const primaryFailedJob = isFailed
+    ? project.status === "failed" && latestPipelineAttempt?.status === "failed"
+      ? latestPipelineAttempt
+      : [...project.jobs].filter((job) => job.status === "failed").sort(newestJobFirst)[0] ?? null
+    : null;
+  const previousFailedJobs = project.jobs
+    .filter((job) => job.status === "failed" && job.id !== primaryFailedJob?.id)
+    .sort(newestAttemptFirst);
   const latestResultKeys = [...project.jobs]
     .filter((job) => job.result_r2_keys && ARTIFACT_JOB_TYPES.has(job.type))
     .sort(newestJobFirst)[0]?.result_r2_keys ?? {};
@@ -1119,6 +1150,11 @@ export default function ProjectDetailPage() {
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M4 21v-7" /><path d="M4 10V3" /><path d="M12 21v-9" /><path d="M12 8V3" /><path d="M20 21v-5" /><path d="M20 12V3" /><path d="M2 14h4" /><path d="M10 8h4" /><path d="M18 16h4" /></svg>
                     {currentEditIntensityLabel}
                   </span>
+                  {latestPipelineAttempt && jobAttemptNumber(latestPipelineAttempt) > 1 && (
+                    <span className="inline-flex items-center gap-1.5 rounded-full border border-cyan-400/20 bg-cyan-400/10 px-2 py-0.5 text-xs font-medium text-cyan-300">
+                      {jobAttemptNumber(latestPipelineAttempt)}차 처리 시도
+                    </span>
+                  )}
                   <span className="inline-flex items-center gap-1.5 rounded-full border border-violet-400/20 bg-violet-400/10 px-2 py-0.5 text-xs font-medium text-violet-300">
                     Edit Decision: {currentEditDecisionVersionLabel}
                   </span>
@@ -1232,7 +1268,7 @@ export default function ProjectDetailPage() {
               {visibleProcessingJobs.map((job) => (
                 <div key={job.id}>
                   <div className="flex justify-between text-sm mb-2">
-                    <span className="text-gray-300">{JOB_TYPE_LABELS[job.type] ?? job.type}</span>
+                    <span className="text-gray-300">{jobAttemptLabel(job)}</span>
                     <span className="text-gray-500">{job.progress}%</span>
                   </div>
                   <div className="relative h-2 bg-white/[0.05] rounded-full overflow-hidden">
@@ -1263,13 +1299,15 @@ export default function ProjectDetailPage() {
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-red-400">
                   <circle cx="12" cy="12" r="10" /><line x1="15" y1="9" x2="9" y2="15" /><line x1="9" y1="9" x2="15" y2="15" />
                 </svg>
-                <h3 className="font-semibold text-[15px] text-red-300">처리 실패</h3>
+                <h3 className="font-semibold text-[15px] text-red-300">
+                  {primaryFailedJob ? `처리 실패 · ${jobAttemptNumber(primaryFailedJob)}차 시도` : "처리 실패"}
+                </h3>
               </div>
-              {project.jobs.filter((j) => j.status === "failed").map((j) => (
-                <p key={j.id} className="text-sm text-red-300/80 mb-2 font-mono bg-red-500/[0.06] rounded-lg px-3 py-2">
-                  {j.error_message}
+              {primaryFailedJob?.error_message && (
+                <p className="whitespace-pre-wrap break-words text-sm text-red-300/80 font-mono bg-red-500/[0.06] rounded-lg px-3 py-2">
+                  {primaryFailedJob.error_message}
                 </p>
-              ))}
+              )}
               <p className="text-xs text-gray-500 mt-3 mb-4">
                 홀딩된 크레딧은 자동으로 복구되었습니다.
               </p>
@@ -1285,6 +1323,31 @@ export default function ProjectDetailPage() {
               )}
             </div>
           </div>
+        )}
+
+        {previousFailedJobs.length > 0 && (
+          <Section
+            title={`이전 실패 이력 (${previousFailedJobs.length})`}
+            icon={<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" /><path d="M12 7v5l3 2" /></svg>}
+          >
+            <div className="space-y-3">
+              {previousFailedJobs.map((job) => (
+                <div key={job.id} className="rounded-xl border border-red-500/10 bg-red-500/[0.025] px-4 py-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <span className="font-medium text-red-300/80">{jobAttemptLabel(job)}</span>
+                    <span className="text-gray-600">
+                      {new Date(job.completed_at ?? job.created_at).toLocaleString("ko-KR")}
+                    </span>
+                  </div>
+                  {job.error_message && (
+                    <p className="mt-2 whitespace-pre-wrap break-words font-mono text-xs leading-5 text-gray-500">
+                      {job.error_message}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </Section>
         )}
 
         {/* ── Downloads ── */}

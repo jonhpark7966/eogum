@@ -346,15 +346,90 @@ def _source_r2_key_is_shared(db, *, r2_key: str | None, project_id: str) -> bool
         return True
 
 
-def _create_initial_job_or_fail(db, project: dict) -> dict:
+def _create_initial_job_or_fail(
+    db,
+    project: dict,
+    *,
+    retry_of_job_id: str | None = None,
+    attempt_number: int = 1,
+) -> dict:
     try:
-        return create_initial_job(db, project)
+        return create_initial_job(
+            db,
+            project,
+            retry_of_job_id=retry_of_job_id,
+            attempt_number=attempt_number,
+        )
     except Exception as exc:
+        winner = _find_active_initial_job(db, project=project)
+        if (
+            winner
+            and winner.get("type") == project["cut_type"]
+            and winner.get("status") in {"queued", "pending", "running"}
+        ):
+            logger.info(
+                "Reusing concurrent initial job %s for project %s",
+                winner["id"],
+                project["id"],
+            )
+            return winner
         logger.exception("Failed to create initial job for project %s", project.get("id"))
         try:
             db.table("projects").update({"status": "failed"}).eq("id", project["id"]).execute()
         except Exception:
             logger.exception("Failed to mark project %s failed after job creation error", project.get("id"))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="프로젝트 처리 작업 등록에 실패했습니다",
+        ) from exc
+
+
+def _find_active_initial_job(db, *, project: dict) -> dict | None:
+    result = (
+        db.table("jobs")
+        .select("id, type, status, retry_of_job_id, attempt_number")
+        .eq("project_id", project["id"])
+        .eq("user_id", project["user_id"])
+        .in_("status", ["queued", "pending", "running", "cancel_requested"])
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
+def _create_retry_job_or_reuse_pending(
+    db,
+    *,
+    project: dict,
+    retry_of_job_id: str | None,
+    attempt_number: int,
+) -> tuple[dict, bool]:
+    """Insert a retry attempt, or reuse the concurrent unique-index winner."""
+    try:
+        return (
+            create_initial_job(
+                db,
+                project,
+                retry_of_job_id=retry_of_job_id,
+                attempt_number=attempt_number,
+            ),
+            True,
+        )
+    except Exception as exc:
+        winner = _find_active_initial_job(db, project=project)
+        if (
+            winner
+            and winner.get("type") == project["cut_type"]
+            and winner.get("status") in {"queued", "pending", "running"}
+        ):
+            logger.info(
+                "Reusing concurrent retry job %s for project %s",
+                winner["id"],
+                project["id"],
+            )
+            return winner, False
+        logger.exception("Failed to create retry job for project %s", project.get("id"))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="프로젝트 처리 작업 등록에 실패했습니다",
@@ -765,6 +840,32 @@ def retry_project(project_id: str, current_user: CurrentUser = Depends(get_curre
             detail="실패한 프로젝트만 재시도할 수 있습니다",
         )
 
+    orphan_job = _find_active_initial_job(db, project=project_data)
+    if (
+        orphan_job
+        and orphan_job.get("type") == project_data["cut_type"]
+        and orphan_job.get("status") in {"queued", "running"}
+    ):
+        latest_project = (
+            db.table("projects")
+            .select("*")
+            .eq("id", project_id)
+            .single()
+            .execute()
+            .data
+        )
+        if latest_project and latest_project.get("status") in {"queued", "processing"}:
+            db.table("edit_reports").delete().eq("project_id", project_id).execute()
+            return _annotate_project_access(latest_project, current_user)
+    if orphan_job and (
+        orphan_job.get("type") != project_data["cut_type"]
+        or orphan_job.get("status") != "pending"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="프로젝트에 이미 다른 작업이 진행 중입니다",
+        )
+
     # Check credits
     duration = project_data["source_duration_seconds"]
     balance = get_balance(owner_user_id)
@@ -774,13 +875,64 @@ def retry_project(project_id: str, current_user: CurrentUser = Depends(get_curre
             detail=f"크레딧이 부족합니다. 필요: {duration}초, 사용 가능: {balance['available_seconds']}초",
         )
 
-    # Clean up old failed jobs and reports
-    db.table("jobs").delete().eq("project_id", project_id).execute()
-    db.table("edit_reports").delete().eq("project_id", project_id).execute()
+    created_new_job = orphan_job is None
+    if orphan_job is not None:
+        job = orphan_job
+    else:
+        previous_jobs = (
+            db.table("jobs")
+            .select("id, attempt_number")
+            .eq("project_id", project_id)
+            .eq("user_id", owner_user_id)
+            .eq("type", project_data["cut_type"])
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        previous_job = previous_jobs.data[0] if previous_jobs.data else None
+        previous_attempt = int((previous_job or {}).get("attempt_number") or (1 if previous_job else 0))
+        # Persist lineage before project activation so a crash leaves a reusable
+        # orphan pending attempt instead of losing the retry history.
+        job, created_new_job = _create_retry_job_or_reuse_pending(
+            db,
+            project=project_data,
+            retry_of_job_id=(previous_job or {}).get("id"),
+            attempt_number=previous_attempt + 1,
+        )
 
-    # Reset project status and create a durable retry job before enqueueing.
-    updated = db.table("projects").update({"status": "queued"}).eq("id", project_id).execute().data[0]
-    job = _create_initial_job_or_fail(db, updated)
+    reset_result = (
+        db.table("projects")
+        .update({"status": "queued"})
+        .eq("id", project_id)
+        .eq("status", "failed")
+        .execute()
+    )
+    if not reset_result.data:
+        latest_project = (
+            db.table("projects")
+            .select("*")
+            .eq("id", project_id)
+            .single()
+            .execute()
+            .data
+        )
+        if latest_project and latest_project.get("status") in {"queued", "processing"}:
+            db.table("edit_reports").delete().eq("project_id", project_id).execute()
+            return _annotate_project_access(latest_project, current_user)
+        if created_new_job:
+            db.table("jobs").update({
+                "status": "failed",
+                "error_message": "Retry activation lost project status race",
+                "completed_at": "now()",
+            }).eq("id", job["id"]).eq("status", "pending").execute()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="이미 다른 재시도 작업이 시작되었습니다",
+        )
+    updated = reset_result.data[0]
+
+    # Reports are regenerated, but failed jobs remain as immutable retry history.
+    db.table("edit_reports").delete().eq("project_id", project_id).execute()
 
     # Enqueue for processing
     enqueue(project_id, job["id"])

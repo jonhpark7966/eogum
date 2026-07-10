@@ -111,6 +111,8 @@ class SourceLookupResponse(BaseModel):
 class JobResponse(BaseModel):
     id: str
     type: str
+    retry_of_job_id: str | None = None
+    attempt_number: int = 1
     status: str
     progress: int
     error_message: str | None

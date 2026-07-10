@@ -101,6 +101,8 @@ export interface PipelineStage {
 
 export interface Job {
   id: string;
+  retry_of_job_id: string | null;
+  attempt_number: number;
   type: string;
   status: string;
   progress: number;

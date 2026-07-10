@@ -3,14 +3,60 @@
 export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
-import { api, uploadFile, type SegmentationBoundaryRule, YouTubeInfoResponse } from "@/lib/api";
+import {
+  api,
+  uploadFile,
+  type CutType,
+  type SegmentationBoundaryRule,
+  type YouTubeInfoResponse,
+} from "@/lib/api";
 import { sha256File } from "@/lib/hash";
 import { useRouter } from "next/navigation";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useRef, useState, type ReactNode } from "react";
 
 type SourceMode = "file" | "youtube";
 type EditIntensity = "light" | "normal" | "heavy";
 type EditDecisionVersion = "legacy" | "boundary_aware_v1";
+
+const CUT_TYPE_OPTIONS: {
+  value: CutType;
+  label: string;
+  description: string;
+}[] = [
+  {
+    value: "subtitle_cut",
+    label: "강의/설명",
+    description: "중복, 더듬, 미완성 문장 감지",
+  },
+  {
+    value: "podcast_cut",
+    label: "팟캐스트",
+    description: "지루한 구간, 반복, 탈선 감지",
+  },
+  {
+    value: "ai_frontier_cut",
+    label: "AI Frontier",
+    description: "프리롤·포스트롤과 방송 흐름 정리",
+  },
+];
+
+const CUT_TYPE_ICONS: Record<CutType, ReactNode> = {
+  subtitle_cut: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-gray-400">
+      <rect x="2" y="2" width="20" height="20" rx="2" /><path d="M7 2v20" /><path d="M17 2v20" /><path d="M2 12h20" />
+    </svg>
+  ),
+  podcast_cut: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-gray-400">
+      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+    </svg>
+  ),
+  ai_frontier_cut: (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-gray-400">
+      <path d="m12 2 1.4 5.1L18 9l-4.6 1.9L12 16l-1.4-5.1L6 9l4.6-1.9L12 2Z" /><path d="m19 15 .7 2.3L22 18l-2.3.7L19 21l-.7-2.3L16 18l2.3-.7L19 15Z" />
+    </svg>
+  ),
+};
 
 const EDIT_INTENSITY_OPTIONS: {
   value: EditIntensity;
@@ -49,7 +95,7 @@ export default function NewProjectPage() {
   // Common state
   const [sourceMode, setSourceMode] = useState<SourceMode>("file");
   const [name, setName] = useState("");
-  const [cutType, setCutType] = useState("subtitle_cut");
+  const [cutType, setCutType] = useState<CutType>("subtitle_cut");
   const [editIntensity, setEditIntensity] = useState<EditIntensity>("normal");
   const [editDecisionVersion, setEditDecisionVersion] = useState<EditDecisionVersion>("legacy");
   const [segmentationBoundaryRule, setSegmentationBoundaryRule] =
@@ -456,35 +502,25 @@ export default function NewProjectPage() {
           {/* Cut type */}
           <div>
             <label className="block text-sm font-medium mb-2">편집 타입</label>
-            <div className="grid grid-cols-2 gap-3">
-              <button
-                type="button"
-                onClick={() => setCutType("subtitle_cut")}
-                className={`p-4 rounded-lg border text-left transition ${
-                  cutType === "subtitle_cut"
-                    ? "border-white bg-gray-800"
-                    : "border-gray-700 hover:border-gray-500"
-                }`}
-              >
-                <p className="font-medium">강의/설명</p>
-                <p className="text-sm text-gray-400 mt-1">
-                  중복, 더듬, 미완성 문장 감지
-                </p>
-              </button>
-              <button
-                type="button"
-                onClick={() => setCutType("podcast_cut")}
-                className={`p-4 rounded-lg border text-left transition ${
-                  cutType === "podcast_cut"
-                    ? "border-white bg-gray-800"
-                    : "border-gray-700 hover:border-gray-500"
-                }`}
-              >
-                <p className="font-medium">팟캐스트</p>
-                <p className="text-sm text-gray-400 mt-1">
-                  지루한 구간, 반복, 탈선 감지
-                </p>
-              </button>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              {CUT_TYPE_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => setCutType(option.value)}
+                  className={`p-4 rounded-lg border text-left transition ${
+                    cutType === option.value
+                      ? "border-white bg-gray-800"
+                      : "border-gray-700 hover:border-gray-500"
+                  }`}
+                >
+                  <p className="flex items-center gap-2 font-medium">
+                    {CUT_TYPE_ICONS[option.value]}
+                    {option.label}
+                  </p>
+                  <p className="text-sm text-gray-400 mt-1">{option.description}</p>
+                </button>
+              ))}
             </div>
           </div>
 

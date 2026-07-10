@@ -3,8 +3,8 @@
 export const dynamic = "force-dynamic";
 
 import { createClient } from "@/lib/supabase/client";
-import { api, type CreditBalance, type Project } from "@/lib/api";
-import type { MouseEvent } from "react";
+import { api, type CreditBalance, type CutType, type Project } from "@/lib/api";
+import type { MouseEvent, ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import Image from "next/image";
@@ -36,6 +36,30 @@ const EDIT_INTENSITY_LABELS: Record<EditIntensity, string> = {
   light: "적게 편집",
   normal: "일반 편집",
   heavy: "많이 편집",
+};
+
+const CUT_TYPE_LABELS: Record<CutType, string> = {
+  subtitle_cut: "강의/설명",
+  podcast_cut: "팟캐스트",
+  ai_frontier_cut: "AI Frontier",
+};
+
+const CUT_TYPE_ICONS: Record<CutType, ReactNode> = {
+  subtitle_cut: (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-gray-500">
+      <rect x="2" y="2" width="20" height="20" rx="2" /><path d="M7 2v20" /><path d="M17 2v20" /><path d="M2 12h20" />
+    </svg>
+  ),
+  podcast_cut: (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-gray-500">
+      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+    </svg>
+  ),
+  ai_frontier_cut: (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-gray-500">
+      <path d="m12 2 1.4 5.1L18 9l-4.6 1.9L12 16l-1.4-5.1L6 9l4.6-1.9L12 2Z" /><path d="m19 15 .7 2.3L22 18l-2.3.7L19 21l-.7-2.3L16 18l2.3-.7L19 15Z" />
+    </svg>
+  ),
 };
 
 function normalizeEditIntensity(value: unknown): EditIntensity {
@@ -174,18 +198,10 @@ function ProjectCard({
   const ownerBadgeClass = isOwnProject
     ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300"
     : "border-amber-400/20 bg-amber-400/10 text-amber-300";
-  const cutTypeLabel = project.cut_type === "subtitle_cut" ? "강의/설명" : "팟캐스트";
+  const cutTypeLabel = CUT_TYPE_LABELS[project.cut_type];
   const editIntensity = normalizeEditIntensity(project.settings?.edit_intensity);
   const editIntensityLabel = EDIT_INTENSITY_LABELS[editIntensity];
-  const cutTypeIcon = project.cut_type === "subtitle_cut" ? (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-gray-500">
-      <rect x="2" y="2" width="20" height="20" rx="2" /><path d="M7 2v20" /><path d="M17 2v20" /><path d="M2 12h20" />
-    </svg>
-  ) : (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="text-gray-500">
-      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-    </svg>
-  );
+  const cutTypeIcon = CUT_TYPE_ICONS[project.cut_type];
 
   return (
     <div

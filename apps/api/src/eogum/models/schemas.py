@@ -1,6 +1,10 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
+
+
+CutType = Literal["subtitle_cut", "podcast_cut", "ai_frontier_cut"]
 
 
 # ── Upload ──
@@ -43,7 +47,7 @@ class UpdateMulticamSettingsRequest(BaseModel):
 # ── Projects ──
 class ProjectCreate(BaseModel):
     name: str
-    cut_type: str  # subtitle_cut | podcast_cut
+    cut_type: CutType
     language: str = "ko"
     source_r2_key: str
     source_filename: str
@@ -71,7 +75,7 @@ class ProjectResponse(BaseModel):
     viewer_can_edit: bool = False
     name: str
     status: str
-    cut_type: str
+    cut_type: CutType
     language: str
     source_filename: str | None
     source_duration_seconds: int | None

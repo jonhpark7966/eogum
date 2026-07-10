@@ -11,13 +11,22 @@ import {
   type SegmentWithDecision,
   type MulticamSwitching,
   type MulticamSourceLabel,
+  type CutType,
   type EditDecisionVersion,
   type SegmentationBoundaryRule,
 } from "@/lib/api";
 import { useUploads } from "@/lib/upload-provider";
 import { isPublicProjectId } from "@/lib/public-projects";
 import { useParams, useRouter } from "next/navigation";
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import Image from "next/image";
@@ -47,10 +56,35 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; icon: string
 const JOB_TYPE_LABELS: Record<string, string> = {
   subtitle_cut: "편집 처리",
   podcast_cut: "편집 처리",
+  ai_frontier_cut: "편집 처리",
   reprocess_multicam: "멀티캠 적용",
   cut_decision: "컷 결정 재실행",
   final_preview: "완성본 미리보기",
   source_derive: "오디오 준비",
+};
+
+const CUT_TYPE_LABELS: Record<CutType, string> = {
+  subtitle_cut: "강의/설명",
+  podcast_cut: "팟캐스트",
+  ai_frontier_cut: "AI Frontier",
+};
+
+const CUT_TYPE_ICONS: Record<CutType, ReactNode> = {
+  subtitle_cut: (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+      <rect x="2" y="2" width="20" height="20" rx="2" /><path d="M7 2v20" /><path d="M17 2v20" /><path d="M2 12h20" />
+    </svg>
+  ),
+  podcast_cut: (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+    </svg>
+  ),
+  ai_frontier_cut: (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+      <path d="m12 2 1.4 5.1L18 9l-4.6 1.9L12 16l-1.4-5.1L6 9l4.6-1.9L12 2Z" /><path d="m19 15 .7 2.3L22 18l-2.3.7L19 21l-.7-2.3L16 18l2.3-.7L19 15Z" />
+    </svg>
+  ),
 };
 
 const PROJECT_NAME_MAX_LENGTH = 120;
@@ -171,7 +205,13 @@ function hasScribeV2CacheHit(project: ProjectDetail): boolean {
 type ProjectJob = ProjectDetail["jobs"][number];
 
 const ACTIVE_JOB_STATUSES = new Set(["pending", "queued", "running", "cancel_requested"]);
-const ARTIFACT_JOB_TYPES = new Set(["subtitle_cut", "podcast_cut", "reprocess_multicam", "cut_decision"]);
+const ARTIFACT_JOB_TYPES = new Set([
+  "subtitle_cut",
+  "podcast_cut",
+  "ai_frontier_cut",
+  "reprocess_multicam",
+  "cut_decision",
+]);
 
 function isActiveJob(job: ProjectJob): boolean {
   return ACTIVE_JOB_STATUSES.has(job.status);
@@ -912,7 +952,7 @@ export default function ProjectDetailPage() {
   const isProcessing = project.status === "processing" || project.status === "queued";
   const isCompleted = project.status === "completed";
   const isFailed = project.status === "failed" || project.status === "reprocess_failed";
-  const cutTypeLabel = project.cut_type === "subtitle_cut" ? "강의/설명" : "팟캐스트";
+  const cutTypeLabel = CUT_TYPE_LABELS[project.cut_type];
   const currentEditIntensity = normalizeEditIntensity(project.settings?.edit_intensity);
   const currentEditIntensityLabel = EDIT_INTENSITY_LABELS[currentEditIntensity];
   const currentEditDecisionVersion = normalizeEditDecisionVersion(project.settings?.edit_decision_version);
@@ -1072,11 +1112,7 @@ export default function ProjectDetailPage() {
                 )}
                 <div className="flex flex-wrap items-center gap-3 text-sm text-gray-500">
                   <span className="inline-flex items-center gap-1.5">
-                    {project.cut_type === "subtitle_cut" ? (
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><rect x="2" y="2" width="20" height="20" rx="2" /><path d="M7 2v20" /><path d="M17 2v20" /><path d="M2 12h20" /></svg>
-                    ) : (
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2" /></svg>
-                    )}
+                    {CUT_TYPE_ICONS[project.cut_type]}
                     {cutTypeLabel}
                   </span>
                   <span className="inline-flex items-center gap-1.5 text-cyan-300">

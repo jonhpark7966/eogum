@@ -48,6 +48,7 @@ export interface ExtraSource {
 export type MulticamSwitching = "none" | "follow_speaker" | "conservative_follow_speaker";
 export type EditDecisionVersion = "legacy" | "boundary_aware_v1";
 export type SegmentationBoundaryRule = "word_boundary" | "midpoint_gap" | "low_energy_gap_v1";
+export type CutType = "subtitle_cut" | "podcast_cut" | "ai_frontier_cut";
 
 export interface MulticamSourceLabel {
   display_id?: string;
@@ -67,7 +68,7 @@ export interface Project {
   viewer_can_edit: boolean;
   name: string;
   status: string;
-  cut_type: string;
+  cut_type: CutType;
   language: string;
   source_filename: string | null;
   source_duration_seconds: number | null;
@@ -434,7 +435,7 @@ export const api = {
     token: string,
     data: {
       name: string;
-      cut_type: string;
+      cut_type: CutType;
       language: string;
       source_r2_key: string;
       source_filename: string;

@@ -4,7 +4,13 @@ from typing import Any
 
 from eogum.services.database import execute_with_retry
 
-ARTIFACT_JOB_TYPES = ["subtitle_cut", "podcast_cut", "reprocess_multicam", "cut_decision"]
+ARTIFACT_JOB_TYPES = [
+    "subtitle_cut",
+    "podcast_cut",
+    "ai_frontier_cut",
+    "reprocess_multicam",
+    "cut_decision",
+]
 
 
 def get_latest_artifact_job(

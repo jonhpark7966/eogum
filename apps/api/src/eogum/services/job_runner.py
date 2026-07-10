@@ -48,7 +48,12 @@ _worker_limit_settings = {
     "final_preview": "final_preview_worker_count",
 }
 _lock = threading.Lock()
-_initial_job_types = {"subtitle_cut", "podcast_cut"}
+PODCAST_LIKE_CUT_TYPES = frozenset({"podcast_cut", "ai_frontier_cut"})
+_PODCAST_PROMPT_PROFILES = {
+    "podcast_cut": "podcast",
+    "ai_frontier_cut": "ai_frontier",
+}
+_initial_job_types = {"subtitle_cut", *PODCAST_LIKE_CUT_TYPES}
 _incomplete_job_statuses = ["queued", "pending", "running"]
 _stale_running_after = timedelta(hours=6)
 _PODCAST_CUT_RESUME_MARKER = "resume_state.json"
@@ -59,6 +64,19 @@ ALLOWED_SEGMENTATION_BOUNDARY_RULES = {
 }
 DEFAULT_SEGMENTATION_BOUNDARY_RULE = "word_boundary"
 FINAL_PREVIEW_MERGE_GAP_MS = 500
+
+
+def _resolve_cut_runner(project: dict):
+    """Return the AVID cut function and style-only keyword arguments."""
+    cut_type = project.get("cut_type")
+    if cut_type == "subtitle_cut":
+        return avid.subtitle_cut, {}
+
+    prompt_profile = _PODCAST_PROMPT_PROFILES.get(cut_type)
+    if prompt_profile is not None:
+        return avid.podcast_cut, {"prompt_profile": prompt_profile}
+
+    raise ValueError(f"Unsupported cut_type: {cut_type}")
 
 
 def enqueue(project_id: str, job_id: str) -> None:
@@ -680,8 +698,8 @@ def _process_project(project_id: str, job_id: str | None) -> None:
 
         # 5. Cut (Pass 2)
         current_stage = "podcast_cut"
-        cut_fn = avid.subtitle_cut if project["cut_type"] == "subtitle_cut" else avid.podcast_cut
-        if project["cut_type"] == "podcast_cut":
+        cut_fn, cut_style_kwargs = _resolve_cut_runner(project)
+        if project["cut_type"] in PODCAST_LIKE_CUT_TYPES:
             _write_podcast_cut_resume_state(
                 temp_dir,
                 project_id=project_id,
@@ -702,6 +720,7 @@ def _process_project(project_id: str, job_id: str | None) -> None:
             edit_decision_version=_output_edit_decision_version(project),
             segmentation_boundary_rule=_output_segmentation_boundary_rule(project),
             llm_log_path=str(llm_log_path),
+            **cut_style_kwargs,
         )
         result_paths["storyline"] = storyline_path
         if segments_json_path:
@@ -1183,7 +1202,7 @@ def _local_source_matches_resume_state(path: Path, state: dict) -> bool:
 
 
 def _load_podcast_cut_resume_state(temp_dir: Path, project: dict | None) -> dict | None:
-    if not project or project.get("cut_type") != "podcast_cut":
+    if not project or project.get("cut_type") not in PODCAST_LIKE_CUT_TYPES:
         return None
 
     marker_path = _podcast_cut_resume_marker_path(temp_dir)
@@ -1894,7 +1913,7 @@ def _cut_decision_project(project_id: str, job_id: str | None) -> None:
         _update_cut_decision_progress(db, job_id, 25, "edit_decision", 1)
 
         llm_log_path = output_dir / "llm_io.jsonl"
-        cut_fn = avid.subtitle_cut if project["cut_type"] == "subtitle_cut" else avid.podcast_cut
+        cut_fn, cut_style_kwargs = _resolve_cut_runner(project)
         result_paths = cut_fn(
             source_path=str(source_path),
             srt_path=str(srt_path),
@@ -1905,6 +1924,7 @@ def _cut_decision_project(project_id: str, job_id: str | None) -> None:
             edit_intensity=_output_edit_intensity(project),
             edit_decision_version=_output_edit_decision_version(project),
             llm_log_path=str(llm_log_path),
+            **cut_style_kwargs,
         )
         if llm_log_path.exists() and llm_log_path.stat().st_size > 0:
             result_paths["llm_io_log"] = str(llm_log_path)

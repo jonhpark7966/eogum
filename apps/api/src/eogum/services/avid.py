@@ -286,8 +286,12 @@ def podcast_cut(
     edit_decision_version: str = "legacy",
     segmentation_boundary_rule: str = "word_boundary",
     llm_log_path: str | None = None,
+    prompt_profile: str = "podcast",
 ) -> dict[str, str]:
     """Run avid podcast-cut (Pass 2). Returns result paths dict."""
+    if prompt_profile not in {"podcast", "ai_frontier"}:
+        raise ValueError(f"Unsupported podcast prompt profile: {prompt_profile}")
+
     args = _apply_provider_args(["podcast-cut", source_path])
     if srt_path:
         args += ["--srt", srt_path]
@@ -302,6 +306,7 @@ def podcast_cut(
     args += ["--edit-intensity", edit_intensity]
     args += ["--edit-decision-version", edit_decision_version]
     args += ["--segmentation-boundary-rule", segmentation_boundary_rule]
+    args += ["--prompt-profile", prompt_profile]
     for src in extra_sources or []:
         args += ["--extra-source", src]
 

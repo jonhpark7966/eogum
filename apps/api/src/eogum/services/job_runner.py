@@ -64,6 +64,11 @@ ALLOWED_SEGMENTATION_BOUNDARY_RULES = {
 }
 DEFAULT_SEGMENTATION_BOUNDARY_RULE = "word_boundary"
 FINAL_PREVIEW_MERGE_GAP_MS = 500
+CHALNA_MAX_INPUT_BYTES = 2 * 1024 * 1024 * 1024
+
+
+class AudioProxyPreparationError(RuntimeError):
+    """Raised when a source cannot provide a valid Chalna audio proxy."""
 
 
 def _resolve_cut_runner(project: dict):
@@ -646,11 +651,16 @@ def _process_project(project_id: str, job_id: str | None) -> None:
                     output_dir=temp_dir,
                 )
             if transcription_result is None:
+                transcription_source_path = _ensure_chalna_audio_proxy(
+                    project=project,
+                    source_path=source_path_obj,
+                    temp_dir=temp_dir,
+                )
                 transcription_result = _transcribe_with_scribe_v2_cache(
                     db,
                     job_id=job_id,
                     project=project,
-                    source_path=source_path,
+                    source_path=str(transcription_source_path),
                     output_dir=temp_dir,
                     source_sha256=source_sha256,
                     language=project["language"],
@@ -668,6 +678,7 @@ def _process_project(project_id: str, job_id: str | None) -> None:
                     segmentation_boundary_rule=_output_segmentation_boundary_rule(project),
                     llm_log_path=llm_log_path,
                     overlap_intervals_path=overlap_artifact_path,
+                    retry_failed_size_cache=True,
                 )
         srt_path = transcription_result.srt_path
         segments_json_path = transcription_result.segments_json_path
@@ -966,6 +977,91 @@ def _derive_primary_source_best_effort(
         project.update(updated)
     except Exception:
         logger.exception("Best-effort primary source derivative generation failed for project %s", project_id)
+
+
+def _ensure_chalna_audio_proxy(*, project: dict, source_path: Path, temp_dir: Path) -> Path:
+    """Return the required 16 kHz mono FLAC input for Chalna."""
+    source_path = Path(source_path)
+    derived = project.get("source_derived") or {}
+    if not source_derivatives.is_ready(derived):
+        raise AudioProxyPreparationError("Primary audio proxy is not ready for Chalna transcription")
+
+    _validate_chalna_audio_proxy_metadata(derived)
+
+    audio_proxy_key = derived.get("audio_proxy_r2_key")
+    if not isinstance(audio_proxy_key, str) or not audio_proxy_key:
+        raise AudioProxyPreparationError("Primary audio proxy is missing its R2 key")
+    if Path(audio_proxy_key).suffix.lower() != ".flac":
+        raise AudioProxyPreparationError(f"Primary audio proxy R2 key must be FLAC: {audio_proxy_key}")
+
+    proxy_path = _download_chalna_audio_proxy(
+        audio_proxy_key=audio_proxy_key,
+        source_path=source_path,
+        temp_dir=Path(temp_dir),
+    )
+    _validate_chalna_audio_proxy_file(proxy_path, source_path=source_path)
+
+    logger.info(
+        "Using source audio proxy for Chalna transcription: project=%s proxy=%s size=%s",
+        project.get("id"),
+        audio_proxy_key,
+        proxy_path.stat().st_size,
+    )
+    return proxy_path
+
+
+def _validate_chalna_audio_proxy_metadata(derived: dict) -> None:
+    expected = {
+        "audio_codec": source_derivatives.AUDIO_PROXY_CODEC,
+        "sample_rate": source_derivatives.AUDIO_PROXY_SAMPLE_RATE,
+        "channels": source_derivatives.AUDIO_PROXY_CHANNELS,
+    }
+    actual = {
+        "audio_codec": str(derived.get("audio_codec") or "").lower(),
+        "sample_rate": _optional_int_value(derived.get("sample_rate")),
+        "channels": _optional_int_value(derived.get("channels")),
+    }
+    if actual != expected:
+        raise AudioProxyPreparationError(
+            f"Primary audio proxy metadata is invalid: expected={expected} actual={actual}"
+        )
+
+
+def _download_chalna_audio_proxy(*, audio_proxy_key: str, source_path: Path, temp_dir: Path) -> Path:
+    generated_proxy_path = source_path.parent / "audio_proxy.flac"
+    if generated_proxy_path.exists() and generated_proxy_path.stat().st_size > 0:
+        return generated_proxy_path
+
+    proxy_path = temp_dir / "source.audio_proxy.flac"
+    if proxy_path.exists() and proxy_path.stat().st_size > 0:
+        return proxy_path
+
+    r2.download_file(audio_proxy_key, str(proxy_path))
+    return proxy_path
+
+
+def _validate_chalna_audio_proxy_file(proxy_path: Path, *, source_path: Path) -> None:
+    if proxy_path.resolve() == source_path.resolve():
+        raise AudioProxyPreparationError("Refusing to submit the original source to Chalna")
+    if proxy_path.suffix.lower() != ".flac":
+        raise AudioProxyPreparationError(f"Chalna audio proxy must be FLAC: {proxy_path}")
+    if not proxy_path.exists() or not proxy_path.is_file():
+        raise AudioProxyPreparationError(f"Chalna audio proxy is missing: {proxy_path}")
+
+    size_bytes = proxy_path.stat().st_size
+    if size_bytes <= 0:
+        raise AudioProxyPreparationError(f"Chalna audio proxy is empty: {proxy_path}")
+    if size_bytes > CHALNA_MAX_INPUT_BYTES:
+        raise AudioProxyPreparationError(
+            f"Chalna audio proxy exceeds 2 GiB: size_bytes={size_bytes} path={proxy_path}"
+        )
+
+
+def _optional_int_value(value) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _update_source_derive_progress(db, job_id: str, completed: int, total: int) -> None:
@@ -2784,6 +2880,7 @@ def _transcribe_with_scribe_v2_cache(
     segmentation_boundary_rule: str,
     llm_log_path: Path | None = None,
     overlap_intervals_path: Path | None = None,
+    retry_failed_size_cache: bool = False,
 ) -> chalna.TranscriptionSrtResult:
     source = Path(source_path)
     source_size_bytes = int(project.get("source_size_bytes") or source.stat().st_size)
@@ -2825,7 +2922,15 @@ def _transcribe_with_scribe_v2_cache(
             raise RuntimeError(entry.get("error_message") or "Scribe V2 cache generation failed")
         _download_completed_scribe_cache(db, entry, raw_json_local, raw_srt_local)
     elif entry and entry.get("status") == "failed":
-        raise RuntimeError(entry.get("error_message") or "Scribe V2 cache entry is failed")
+        if retry_failed_size_cache and _is_chalna_file_size_cache_error(entry):
+            cache_owner = scribe_v2_cache.claim_failed_entry_for_retry(db, cache_key=cache_key) is not None
+            if not cache_owner:
+                entry = scribe_v2_cache.wait_for_running_entry(db, cache_key=cache_key)
+                if entry.get("status") != "completed":
+                    raise RuntimeError(entry.get("error_message") or "Scribe V2 cache generation failed")
+                _download_completed_scribe_cache(db, entry, raw_json_local, raw_srt_local)
+        else:
+            raise RuntimeError(entry.get("error_message") or "Scribe V2 cache entry is failed")
     else:
         cache_owner = scribe_v2_cache.create_running_entry(
             db,
@@ -2947,6 +3052,15 @@ def _download_completed_scribe_cache(
     r2.download_file(raw_json_key, str(raw_json_local))
     r2.download_file(raw_srt_key, str(raw_srt_local))
     scribe_v2_cache.record_cache_hit(db, entry)
+
+
+def _is_chalna_file_size_cache_error(entry: dict) -> bool:
+    error_message = str(entry.get("error_message") or "")
+    return (
+        "FileTooLargeError" in error_message
+        or '"error_code":"E1004"' in error_message
+        or "exceeds maximum allowed" in error_message
+    )
 
 
 def _download_reused_transcription_srt(

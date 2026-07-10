@@ -82,6 +82,28 @@ def create_running_entry(db, *, cache_key: str, params: ScribeV2CacheParams) -> 
     return data[0] if isinstance(data, list) and data else None
 
 
+def claim_failed_entry_for_retry(db, *, cache_key: str) -> dict | None:
+    """Atomically convert a failed cache row back to running for a retry owner."""
+    payload = {
+        "status": "running",
+        "raw_json_r2_key": None,
+        "raw_srt_r2_key": None,
+        "external_task_id": None,
+        "error_message": None,
+        "completed_at": None,
+        "last_used_at": "now()",
+    }
+    result = (
+        db.table("scribe_v2_cache_entries")
+        .update(payload)
+        .eq("cache_key", cache_key)
+        .eq("status", "failed")
+        .execute()
+    )
+    data = getattr(result, "data", None)
+    return data[0] if isinstance(data, list) and data else None
+
+
 def mark_cache_completed(
     db,
     *,

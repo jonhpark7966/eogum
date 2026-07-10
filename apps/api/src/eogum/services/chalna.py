@@ -97,7 +97,7 @@ def transcribe_to_srt(
         with source.open("rb") as file_obj:
             response = client.post(
                 f"{base_url}/transcribe/async",
-                files={"file": (source.name, file_obj, "application/octet-stream")},
+                files={"file": (source.name, file_obj, _source_content_type(source))},
                 data=form_data,
             )
 
@@ -435,7 +435,7 @@ def _submit_and_poll(
         with ExitStack() as stack:
             source_file = stack.enter_context(source.open("rb"))
             files: dict[str, Any] = {
-                "file": (source.name, source_file, "application/octet-stream"),
+                "file": (source.name, source_file, _source_content_type(source)),
             }
             if raw_json is not None:
                 raw_json_file = stack.enter_context(raw_json.open("rb"))
@@ -486,6 +486,12 @@ def _submit_and_poll(
                 raise ChalnaClientError(payload.get("error") or "Chalna transcription failed")
 
             time.sleep(poll_interval_seconds)
+
+
+def _source_content_type(source: Path) -> str:
+    if source.suffix.lower() == ".flac":
+        return "audio/flac"
+    return "application/octet-stream"
 
 
 def _coerce_result(value: Any) -> dict[str, Any]:

@@ -9,7 +9,8 @@ from typing import Callable
 
 
 FINAL_PREVIEW_PROFILE = "final_preview_v1"
-WEB_1080P_PROFILE = "web_1080p_v1"
+WEB_1080P_PROFILE = "web_1080p_v2"
+WEB_VIDEO_BITRATE_TOLERANCE_RATIO = 0.10
 
 
 def _run(command: list[str], *, timeout: int, description: str) -> subprocess.CompletedProcess[str]:
@@ -27,6 +28,16 @@ def _fraction_value(value: object) -> float | None:
         return float(numerator) / float(denominator) if separator else float(numerator)
     except (TypeError, ValueError, ZeroDivisionError):
         return None
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def probe_media(path: Path) -> dict:
@@ -51,7 +62,8 @@ def probe_media(path: Path) -> dict:
     if not video:
         raise RuntimeError(f"video stream not found in {path}")
 
-    duration_value = (payload.get("format") or {}).get("duration") or video.get("duration")
+    format_metadata = payload.get("format") or {}
+    duration_value = format_metadata.get("duration") or video.get("duration")
     try:
         duration_ms = int(round(float(duration_value) * 1000))
     except (TypeError, ValueError):
@@ -68,6 +80,22 @@ def probe_media(path: Path) -> dict:
     except (TypeError, ValueError):
         av_sync_diff_ms = None
 
+    overall_bitrate = _positive_int(format_metadata.get("bit_rate"))
+    audio_bitrate = _positive_int(audio.get("bit_rate")) if audio else None
+    video_bitrate = _positive_int(video.get("bit_rate"))
+    video_bitrate_estimated = False
+    if video_bitrate is None:
+        if overall_bitrate is None and duration_ms > 0:
+            overall_bitrate = int(round(path.stat().st_size * 8 * 1000 / duration_ms))
+        known_audio_bitrate = sum(
+            _positive_int(stream.get("bit_rate")) or 0
+            for stream in streams
+            if stream.get("codec_type") == "audio"
+        )
+        if overall_bitrate is not None and overall_bitrate > known_audio_bitrate:
+            video_bitrate = overall_bitrate - known_audio_bitrate
+            video_bitrate_estimated = True
+
     return {
         "duration_ms": duration_ms,
         "size_bytes": path.stat().st_size,
@@ -79,6 +107,10 @@ def probe_media(path: Path) -> dict:
         "height": int(video.get("height") or 0),
         "fps": _fraction_value(video.get("avg_frame_rate")) or _fraction_value(video.get("r_frame_rate")),
         "av_sync_diff_ms": av_sync_diff_ms,
+        "overall_bitrate": overall_bitrate,
+        "video_bitrate": video_bitrate,
+        "video_bitrate_estimated": video_bitrate_estimated,
+        "audio_bitrate": audio_bitrate,
     }
 
 
@@ -90,7 +122,12 @@ def has_audio_stream(path: Path) -> bool:
     return bool(probe_media(path)["has_audio"])
 
 
-def _encoding_args(profile: str, *, has_audio: bool) -> list[str]:
+def _encoding_args(
+    profile: str,
+    *,
+    has_audio: bool,
+    target_video_bitrate: int | None = None,
+) -> list[str]:
     if profile == FINAL_PREVIEW_PROFILE:
         args = [
             "-c:v",
@@ -109,6 +146,9 @@ def _encoding_args(profile: str, *, has_audio: bool) -> list[str]:
         return args
 
     if profile == WEB_1080P_PROFILE:
+        target_video_bitrate = _positive_int(target_video_bitrate)
+        if target_video_bitrate is None:
+            raise RuntimeError("source video bitrate is unavailable for web render")
         args = [
             "-vf",
             "scale=min(1920\\,iw):min(1080\\,ih):force_original_aspect_ratio=decrease:force_divisible_by=2",
@@ -116,8 +156,16 @@ def _encoding_args(profile: str, *, has_audio: bool) -> list[str]:
             "libx264",
             "-preset",
             "fast",
-            "-crf",
-            "21",
+            "-b:v",
+            str(target_video_bitrate),
+            "-minrate",
+            str(target_video_bitrate),
+            "-maxrate",
+            str(target_video_bitrate),
+            "-bufsize",
+            str(target_video_bitrate * 2),
+            "-x264-params",
+            "nal-hrd=cbr:force-cfr=0",
             "-pix_fmt",
             "yuv420p",
         ]
@@ -136,6 +184,7 @@ def validate_output(
     profile: str,
     expected_duration_ms: int | None = None,
     interval_count: int = 1,
+    expected_video_bitrate: int | None = None,
 ) -> dict:
     metadata = probe_media(output_path)
     if metadata["size_bytes"] <= 0:
@@ -152,6 +201,20 @@ def validate_output(
         if metadata["width"] > 1920 or metadata["height"] > 1080:
             raise RuntimeError(
                 f"rendered dimensions exceed 1080p profile: {metadata['width']}x{metadata['height']}"
+            )
+        if expected_video_bitrate is not None:
+            actual_video_bitrate = metadata.get("video_bitrate")
+            if actual_video_bitrate is None:
+                raise RuntimeError("rendered video bitrate is unavailable")
+            bitrate_delta_ratio = abs(actual_video_bitrate - expected_video_bitrate) / expected_video_bitrate
+            if bitrate_delta_ratio > WEB_VIDEO_BITRATE_TOLERANCE_RATIO:
+                raise RuntimeError(
+                    "rendered video bitrate differs from source target: "
+                    f"expected={expected_video_bitrate}bps actual={actual_video_bitrate}bps"
+                )
+            metadata["target_video_bitrate"] = expected_video_bitrate
+            metadata["video_bitrate_delta_percent"] = (
+                (actual_video_bitrate - expected_video_bitrate) / expected_video_bitrate * 100
             )
     if expected_duration_ms is not None:
         tolerance_ms = max(500, interval_count * 100)
@@ -177,6 +240,9 @@ def render_intervals(
     segment_dir.mkdir(parents=True, exist_ok=True)
     source_metadata = probe_media(source_path)
     has_audio = bool(source_metadata["has_audio"])
+    target_video_bitrate = (
+        source_metadata.get("video_bitrate") if profile == WEB_1080P_PROFILE else None
+    )
     valid_intervals = [(start, duration) for start, duration in intervals if duration > 0]
 
     segment_paths: list[Path] = []
@@ -200,7 +266,11 @@ def render_intervals(
         ]
         if has_audio:
             command += ["-map", "0:a:0"]
-        command += _encoding_args(profile, has_audio=has_audio)
+        command += _encoding_args(
+            profile,
+            has_audio=has_audio,
+            target_video_bitrate=target_video_bitrate,
+        )
         command += ["-movflags", "+faststart", str(segment_path)]
         _run(
             command,
@@ -260,4 +330,5 @@ def render_intervals(
         "version": 1,
         "intervals": manifest_intervals,
         "source": source_metadata,
+        "target_video_bitrate": target_video_bitrate,
     }

@@ -16,8 +16,8 @@ AI_SOURCE_JOB_TYPES = [
 ]
 AI_CUT_RENDER_TYPE = "ai_cut_render"
 AI_DECISION_MODE = "ai"
-WEB_RENDER_PROFILE = "web_1080p_v1"
-RENDER_VERSION = 1
+WEB_RENDER_PROFILE = "web_1080p_v2"
+RENDER_VERSION = 2
 REUSABLE_RENDER_STATUSES = ["pending", "queued", "running", "completed"]
 
 

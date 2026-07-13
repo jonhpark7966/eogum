@@ -2891,7 +2891,7 @@ def _render_ai_cut(project_id: str, job_id: str | None) -> None:
             db.table("jobs").update({"progress": progress}).eq("id", job_id).eq("status", "running").execute()
 
         output_path = output_dir / "main-source-ai-cut.mp4"
-        media_render.render_intervals(
+        render_manifest = media_render.render_intervals(
             source_path,
             intervals,
             output_path,
@@ -2904,6 +2904,7 @@ def _render_ai_cut(project_id: str, job_id: str | None) -> None:
             profile=media_render.WEB_1080P_PROFILE,
             expected_duration_ms=expected_duration_ms,
             interval_count=len(intervals),
+            expected_video_bitrate=render_manifest["target_video_bitrate"],
         )
         processing_metadata = {
             **(job.get("processing_metadata") or {}),
@@ -2920,6 +2921,12 @@ def _render_ai_cut(project_id: str, job_id: str | None) -> None:
             "height": rendered_metadata["height"],
             "fps": rendered_metadata["fps"],
             "av_sync_diff_ms": rendered_metadata["av_sync_diff_ms"],
+            "source_video_bitrate": source_metadata["video_bitrate"],
+            "source_video_bitrate_estimated": source_metadata["video_bitrate_estimated"],
+            "target_video_bitrate": rendered_metadata["target_video_bitrate"],
+            "output_video_bitrate": rendered_metadata["video_bitrate"],
+            "video_bitrate_delta_percent": rendered_metadata["video_bitrate_delta_percent"],
+            "video_bitrate_mode": "source_cbr",
         }
         db.table("jobs").update({
             "progress": 90,

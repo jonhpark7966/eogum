@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -477,7 +478,24 @@ def _make_fixture(
             "-i",
             f"sine=frequency=440:duration={duration}:sample_rate=48000",
         ]
-    command += ["-c:v", "libx264", "-pix_fmt", "yuv420p"]
+    command += [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-b:v",
+        "800k",
+        "-minrate",
+        "800k",
+        "-maxrate",
+        "800k",
+        "-bufsize",
+        "1600k",
+        "-x264-params",
+        "nal-hrd=cbr:force-cfr=0",
+        "-pix_fmt",
+        "yuv420p",
+    ]
     if with_audio:
         command += ["-c:a", "aac", "-shortest"]
     else:
@@ -491,7 +509,8 @@ def test_web_1080p_ffmpeg_render_profile(tmp_path: Path, with_audio: bool):
     output = tmp_path / "output.mp4"
     _make_fixture(source, with_audio=with_audio)
 
-    media_render.render_intervals(
+    source_metadata = media_render.probe_media(source)
+    manifest = media_render.render_intervals(
         source,
         [(0.0, 1.5), (2.5, 1.5)],
         output,
@@ -502,6 +521,7 @@ def test_web_1080p_ffmpeg_render_profile(tmp_path: Path, with_audio: bool):
         profile=media_render.WEB_1080P_PROFILE,
         expected_duration_ms=3000,
         interval_count=2,
+        expected_video_bitrate=source_metadata["video_bitrate"],
     )
 
     assert metadata["video_codec"] == "h264"
@@ -510,6 +530,10 @@ def test_web_1080p_ffmpeg_render_profile(tmp_path: Path, with_audio: bool):
     assert (metadata["width"], metadata["height"]) == (320, 180)
     assert metadata["fps"] == pytest.approx(24.0)
     assert metadata["duration_ms"] == pytest.approx(3000, abs=500)
+    assert manifest["target_video_bitrate"] == source_metadata["video_bitrate"]
+    assert metadata["video_bitrate"] == pytest.approx(source_metadata["video_bitrate"], rel=0.10)
+    assert metadata["target_video_bitrate"] == source_metadata["video_bitrate"]
+    assert abs(metadata["video_bitrate_delta_percent"]) <= 10
     if metadata["av_sync_diff_ms"] is not None:
         assert metadata["av_sync_diff_ms"] <= 200
 
@@ -532,3 +556,87 @@ def test_web_profile_downscales_to_1080p(tmp_path: Path):
     )
 
     assert (metadata["width"], metadata["height"]) == (1920, 1080)
+
+
+def test_web_profile_uses_source_bitrate_instead_of_crf():
+    args = media_render._encoding_args(
+        media_render.WEB_1080P_PROFILE,
+        has_audio=True,
+        target_video_bitrate=7_996_392,
+    )
+
+    assert "-crf" not in args
+    assert args[args.index("-b:v") + 1] == "7996392"
+    assert args[args.index("-minrate") + 1] == "7996392"
+    assert args[args.index("-maxrate") + 1] == "7996392"
+    assert args[args.index("-bufsize") + 1] == "15992784"
+    assert args[args.index("-x264-params") + 1] == "nal-hrd=cbr:force-cfr=0"
+
+
+def test_probe_media_estimates_missing_video_bitrate(monkeypatch, tmp_path: Path):
+    source = tmp_path / "missing-stream-bitrate.mp4"
+    source.write_bytes(b"x" * 1_250_000)
+    payload = {
+        "format": {"duration": "10.0"},
+        "streams": [
+            {
+                "codec_type": "video",
+                "codec_name": "h264",
+                "duration": "10.0",
+                "width": 1280,
+                "height": 720,
+                "avg_frame_rate": "30/1",
+            },
+            {
+                "codec_type": "audio",
+                "codec_name": "aac",
+                "duration": "10.0",
+                "channels": 2,
+                "bit_rate": "128000",
+            },
+        ],
+    }
+    monkeypatch.setattr(
+        media_render,
+        "_run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=json.dumps(payload)),
+    )
+
+    metadata = media_render.probe_media(source)
+
+    assert metadata["overall_bitrate"] == 1_000_000
+    assert metadata["audio_bitrate"] == 128_000
+    assert metadata["video_bitrate"] == 872_000
+    assert metadata["video_bitrate_estimated"] is True
+
+
+def test_web_profile_rejects_video_bitrate_drift(monkeypatch, tmp_path: Path):
+    output = tmp_path / "drifted.mp4"
+    output.write_bytes(b"video")
+    monkeypatch.setattr(
+        media_render,
+        "probe_media",
+        lambda _path: {
+            "size_bytes": output.stat().st_size,
+            "video_codec": "h264",
+            "audio_codec": "aac",
+            "audio_channels": 2,
+            "av_sync_diff_ms": 0,
+            "width": 1280,
+            "height": 720,
+            "video_bitrate": 700_000,
+            "duration_ms": 5000,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="video bitrate differs from source target"):
+        media_render.validate_output(
+            output,
+            profile=media_render.WEB_1080P_PROFILE,
+            expected_video_bitrate=8_000_000,
+        )
+
+
+def test_ai_cut_bitrate_policy_has_a_new_render_identity():
+    assert ai_cut_render.WEB_RENDER_PROFILE == media_render.WEB_1080P_PROFILE == "web_1080p_v2"
+    assert ai_cut_render.RENDER_VERSION == 2

@@ -150,6 +150,25 @@ def object_exists(r2_key: str) -> bool:
     return True
 
 
+def head_object(r2_key: str) -> dict | None:
+    """Return lightweight R2 object metadata, or ``None`` when absent."""
+    client = get_r2_client()
+    try:
+        response = client.head_object(Bucket=settings.r2_bucket_name, Key=r2_key)
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        status_code = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if code in {"404", "NoSuchKey", "NotFound"} or status_code == 404:
+            return None
+        raise
+    return {
+        "size_bytes": int(response.get("ContentLength") or 0),
+        "content_type": response.get("ContentType"),
+        "etag": response.get("ETag"),
+        "last_modified": response.get("LastModified"),
+    }
+
+
 def copy_object(source_r2_key: str, destination_r2_key: str, content_type: str | None = None) -> str:
     """Copy an object inside the configured R2 bucket."""
     client = get_r2_client()

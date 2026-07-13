@@ -6,7 +6,17 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from eogum.config import settings
-from eogum.routes import credits, downloads, evaluations, health, projects, sources, upload, youtube
+from eogum.routes import (
+    credits,
+    downloads,
+    evaluations,
+    health,
+    projects,
+    renders,
+    sources,
+    upload,
+    youtube,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -15,6 +25,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from eogum.services.job_runner import (
+        recover_stuck_ai_cut_renders,
         recover_stuck_final_previews,
         recover_stuck_projects,
         recover_stuck_source_derivatives,
@@ -34,6 +45,13 @@ async def lifespan(app: FastAPI):
             logger.info("Recovered %d stuck final-preview job(s) on startup", recovered_previews)
     except Exception:
         logger.exception("Startup final-preview recovery failed")
+
+    try:
+        recovered_ai_renders = recover_stuck_ai_cut_renders(recover_running=True)
+        if recovered_ai_renders:
+            logger.info("Recovered %d stuck AI-cut render job(s) on startup", recovered_ai_renders)
+    except Exception:
+        logger.exception("Startup AI-cut render recovery failed")
 
     try:
         recovered_derivatives = recover_stuck_source_derivatives(recover_running=True)
@@ -71,6 +89,7 @@ app.add_middleware(
 app.include_router(health.router, prefix="/api/v1")
 app.include_router(upload.router, prefix="/api/v1")
 app.include_router(projects.router, prefix="/api/v1")
+app.include_router(renders.router, prefix="/api/v1")
 app.include_router(sources.router, prefix="/api/v1")
 app.include_router(credits.router, prefix="/api/v1")
 app.include_router(downloads.router, prefix="/api/v1")

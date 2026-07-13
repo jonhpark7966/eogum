@@ -14,6 +14,7 @@ import {
   type CutType,
   type EditDecisionVersion,
   type SegmentationBoundaryRule,
+  type AiCutRenderJob,
 } from "@/lib/api";
 import { useUploads } from "@/lib/upload-provider";
 import { isPublicProjectId } from "@/lib/public-projects";
@@ -60,6 +61,7 @@ const JOB_TYPE_LABELS: Record<string, string> = {
   reprocess_multicam: "멀티캠 적용",
   cut_decision: "컷 결정 재실행",
   final_preview: "완성본 미리보기",
+  ai_cut_render: "AI 컷편집 영상",
   source_derive: "오디오 준비",
 };
 
@@ -546,7 +548,7 @@ function Section({ title, icon, children, className = "" }: {
 export default function ProjectDetailPage() {
   const params = useParams();
   const router = useRouter();
-  const supabase = createClient();
+  const supabase = useMemo(() => createClient(), []);
   const { tasks, startUpload, cancelUpload } = useUploads();
   const [project, setProject] = useState<ProjectDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -567,6 +569,11 @@ export default function ProjectDetailPage() {
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
   const [renaming, setRenaming] = useState(false);
+  const [aiCutRender, setAiCutRender] = useState<AiCutRenderJob | null>(null);
+  const [hasStaleAiCutRender, setHasStaleAiCutRender] = useState(false);
+  const [aiCutRenderLoading, setAiCutRenderLoading] = useState(false);
+  const [aiCutRenderInitialized, setAiCutRenderInitialized] = useState(false);
+  const [aiCutRenderError, setAiCutRenderError] = useState("");
 
   // Multicam state
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
@@ -614,6 +621,21 @@ export default function ProjectDetailPage() {
     setLoading(false);
   }, [projectId, router, supabase.auth]);
 
+  const loadAiCutRender = useCallback(async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    try {
+      const latest = await api.getLatestAiCutRender(session.access_token, projectId);
+      setAiCutRender(latest.current_job);
+      setHasStaleAiCutRender(latest.has_stale_render);
+      setAiCutRenderError("");
+    } catch (err) {
+      setAiCutRenderError(err instanceof Error ? err.message : "AI 컷편집 영상 상태를 불러오지 못했습니다");
+    } finally {
+      setAiCutRenderInitialized(true);
+    }
+  }, [projectId, supabase.auth]);
+
   useEffect(() => {
     loadProject();
     const interval = setInterval(() => {
@@ -631,6 +653,22 @@ export default function ProjectDetailPage() {
     }, 5000);
     return () => clearInterval(interval);
   }, [loadProject, project?.status, project?.multicam_state?.status, hasActiveSourceDerivatives, derivativePollingKey]);
+
+  useEffect(() => {
+    if (!project?.viewer_can_edit || project.status !== "completed") {
+      setAiCutRender(null);
+      setHasStaleAiCutRender(false);
+      setAiCutRenderInitialized(false);
+      return;
+    }
+    void loadAiCutRender();
+  }, [loadAiCutRender, project?.status, project?.viewer_can_edit]);
+
+  useEffect(() => {
+    if (!aiCutRender || !["pending", "queued", "running"].includes(aiCutRender.status)) return;
+    const interval = window.setInterval(() => void loadAiCutRender(), 3000);
+    return () => window.clearInterval(interval);
+  }, [aiCutRender, loadAiCutRender]);
 
   useEffect(() => {
     if (latestUploadTaskStatus === "completed") {
@@ -780,6 +818,37 @@ export default function ProjectDetailPage() {
       window.open(result.download_url, "_blank");
     } catch (err) {
       setError(err instanceof Error ? err.message : "다운로드 링크 생성에 실패했습니다");
+    }
+  };
+
+  const handleStartAiCutRender = async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    setAiCutRenderLoading(true);
+    setAiCutRenderError("");
+    try {
+      const job = await api.startAiCutRender(session.access_token, projectId);
+      setAiCutRender(job);
+    } catch (err) {
+      setAiCutRenderError(err instanceof Error ? err.message : "AI 컷편집 영상 생성에 실패했습니다");
+    } finally {
+      setAiCutRenderLoading(false);
+    }
+  };
+
+  const handleDownloadAiCutRender = async () => {
+    if (!aiCutRender?.download_ready) return;
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    setAiCutRenderLoading(true);
+    setAiCutRenderError("");
+    try {
+      const result = await api.downloadAiCutRender(session.access_token, projectId, aiCutRender.job_id);
+      window.open(result.download_url, "_blank", "noopener,noreferrer");
+    } catch (err) {
+      setAiCutRenderError(err instanceof Error ? err.message : "다운로드 링크 생성에 실패했습니다");
+    } finally {
+      setAiCutRenderLoading(false);
     }
   };
 
@@ -997,7 +1066,8 @@ export default function ProjectDetailPage() {
     && !isUploadingExtraSources
     && !["queued", "running", "canceling"].includes(multicamStatus);
   const canCancelMulticam = ["queued", "running", "canceling"].includes(multicamStatus);
-  const canDeleteProject = !isProcessing && !isUploadingExtraSources && !canCancelMulticam;
+  const aiCutRenderActive = Boolean(aiCutRender && ["pending", "queued", "running"].includes(aiCutRender.status));
+  const canDeleteProject = !isProcessing && !isUploadingExtraSources && !canCancelMulticam && !aiCutRenderActive;
   const scribeV2CacheHit = hasScribeV2CacheHit(project);
   const showCacheReuseInfo = sourceCacheReused || scribeV2CacheHit;
   const visibleProcessingJobs = getVisibleProcessingJobs(project);
@@ -1364,6 +1434,72 @@ export default function ProjectDetailPage() {
             title={viewerCanEdit ? "다운로드" : "보기"}
             icon={<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>}
           >
+            {viewerCanEdit && (
+              <div className="mb-5 rounded-xl border border-cyan-400/15 bg-gradient-to-r from-cyan-500/[0.07] to-violet-500/[0.04] p-4">
+                <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-lg">✂️</span>
+                      <p className="text-sm font-semibold text-gray-100">AI 컷편집 영상</p>
+                    </div>
+                    <p className="mt-1 text-xs text-gray-500">메인 소스 기준 · 멀티캠 미포함</p>
+                    {!aiCutRenderInitialized && !aiCutRenderError && (
+                      <p className="mt-2 text-xs text-gray-400">상태 확인 중...</p>
+                    )}
+                    {aiCutRenderInitialized && aiCutRenderActive && aiCutRender && (
+                      <p className="mt-2 text-xs text-cyan-300">생성 중 · {Math.round(aiCutRender.progress)}%</p>
+                    )}
+                    {aiCutRender?.status === "completed" && aiCutRender.download_ready && (
+                      <p className="mt-2 text-xs text-emerald-300">
+                        다운로드 준비됨
+                        {aiCutRender.duration_ms !== null ? ` · ${formatDuration(Math.round(aiCutRender.duration_ms / 1000))}` : ""}
+                        {aiCutRender.size_bytes !== null ? ` · ${formatSize(aiCutRender.size_bytes)}` : ""}
+                      </p>
+                    )}
+                    {aiCutRender?.status === "failed" && (
+                      <p className="mt-2 text-xs text-red-300">
+                        생성 실패{aiCutRender.error_message ? ` · ${aiCutRender.error_message}` : ""}
+                      </p>
+                    )}
+                    {!aiCutRender && aiCutRenderInitialized && hasStaleAiCutRender && (
+                      <p className="mt-2 text-xs text-amber-300">AI 컷 결정이 변경되었습니다. 새 버전을 생성해 주세요.</p>
+                    )}
+                    {aiCutRenderError && <p className="mt-2 text-xs text-red-300">{aiCutRenderError}</p>}
+                  </div>
+                  <button
+                    onClick={() => {
+                      if (aiCutRender?.download_ready) void handleDownloadAiCutRender();
+                      else void handleStartAiCutRender();
+                    }}
+                    disabled={!aiCutRenderInitialized || aiCutRenderLoading || aiCutRenderActive}
+                    className="shrink-0 rounded-lg border border-cyan-400/20 bg-cyan-400/10 px-4 py-2 text-sm font-medium text-cyan-200 transition hover:bg-cyan-400/20 disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    {!aiCutRenderInitialized
+                      ? "확인 중..."
+                      : aiCutRenderLoading
+                        ? "처리 중..."
+                        : aiCutRenderActive
+                          ? `생성 중 ${Math.round(aiCutRender?.progress ?? 0)}%`
+                          : aiCutRender?.download_ready
+                            ? "다운로드"
+                            : aiCutRender?.status === "failed"
+                              ? "재시도"
+                              : hasStaleAiCutRender
+                                ? "새 버전 생성"
+                                : "생성하기"}
+                  </button>
+                </div>
+                {aiCutRenderActive && aiCutRender && (
+                  <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
+                    <div
+                      className="h-full rounded-full bg-gradient-to-r from-cyan-400 to-violet-400 transition-all duration-500"
+                      style={{ width: `${Math.min(100, Math.max(0, aiCutRender.progress))}%` }}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Main downloads */}
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-4">
               {viewerCanEdit && downloadItems.map(({ key, label, icon, desc }) => (

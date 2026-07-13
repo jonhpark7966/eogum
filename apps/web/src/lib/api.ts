@@ -161,6 +161,26 @@ export interface DownloadResponse {
   filename: string;
 }
 
+export interface AiCutRenderJob {
+  job_id: string;
+  status: string;
+  progress: number;
+  error_message: string | null;
+  source_job_id: string | null;
+  render_profile: string;
+  duration_ms: number | null;
+  size_bytes: number | null;
+  download_ready: boolean;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface AiCutRenderLatestResponse {
+  current_job: AiCutRenderJob | null;
+  has_stale_render: boolean;
+}
+
 export interface SourceLookupResponse {
   hit: boolean;
   r2_key: string | null;
@@ -525,6 +545,20 @@ export const api = {
       `/projects/${projectId}/download/extra-source/${index}`,
       token
     ),
+
+  startAiCutRender: (token: string, projectId: string) =>
+    apiFetch<AiCutRenderJob>(`/projects/${projectId}/renders/ai-cut`, token, {
+      method: "POST",
+    }),
+
+  getLatestAiCutRender: (token: string, projectId: string) =>
+    apiFetch<AiCutRenderLatestResponse>(`/projects/${projectId}/renders/ai-cut/latest`, token),
+
+  getAiCutRender: (token: string, projectId: string, jobId: string) =>
+    apiFetch<AiCutRenderJob>(`/projects/${projectId}/renders/${jobId}`, token),
+
+  downloadAiCutRender: (token: string, projectId: string, jobId: string) =>
+    apiFetch<DownloadResponse>(`/projects/${projectId}/renders/${jobId}/download`, token),
 
   // Evaluations
   getSegments: (token: string | null | undefined, projectId: string) =>

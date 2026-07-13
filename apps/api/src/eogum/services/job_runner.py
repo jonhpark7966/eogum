@@ -13,10 +13,12 @@ import xml.etree.ElementTree as ET
 
 from eogum.config import settings
 from eogum.services import (
+    ai_cut_render,
     avid,
     chalna,
     credit,
     email,
+    media_render,
     overlap_protection as overlap_detection,
     overlap_speaker_mapping,
     r2,
@@ -104,6 +106,11 @@ def enqueue_final_preview(project_id: str, job_id: str) -> None:
     _enqueue("final_preview", project_id, job_id)
 
 
+def enqueue_ai_cut_render(project_id: str, job_id: str) -> None:
+    """Add an AI-only MP4 render to the shared CPU render lane."""
+    _enqueue("ai_cut_render", project_id, job_id)
+
+
 def enqueue_source_derive(project_id: str, job_id: str) -> None:
     """Add source-derivative generation task to queue."""
     _enqueue("source_derive", project_id, job_id)
@@ -116,7 +123,7 @@ def _lane_for_kind(kind: str) -> str:
         return "source_derive"
     if kind == "cut_decision":
         return "cut_decision"
-    if kind == "final_preview":
+    if kind in {"final_preview", "ai_cut_render"}:
         return "final_preview"
     return "project"
 
@@ -129,6 +136,9 @@ def _enqueue(kind: str, project_id: str, job_id: str | None) -> None:
 
 
 def _lane_worker_limit(lane: str) -> int:
+    if lane == "final_preview":
+        # Both preview and durable MP4 renders execute FFmpeg in this lane.
+        return 1
     value = getattr(settings, _worker_limit_settings[lane], 1)
     try:
         return max(1, int(value))
@@ -167,6 +177,8 @@ def _worker_loop(lane: str) -> None:
                 _cut_decision_project(project_id, item["job_id"])
             elif item["kind"] == "final_preview":
                 _render_final_preview(project_id, item["job_id"])
+            elif item["kind"] == "ai_cut_render":
+                _render_ai_cut(project_id, item["job_id"])
             else:
                 _process_project(project_id, item["job_id"])
         except Exception:
@@ -303,6 +315,52 @@ def recover_stuck_final_previews(*, recover_running: bool = False) -> int:
     return recovered
 
 
+def recover_stuck_ai_cut_renders(*, recover_running: bool = False) -> int:
+    """Requeue durable AI-cut renders after restart or a stale worker."""
+    db = get_db()
+    jobs = (
+        db.table("jobs")
+        .select("id,project_id,status,started_at,created_at")
+        .eq("type", ai_cut_render.AI_CUT_RENDER_TYPE)
+        .in_("status", _incomplete_job_statuses)
+        .order("created_at")
+        .execute()
+        .data
+        or []
+    )
+
+    recovered = 0
+    for job in jobs:
+        try:
+            if job["status"] == "running":
+                if not _should_recover_running_job(job, recover_running):
+                    continue
+                reset = (
+                    db.table("jobs")
+                    .update({
+                        "status": "pending",
+                        "error_message": None,
+                        "started_at": None,
+                        "completed_at": None,
+                    })
+                    .eq("id", job["id"])
+                    .eq("status", "running")
+                    .execute()
+                )
+                if not reset.data:
+                    continue
+            enqueue_ai_cut_render(job["project_id"], job["id"])
+            recovered += 1
+            logger.info(
+                "Requeued stuck AI-cut render %s for project %s",
+                job["id"],
+                job["project_id"],
+            )
+        except Exception:
+            logger.exception("Failed to recover AI-cut render %s", job.get("id"))
+    return recovered
+
+
 def recover_stuck_source_derivatives(*, recover_running: bool = False) -> int:
     """Requeue source-derive jobs that were left behind by a process restart."""
     db = get_db()
@@ -353,6 +411,9 @@ def start_stuck_project_sweeper(interval_seconds: int = 60) -> threading.Event:
                 recovered_previews = recover_stuck_final_previews(recover_running=False)
                 if recovered_previews:
                     logger.info("Recovered %d stuck final-preview job(s)", recovered_previews)
+                recovered_ai_renders = recover_stuck_ai_cut_renders(recover_running=False)
+                if recovered_ai_renders:
+                    logger.info("Recovered %d stuck AI-cut render job(s)", recovered_ai_renders)
                 recovered_derivatives = recover_stuck_source_derivatives(recover_running=False)
                 if recovered_derivatives:
                     logger.info("Recovered %d stuck source-derive job(s)", recovered_derivatives)
@@ -2401,48 +2462,6 @@ def _final_preview_intervals_from_project_json(project_json_path: Path) -> list[
     ]
 
 
-def _has_audio_stream(source_path: Path) -> bool:
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=index",
-            "-of",
-            "csv=p=0",
-            str(source_path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    return result.returncode == 0 and bool(result.stdout.strip())
-
-
-def _probe_duration_ms(path: Path) -> int:
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"ffprobe duration failed for {path}: {result.stderr[-500:]}")
-    return int(round(float(result.stdout.strip()) * 1000))
-
-
 def _render_intervals(source_path: Path, intervals: list[tuple[float, float]], output_path: Path) -> dict:
     """Render keep intervals without building one large ffmpeg filter graph.
 
@@ -2450,103 +2469,16 @@ def _render_intervals(source_path: Path, intervals: list[tuple[float, float]], o
     can consume tens of GB for ordinary review timelines. Render each interval
     independently, then concatenate the normalized segment files.
     """
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    segment_dir = output_path.parent / f"{output_path.stem}_segments"
-    segment_dir.mkdir(parents=True, exist_ok=True)
-    has_audio = _has_audio_stream(source_path)
-
-    segment_paths: list[Path] = []
-    manifest_intervals: list[dict] = []
-    preview_cursor_ms = 0
-    for index, (start, duration) in enumerate(intervals):
-        if duration <= 0:
-            continue
-
-        segment_path = segment_dir / f"segment_{index:04d}.mp4"
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-nostdin",
-            "-y",
-            "-ss",
-            f"{max(0.0, start):.6f}",
-            "-i",
-            str(source_path),
-            "-t",
-            f"{duration:.6f}",
-            "-map",
-            "0:v:0",
-        ]
-        if has_audio:
-            cmd += ["-map", "0:a:0"]
-        cmd += [
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "28",
-            "-pix_fmt",
-            "yuv420p",
-        ]
-        if has_audio:
-            cmd += ["-c:a", "aac", "-b:a", "128k", "-ac", "2"]
-        else:
-            cmd += ["-an"]
-        cmd += ["-movflags", "+faststart", str(segment_path)]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"final preview segment render failed at interval {index + 1}/{len(intervals)} "
-                f"(start={start:.3f}s, duration={duration:.3f}s): {result.stderr[-1000:]}"
-            )
-        actual_duration_ms = _probe_duration_ms(segment_path)
-        source_start_ms = int(round(start * 1000))
-        requested_duration_ms = int(round(duration * 1000))
-        source_end_ms = source_start_ms + requested_duration_ms
-        manifest_intervals.append({
-            "source_start_ms": source_start_ms,
-            "source_end_ms": source_end_ms,
-            "requested_duration_ms": requested_duration_ms,
-            "actual_duration_ms": actual_duration_ms,
-            "preview_start_ms": preview_cursor_ms,
-            "preview_end_ms": preview_cursor_ms + actual_duration_ms,
-        })
-        preview_cursor_ms += actual_duration_ms
-        segment_paths.append(segment_path)
-
-    if not segment_paths:
-        raise RuntimeError("미리보기로 렌더링할 keep 구간이 없습니다")
-
-    concat_list = output_path.with_suffix(".concat.txt")
-    concat_list.write_text(
-        "\n".join(f"file '{str(path).replace(chr(39), chr(92) + chr(39))}'" for path in segment_paths),
-        encoding="utf-8",
+    manifest = media_render.render_intervals(
+        source_path,
+        intervals,
+        output_path,
+        profile=media_render.FINAL_PREVIEW_PROFILE,
     )
-
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-nostdin",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(concat_list),
-        "-c",
-        "copy",
-        "-movflags",
-        "+faststart",
-        str(output_path),
-    ]
-
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
-    if result.returncode != 0:
-        raise RuntimeError(f"final preview concat failed: {result.stderr[-1000:]}")
-    return {"version": 1, "intervals": manifest_intervals}
+    return {
+        "version": manifest["version"],
+        "intervals": manifest["intervals"],
+    }
 
 
 def _burn_subtitles(input_path: Path, srt_path: Path | None, output_path: Path) -> None:
@@ -2835,6 +2767,197 @@ def _render_final_preview(project_id: str, job_id: str | None) -> None:
             "error_message": str(exc)[:1000],
             "completed_at": "now()",
         }).eq("id", job_id).execute()
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _complete_recovered_ai_cut_upload(db, job: dict) -> bool:
+    """Complete a job whose deterministic upload survived a worker crash."""
+    metadata = job.get("processing_metadata") or {}
+    output_key = metadata.get("output_r2_key")
+    expected_size = _int_value(metadata.get("size_bytes"))
+    duration_ms = _int_value(metadata.get("duration_ms"))
+    if not output_key or expected_size is None or expected_size <= 0 or duration_ms is None:
+        return False
+
+    remote = r2.head_object(output_key)
+    if not remote or remote.get("size_bytes") != expected_size:
+        return False
+
+    completed = (
+        db.table("jobs")
+        .update({
+            "status": "completed",
+            "progress": 100,
+            "result_r2_keys": {"video": output_key},
+            "completed_at": "now()",
+        })
+        .eq("id", job["id"])
+        .eq("status", "running")
+        .execute()
+    )
+    return bool(completed.data)
+
+
+def _render_ai_cut(project_id: str, job_id: str | None) -> None:
+    """Render the current AI-only edit of the primary source to durable R2."""
+    import shutil
+
+    if not job_id:
+        raise RuntimeError("AI-cut render job_id is required")
+
+    db = get_db()
+    temp_dir = settings.avid_temp_dir / f"ai_cut_render_{project_id}_{job_id[:8]}"
+    try:
+        job = db.table("jobs").select("*").eq("id", job_id).single().execute().data
+        if not job:
+            raise RuntimeError("AI-cut render job not found")
+        if job.get("status") in {"completed", "canceled"}:
+            return
+
+        claimed = (
+            db.table("jobs")
+            .update({
+                "status": "running",
+                "progress": 5,
+                "error_message": None,
+                "started_at": "now()",
+                "completed_at": None,
+            })
+            .eq("id", job_id)
+            .eq("project_id", project_id)
+            .eq("type", ai_cut_render.AI_CUT_RENDER_TYPE)
+            .in_("status", ["pending", "queued"])
+            .execute()
+        )
+        if not claimed.data:
+            logger.info("AI-cut render %s was already claimed or finished", job_id)
+            return
+
+        job = {**job, **claimed.data[0]}
+        if _complete_recovered_ai_cut_upload(db, job):
+            logger.info("Recovered completed AI-cut upload for job %s", job_id)
+            return
+
+        project = db.table("projects").select("*").eq("id", project_id).single().execute().data
+        if not project:
+            raise RuntimeError("프로젝트를 찾을 수 없습니다")
+        if not project.get("source_r2_key"):
+            raise RuntimeError("메인 소스가 없습니다")
+
+        source_job_id = job.get("source_job_id")
+        source_job = (
+            db.table("jobs")
+            .select("id,type,status,result_r2_keys,created_at")
+            .eq("id", source_job_id)
+            .eq("project_id", project_id)
+            .single()
+            .execute()
+            .data
+        )
+        if (
+            not source_job
+            or source_job.get("status") != "completed"
+            or source_job.get("type") not in ai_cut_render.AI_SOURCE_JOB_TYPES
+        ):
+            raise RuntimeError("완료된 AI 기준 작업을 찾을 수 없습니다")
+        project_json_key = (source_job.get("result_r2_keys") or {}).get("project_json")
+        if not project_json_key:
+            raise RuntimeError("AI 기준 작업에 프로젝트 JSON이 없습니다")
+
+        expected_dedupe = ai_cut_render.render_dedupe_key(project, source_job)
+        if job.get("dedupe_key") != expected_dedupe:
+            raise RuntimeError("AI-cut render input identity changed")
+        output_key = ai_cut_render.output_r2_key(project_id, expected_dedupe)
+
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = temp_dir / "output"
+        output_dir.mkdir(exist_ok=True)
+        project_json_path = temp_dir / "source.project.avid.json"
+        project_json_path.write_bytes(r2.download_to_bytes(project_json_key))
+        project_data = json.loads(project_json_path.read_text(encoding="utf-8"))
+
+        source_path = _get_cached_source_video(project, temp_dir)
+        source_metadata = media_render.probe_media(source_path)
+        db.table("jobs").update({"progress": 20}).eq("id", job_id).eq("status", "running").execute()
+
+        intervals = ai_cut_render.keep_intervals(project_data, source_metadata["duration_ms"])
+        if not intervals:
+            raise RuntimeError("AI 컷편집 영상으로 렌더링할 keep 구간이 없습니다")
+        db.table("jobs").update({"progress": 25}).eq("id", job_id).eq("status", "running").execute()
+
+        def update_render_progress(fraction: float) -> None:
+            progress = min(85, max(25, int(round(25 + fraction * 60))))
+            db.table("jobs").update({"progress": progress}).eq("id", job_id).eq("status", "running").execute()
+
+        output_path = output_dir / "main-source-ai-cut.mp4"
+        media_render.render_intervals(
+            source_path,
+            intervals,
+            output_path,
+            profile=media_render.WEB_1080P_PROFILE,
+            progress_callback=update_render_progress,
+        )
+        expected_duration_ms = sum(int(round(duration * 1000)) for _start, duration in intervals)
+        rendered_metadata = media_render.validate_output(
+            output_path,
+            profile=media_render.WEB_1080P_PROFILE,
+            expected_duration_ms=expected_duration_ms,
+            interval_count=len(intervals),
+        )
+        processing_metadata = {
+            **(job.get("processing_metadata") or {}),
+            "decision_mode": ai_cut_render.AI_DECISION_MODE,
+            "render_profile": ai_cut_render.WEB_RENDER_PROFILE,
+            "render_version": ai_cut_render.RENDER_VERSION,
+            "output_r2_key": output_key,
+            "duration_ms": rendered_metadata["duration_ms"],
+            "size_bytes": rendered_metadata["size_bytes"],
+            "video_codec": rendered_metadata["video_codec"],
+            "audio_codec": rendered_metadata["audio_codec"],
+            "audio_channels": rendered_metadata["audio_channels"],
+            "width": rendered_metadata["width"],
+            "height": rendered_metadata["height"],
+            "fps": rendered_metadata["fps"],
+            "av_sync_diff_ms": rendered_metadata["av_sync_diff_ms"],
+        }
+        db.table("jobs").update({
+            "progress": 90,
+            "processing_metadata": processing_metadata,
+        }).eq("id", job_id).eq("status", "running").execute()
+
+        db.table("jobs").update({"progress": 95}).eq("id", job_id).eq("status", "running").execute()
+        r2.upload_file(str(output_path), output_key, "video/mp4")
+        completed = (
+            db.table("jobs")
+            .update({
+                "status": "completed",
+                "progress": 100,
+                "result_r2_keys": {"video": output_key},
+                "completed_at": "now()",
+            })
+            .eq("id", job_id)
+            .eq("status", "running")
+            .execute()
+        )
+        if not completed.data:
+            raise RuntimeError("AI-cut render completion state changed")
+        logger.info("AI-cut render completed for project %s", project_id)
+    except Exception as exc:
+        logger.exception("AI-cut render failed for project %s", project_id)
+        try:
+            recovery_job = db.table("jobs").select("*").eq("id", job_id).maybe_single().execute().data
+            if recovery_job and recovery_job.get("status") == "running":
+                if _complete_recovered_ai_cut_upload(db, recovery_job):
+                    logger.info("Recovered AI-cut upload while handling job %s failure", job_id)
+                    return
+        except Exception:
+            logger.exception("Failed to verify AI-cut upload after job %s error", job_id)
+        db.table("jobs").update({
+            "status": "failed",
+            "error_message": str(exc)[:1000],
+            "completed_at": "now()",
+        }).eq("id", job_id).in_("status", ["pending", "queued", "running"]).execute()
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 

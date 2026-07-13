@@ -256,6 +256,10 @@ def _sanitize_public_project_detail(project: dict) -> dict:
         public_job = dict(job)
         public_job["external_task_ids"] = {}
         public_job["result_r2_keys"] = None
+        if public_job.get("type") == "ai_cut_render":
+            metadata = dict(public_job.get("processing_metadata") or {})
+            metadata.pop("output_r2_key", None)
+            public_job["processing_metadata"] = metadata
         public_jobs.append(public_job)
     public_project["jobs"] = public_jobs
     return public_project
@@ -1366,7 +1370,7 @@ def delete_project(project_id: str, current_user: CurrentUser = Depends(get_curr
         db.table("jobs")
         .select("id")
         .eq("project_id", project_id)
-        .in_("status", ["pending", "running", "cancel_requested"])
+        .in_("status", ["queued", "pending", "running", "cancel_requested"])
         .limit(1)
         .execute()
     )
@@ -1384,11 +1388,15 @@ def delete_project(project_id: str, current_user: CurrentUser = Depends(get_curr
         else:
             r2_keys.append(source_r2_key)
     r2_keys.extend(src.get("r2_key") for src in (project_data.get("extra_sources") or []))
-    jobs = db.table("jobs").select("result_r2_keys").eq("project_id", project_id).execute()
+    jobs = db.table("jobs").select("type,result_r2_keys,processing_metadata").eq("project_id", project_id).execute()
     for job in jobs.data or []:
         for key in (job.get("result_r2_keys") or {}).values():
             if isinstance(key, str):
                 r2_keys.append(key)
+        if job.get("type") == "ai_cut_render":
+            output_key = (job.get("processing_metadata") or {}).get("output_r2_key")
+            if isinstance(output_key, str):
+                r2_keys.append(output_key)
     try:
         delete_objects([key for key in r2_keys if key])
     except Exception:

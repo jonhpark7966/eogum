@@ -247,6 +247,26 @@ class FinalPreviewJobResponse(BaseModel):
     duration_ms: int | None = None
 
 
+class AiCutRenderJobResponse(BaseModel):
+    job_id: str
+    status: str
+    progress: int
+    error_message: str | None = None
+    source_job_id: str | None = None
+    render_profile: str
+    duration_ms: int | None = None
+    size_bytes: int | None = None
+    download_ready: bool = False
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class AiCutRenderLatestResponse(BaseModel):
+    current_job: AiCutRenderJobResponse | None = None
+    has_stale_render: bool = False
+
+
 # ── Eval Report ──
 class ConfusionMatrix(BaseModel):
     tp: int  # AI=cut, truth=cut (correct cut)

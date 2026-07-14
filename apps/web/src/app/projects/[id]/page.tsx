@@ -563,6 +563,7 @@ export default function ProjectDetailPage() {
   const [variantSegmentationBoundaryRule, setVariantSegmentationBoundaryRule] =
     useState<SegmentationBoundaryRule>("word_boundary");
   const [variantOverlapProtectionEnabled, setVariantOverlapProtectionEnabled] = useState(false);
+  const [variantJunctionAuditEnabled, setVariantJunctionAuditEnabled] = useState(true);
   const [creatingVariant, setCreatingVariant] = useState(false);
   const [sourceCacheReused, setSourceCacheReused] = useState(false);
   const [sessionUserId, setSessionUserId] = useState<string | null>(null);
@@ -985,6 +986,11 @@ export default function ProjectDetailPage() {
       normalizeSegmentationBoundaryRule(project.settings?.segmentation_boundary_rule)
     );
     setVariantOverlapProtectionEnabled(project.settings?.overlap_protection_enabled === true);
+    setVariantJunctionAuditEnabled(
+      typeof project.settings?.junction_audit_enabled === "boolean"
+        ? project.settings.junction_audit_enabled
+        : true
+    );
     setVariantModalOpen(true);
     setError("");
   };
@@ -1001,6 +1007,7 @@ export default function ProjectDetailPage() {
         edit_decision_version: variantEditDecisionVersion,
         segmentation_boundary_rule: variantSegmentationBoundaryRule,
         overlap_protection_enabled: variantOverlapProtectionEnabled,
+        junction_audit_enabled: variantJunctionAuditEnabled,
       });
       router.push("/projects/" + variant.id);
     } catch (err) {
@@ -1047,6 +1054,9 @@ export default function ProjectDetailPage() {
   const currentEditDecisionVersionLabel = EDIT_DECISION_VERSION_LABELS[currentEditDecisionVersion];
   const currentBoundaryRule = normalizeSegmentationBoundaryRule(project.settings?.segmentation_boundary_rule);
   const currentBoundaryRuleLabel = SEGMENTATION_BOUNDARY_RULE_LABELS[currentBoundaryRule];
+  const currentJunctionAuditEnabled = typeof project.settings?.junction_audit_enabled === "boolean"
+    ? project.settings.junction_audit_enabled
+    : true;
   const segmentationDisplay = getSegmentationDisplay(project);
   const boundaryRuleDisplay = getBoundaryRuleDisplay(project);
   const overlapProtectionDisplay = getOverlapProtectionDisplay(project);
@@ -1122,6 +1132,9 @@ export default function ProjectDetailPage() {
       : []),
     ...(latestResultKeys.overlap_protection
       ? [{ key: "overlap_protection", label: "겹침 보호 JSON", icon: "⧉", desc: "overlap detector 결과" }]
+      : []),
+    ...(latestResultKeys.junction_audit
+      ? [{ key: "junction_audit", label: "연결부 검토 JSON", icon: "↔", desc: "Junction Auditor 입력·응답·적용 결과" }]
       : []),
     ...(latestResultKeys.llm_io_log
       ? [{ key: "llm_io_log", label: "LLM 로그", icon: "🧾", desc: "프롬프트/응답 JSONL" }]
@@ -1897,6 +1910,7 @@ export default function ProjectDetailPage() {
               현재 강도: <span className="font-medium text-cyan-300">{currentEditIntensityLabel}</span><br />
               현재 Edit Decision: <span className="font-medium text-violet-300">{currentEditDecisionVersionLabel}</span><br />
               현재 Boundary: <span className="font-medium text-emerald-300">{currentBoundaryRuleLabel}</span><br />
+              현재 연결부 자동 검토: <span className="font-medium text-cyan-300">{currentJunctionAuditEnabled ? "사용" : "사용 안 함"}</span><br />
               새 버전은 전사 캐시를 재사용하고 편집 판단을 다시 실행합니다.
             </div>
             <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-3">
@@ -1957,6 +1971,19 @@ export default function ProjectDetailPage() {
               새 프로젝트 이름: <span className="text-gray-300">{project.name} - {EDIT_INTENSITY_LABELS[variantIntensity]} YYYYMMDD-HHMMSS</span><br />
               같은 강도를 선택해도 새 edit decision을 생성합니다.
             </div>
+            <label className="mt-4 flex items-center justify-between gap-4 rounded-xl border border-white/[0.06] bg-white/[0.025] px-4 py-3 text-sm">
+              <span>
+                <span className="block font-medium text-gray-200">연결부 자동 검토</span>
+                <span className="block text-xs leading-5 text-gray-500">Edit Decision을 다시 판단하지 않고, CUT 제거 결과가 명백히 부자연스러운 경우에만 최소 복구합니다.</span>
+              </span>
+              <input
+                type="checkbox"
+                checked={variantJunctionAuditEnabled}
+                onChange={(event) => setVariantJunctionAuditEnabled(event.currentTarget.checked)}
+                disabled={creatingVariant}
+                className="h-4 w-4 accent-cyan-400 disabled:opacity-50"
+              />
+            </label>
             <label className="mt-4 flex items-center justify-between gap-4 rounded-xl border border-white/[0.06] bg-white/[0.025] px-4 py-3 text-sm">
               <span>
                 <span className="block font-medium text-gray-200">겹치는 구간 보호</span>

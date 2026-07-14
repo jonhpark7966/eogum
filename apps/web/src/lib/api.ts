@@ -480,6 +480,7 @@ export const api = {
       edit_decision_version?: EditDecisionVersion;
       segmentation_boundary_rule?: SegmentationBoundaryRule;
       overlap_protection_enabled?: boolean;
+      junction_audit_enabled?: boolean;
       name?: string;
     }
   ) =>

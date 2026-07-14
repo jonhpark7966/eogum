@@ -136,6 +136,13 @@ function junctionRepairMetadata(seg: EvalSegment): Record<string, unknown> | nul
   return repair && typeof repair === "object" ? repair as Record<string, unknown> : null;
 }
 
+function isLlmJunctionRestore(seg: EvalSegment): boolean {
+  const repair = junctionRepairMetadata(seg);
+  return repair?.type === "llm_junction_restore"
+    && repair.original_action === "cut"
+    && repair.repaired_to === "keep";
+}
+
 function effectiveAiDecision(ai: EvalSegment["ai"]): EvalSegment["ai"] {
   if (!ai) return ai;
   const repair = ai.junction_repair;
@@ -164,7 +171,7 @@ function effectiveAiDecision(ai: EvalSegment["ai"]): EvalSegment["ai"] {
 function junctionRepairTitle(metadata: Record<string, unknown>): string {
   const linked = stringListValue(metadata.linked_segment_indices);
   return [
-    "AI 자동 보정",
+    metadata.type === "llm_junction_restore" ? "연결부 복구" : "AI 자동 보정",
     metadata.type ? `type=${String(metadata.type)}` : null,
     `${String(metadata.original_action ?? metadata.repaired_from ?? "unknown").toUpperCase()} -> ${String(metadata.repaired_to ?? "unknown").toUpperCase()}`,
     linked ? `linked=${linked}` : null,
@@ -198,7 +205,7 @@ function overlapProtectionBadgeTitle(metadata: Record<string, unknown>): string 
 
 type ReviewMetadata = Pick<
   EvaluationSavePayload,
-  "schema_version" | "review_scope" | "join_strategy"
+  "schema_version" | "review_scope" | "join_strategy" | "stats"
 >;
 
 type SegmentRowOptions = {
@@ -226,6 +233,7 @@ export default function ReviewPage() {
     schema_version: null,
     review_scope: null,
     join_strategy: null,
+    stats: null,
   });
   const [currentIndex, setCurrentIndex] = useState(-1);
   const [dirty, setDirty] = useState(false);
@@ -248,6 +256,8 @@ export default function ReviewPage() {
   const [finalPreviewTimelineMap, setFinalPreviewTimelineMap] =
     useState<FinalPreviewTimelineMap | null>(null);
   const [showJunctionOnly, setShowJunctionOnly] = useState(false);
+  const [showRestoredOnly, setShowRestoredOnly] = useState(false);
+  const [showRepairList, setShowRepairList] = useState(false);
   const [gapFilterInputMs, setGapFilterInputMs] = useState("");
   const [selectedSegmentIndexes, setSelectedSegmentIndexes] = useState<Set<number>>(
     () => new Set<number>()
@@ -291,8 +301,23 @@ export default function ReviewPage() {
 
       const merged: EvalSegment[] = segRes.segments.map((seg: SegmentWithDecision) => {
         const saved = evalMap.get(seg.index);
+        const baseRepair = seg.ai?.junction_repair;
+        const savedRepair = saved?.ai?.junction_repair;
+        const savedPreference = savedRepair && typeof savedRepair === "object"
+          ? (savedRepair as Record<string, unknown>).user_apply_junction_repair
+          : undefined;
+        const mergedAi = seg.ai && baseRepair && typeof baseRepair === "object" && typeof savedPreference === "boolean"
+          ? {
+              ...seg.ai,
+              junction_repair: {
+                ...(baseRepair as Record<string, unknown>),
+                user_apply_junction_repair: savedPreference,
+              },
+            }
+          : seg.ai;
         return {
           ...seg,
+          ai: mergedAi,
           human: saved?.human ?? null,
         };
       });
@@ -301,6 +326,7 @@ export default function ReviewPage() {
         schema_version: evalRes?.schema_version ?? segRes.schema_version ?? null,
         review_scope: evalRes?.review_scope ?? segRes.review_scope ?? null,
         join_strategy: evalRes?.join_strategy ?? segRes.join_strategy ?? null,
+        stats: segRes.stats ?? evalRes?.stats ?? null,
       });
       setSegments(merged);
     } catch (err) {
@@ -462,6 +488,9 @@ export default function ReviewPage() {
   }, [visibleJunctionPairs]);
 
   const visibleSegments = useMemo(() => {
+    if (showRestoredOnly) {
+      return segments.filter(isLlmJunctionRestore);
+    }
     if (showJunctionOnly) {
       return segments.filter((seg) => visibleJunctionSegmentIndexes.has(seg.index));
     }
@@ -471,7 +500,7 @@ export default function ReviewPage() {
       const gap = rawGapByIndex.get(seg.index);
       return gap !== null && gap !== undefined && gap <= gapFilterMs;
     });
-  }, [gapFilterMs, rawGapByIndex, segments, showJunctionOnly, visibleJunctionSegmentIndexes]);
+  }, [gapFilterMs, rawGapByIndex, segments, showJunctionOnly, showRestoredOnly, visibleJunctionSegmentIndexes]);
 
   const selectedSegments = useMemo(
     () => segments.filter((seg) => selectedSegmentIndexes.has(seg.index)),
@@ -843,6 +872,46 @@ export default function ReviewPage() {
     (s) => s.human && s.ai && s.human.action === aiActionForSegment(s)
   ).length;
   const agreePct = reviewedCount > 0 ? Math.round((agreeCount / reviewedCount) * 100) : 0;
+  const restoredSegments = segments.filter(isLlmJunctionRestore);
+  const appliedRestoredSegments = restoredSegments.filter((seg) => {
+    const repair = junctionRepairMetadata(seg);
+    return repair?.user_apply_junction_repair !== false && seg.human === null;
+  });
+  const restoredDurationMs = restoredSegments.reduce(
+    (total, seg) => total + Math.max(0, seg.end_ms - seg.start_ms),
+    0
+  );
+  const restoredJunctionCount = new Set(
+    restoredSegments
+      .map((seg) => junctionRepairMetadata(seg)?.junction_id)
+      .filter((value): value is string => typeof value === "string" && value.length > 0)
+  ).size;
+  const junctionAuditStats = reviewMetadata.stats?.junction_audit;
+  const engineJunctionAuditStats = junctionAuditStats && typeof junctionAuditStats === "object"
+    ? junctionAuditStats as Record<string, unknown>
+    : null;
+  const manualReviewCount = typeof engineJunctionAuditStats?.manual_review_count === "number"
+    ? engineJunctionAuditStats.manual_review_count
+    : 0;
+  const proposedRestoredSegmentCount = typeof engineJunctionAuditStats?.restored_segment_count === "number"
+    ? engineJunctionAuditStats.restored_segment_count
+    : restoredSegments.length;
+  const proposedRestoredJunctionCount = typeof engineJunctionAuditStats?.restored_junction_count === "number"
+    ? engineJunctionAuditStats.restored_junction_count
+    : restoredJunctionCount;
+  const engineRestoredDurationMs = typeof engineJunctionAuditStats?.restored_duration_ms === "number"
+    ? engineJunctionAuditStats.restored_duration_ms
+    : restoredDurationMs;
+  const repairGroups = Array.from(
+    restoredSegments.reduce((groups, seg) => {
+      const repair = junctionRepairMetadata(seg);
+      const junctionId = typeof repair?.junction_id === "string" ? repair.junction_id : `segment-${seg.index}`;
+      const existing = groups.get(junctionId) ?? [];
+      existing.push(seg);
+      groups.set(junctionId, existing);
+      return groups;
+    }, new Map<string, EvalSegment[]>())
+  );
 
   const previewLabel =
     activePreviewKind === "junction"
@@ -876,6 +945,8 @@ export default function ReviewPage() {
     const isOverlapMerged = overlapMetadata?.merged === true;
     const junctionRepair = junctionRepairMetadata(seg);
     const hasJunctionRepair = junctionRepair !== null;
+    const isJunctionRestore = isLlmJunctionRestore(seg);
+    const isJunctionManualReview = junctionRepair?.type === "llm_junction_manual_review";
     const junctionRepairApplied = junctionRepair?.user_apply_junction_repair !== false;
     const effectiveAi = effectiveAiDecision(seg.ai);
 
@@ -915,11 +986,13 @@ export default function ReviewPage() {
 
         <div
           className={`rounded-lg p-3 transition-all ${
-            aiAction === "cut"
+            isJunctionRestore
+              ? "border-l-4 border-cyan-400"
+              : aiAction === "cut"
               ? "border-l-4 border-red-500"
               : "border-l-4 border-green-500"
           } ${isCurrent ? "ring-2 ring-blue-500" : ""} ${
-            disagree ? "bg-amber-900/20" : "bg-gray-900"
+            disagree ? "bg-amber-900/20" : isJunctionRestore ? "bg-cyan-950/20" : "bg-gray-900"
           }`}
         >
           <div className="flex items-center gap-3 mb-1">
@@ -944,7 +1017,7 @@ export default function ReviewPage() {
                 className="shrink-0 rounded border border-cyan-400/25 bg-cyan-400/10 px-2 py-0.5 text-[11px] font-medium text-cyan-200"
                 title={junctionRepairTitle(junctionRepair)}
               >
-                AI 자동 보정
+                {isJunctionRestore ? "연결부 복구" : isJunctionManualReview ? "수동 확인 필요" : "AI 자동 보정"}
               </span>
             )}
             <span className="text-xs text-gray-400 font-mono">
@@ -977,31 +1050,47 @@ export default function ReviewPage() {
 
           {hasJunctionRepair && junctionRepair && (
             <div className="mb-2 flex flex-wrap items-center gap-2 pl-14 text-xs text-cyan-100">
-              <label
-                className={`flex items-center gap-2 rounded border px-2 py-1 ${
-                  seg.human
-                    ? "border-gray-700 bg-gray-900/70 text-gray-500"
-                    : "border-cyan-400/20 bg-cyan-400/10 text-cyan-200"
-                }`}
-                title={seg.human ? "수동 평가가 AI 자동 보정보다 우선합니다" : "체크하면 보정된 decision이 final preview/export에 적용됩니다"}
-              >
-                <input
-                  type="checkbox"
-                  checked={junctionRepairApplied}
-                  disabled={!viewerCanEdit || Boolean(seg.human)}
-                  onChange={(event) => setJunctionRepairApplied(seg.index, event.target.checked)}
-                  className="h-3.5 w-3.5 rounded border-gray-600 bg-gray-950 accent-cyan-400 disabled:opacity-50"
-                />
-                <span>Final에 적용</span>
-              </label>
+              {!isJunctionManualReview ? (
+                <label
+                  className={`flex items-center gap-2 rounded border px-2 py-1 ${
+                    seg.human
+                      ? "border-gray-700 bg-gray-900/70 text-gray-500"
+                      : "border-cyan-400/20 bg-cyan-400/10 text-cyan-200"
+                  }`}
+                  title={seg.human ? "수동 평가가 AI 자동 보정보다 우선합니다" : "체크하면 보정된 decision이 final preview/export에 적용됩니다"}
+                >
+                  <input
+                    type="checkbox"
+                    checked={junctionRepairApplied}
+                    disabled={!viewerCanEdit || Boolean(seg.human)}
+                    onChange={(event) => setJunctionRepairApplied(seg.index, event.target.checked)}
+                    className="h-3.5 w-3.5 rounded border-gray-600 bg-gray-950 accent-cyan-400 disabled:opacity-50"
+                  />
+                  <span>Final에 적용</span>
+                </label>
+              ) : (
+                <span className="rounded border border-amber-400/20 bg-amber-400/10 px-2 py-1 text-amber-200">
+                  자동 복구 금지 유형 · 사람 판단 필요
+                </span>
+              )}
               <span className="text-gray-400">
                 AI 원판정 {String(junctionRepair.original_action ?? junctionRepair.repaired_from ?? "unknown").toUpperCase()}
                 {" → "}
-                보정 {String(junctionRepair.repaired_to ?? "unknown").toUpperCase()}
+                {isJunctionManualReview ? "복구 제안" : "보정"} {String(junctionRepair.suggested_to ?? junctionRepair.repaired_to ?? "unknown").toUpperCase()}
               </span>
               {Array.isArray(junctionRepair.linked_segment_indices) && (
                 <span className="text-gray-500">
                   연결 #{junctionRepair.linked_segment_indices.map((value) => String(value)).join(", #")}
+                </span>
+              )}
+              {(isJunctionRestore || isJunctionManualReview) && Boolean(junctionRepair.reason) && (
+                <span className="text-cyan-200">
+                  {isJunctionManualReview ? "감지 사유" : "복구 사유"}: {String(junctionRepair.reason)}
+                </span>
+              )}
+              {(isJunctionRestore || isJunctionManualReview) && typeof junctionRepair.confidence === "number" && (
+                <span className="text-gray-400">
+                  신뢰도 {Math.round(junctionRepair.confidence * 100)}%
                 </span>
               )}
             </div>
@@ -1232,6 +1321,22 @@ export default function ReviewPage() {
           <span>전체 <strong className="text-white">{totalSegments}</strong></span>
           <span>리뷰완료 <strong className="text-white">{reviewedCount}</strong></span>
           <span>AI삭제 <strong className="text-red-400">{aiCutCount}</strong></span>
+          <button
+            type="button"
+            onClick={() => setShowRepairList((value) => !value)}
+            className="text-left transition hover:text-cyan-200"
+            disabled={restoredSegments.length === 0}
+            title="복구된 연결부 목록 열기"
+          >
+            연결부 복구 적용 <strong className="text-cyan-300">{appliedRestoredSegments.length}</strong>
+            <span className="text-gray-500"> / 제안 {proposedRestoredSegmentCount} segments · {proposedRestoredJunctionCount}곳</span>
+          </button>
+          {restoredSegments.length > 0 && (
+            <span>복구 시간 <strong className="text-cyan-300">{formatTime(engineRestoredDurationMs)}</strong></span>
+          )}
+          {manualReviewCount > 0 && (
+            <span>수동 확인 필요 <strong className="text-amber-300">{manualReviewCount}곳</strong></span>
+          )}
           <span>일치율 <strong className="text-white">{agreePct}%</strong></span>
           <span>미리보기 <strong className="text-white">{formatTime(durationMs)}</strong></span>
           {showJunctionOnly && (
@@ -1279,7 +1384,10 @@ export default function ReviewPage() {
             )}
             <button
               type="button"
-              onClick={() => setShowJunctionOnly((value) => !value)}
+              onClick={() => {
+                setShowJunctionOnly((value) => !value);
+                setShowRestoredOnly(false);
+              }}
               className={`px-2.5 py-1 rounded text-xs font-medium transition ${
                 showJunctionOnly
                   ? "bg-cyan-500 text-gray-950 hover:bg-cyan-400"
@@ -1287,6 +1395,21 @@ export default function ReviewPage() {
               }`}
             >
               {showJunctionOnly ? "전체 보기" : "연결부만 골라보기"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setShowRestoredOnly((value) => !value);
+                setShowJunctionOnly(false);
+              }}
+              disabled={restoredSegments.length === 0}
+              className={`px-2.5 py-1 rounded text-xs font-medium transition disabled:opacity-40 disabled:cursor-not-allowed ${
+                showRestoredOnly
+                  ? "bg-cyan-500 text-gray-950 hover:bg-cyan-400"
+                  : "bg-gray-800 text-gray-300 hover:bg-gray-700"
+              }`}
+            >
+              {showRestoredOnly ? "전체 보기" : "복구된 구간만 보기"}
             </button>
             {viewerCanEdit && (
               <button
@@ -1327,6 +1450,58 @@ export default function ReviewPage() {
           </div>
         </div>
       </div>
+
+      {showRepairList && restoredSegments.length > 0 && (
+        <div className="border-b border-cyan-900/50 bg-cyan-950/10">
+          <div className="mx-auto max-w-4xl px-6 py-4">
+            <div className="mb-3 flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-cyan-100">복구된 연결부 {repairGroups.length}곳</h2>
+              <button
+                type="button"
+                onClick={() => setShowRepairList(false)}
+                className="text-xs text-gray-500 hover:text-gray-300"
+              >
+                닫기
+              </button>
+            </div>
+            <div className="space-y-2">
+              {repairGroups.map(([junctionId, group], groupIndex) => {
+                const first = group[0];
+                const repair = junctionRepairMetadata(first);
+                const linked = Array.isArray(repair?.linked_segment_indices)
+                  ? repair.linked_segment_indices.map((value) => `#${String(value)}`).join(" → ")
+                  : junctionId;
+                const duration = group.reduce(
+                  (total, seg) => total + Math.max(0, seg.end_ms - seg.start_ms),
+                  0
+                );
+                return (
+                  <button
+                    key={junctionId}
+                    type="button"
+                    onClick={() => {
+                      setShowRepairList(false);
+                      setShowJunctionOnly(false);
+                      setShowRestoredOnly(true);
+                      window.setTimeout(() => {
+                        segmentRefs.current.get(first.index)?.scrollIntoView({ behavior: "smooth", block: "center" });
+                        playSegment(first);
+                      }, 100);
+                    }}
+                    className="flex w-full flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-cyan-900/50 bg-gray-950/60 px-3 py-2 text-left text-xs transition hover:border-cyan-700"
+                  >
+                    <span className="font-medium text-cyan-200">{groupIndex + 1}. {linked}</span>
+                    <span className="text-gray-400">
+                      복구 {group.map((seg) => `#${seg.index}`).join(", ")} · {formatTime(duration)}
+                    </span>
+                    {Boolean(repair?.reason) && <span className="text-gray-500">{String(repair?.reason)}</span>}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Report Panel */}
       {showReport && report && (

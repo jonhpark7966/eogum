@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     avid_provider: str = "codex"
     avid_provider_model: str | None = "gpt-5.5"
     avid_provider_effort: str | None = "xhigh"
+    junction_audit_global_enabled: bool = True
 
     # Chalna
     chalna_url: str = "http://localhost:7861"

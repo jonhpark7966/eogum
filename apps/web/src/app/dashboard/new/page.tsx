@@ -98,6 +98,7 @@ export default function NewProjectPage() {
   const [cutType, setCutType] = useState<CutType>("subtitle_cut");
   const [editIntensity, setEditIntensity] = useState<EditIntensity>("normal");
   const [editDecisionVersion, setEditDecisionVersion] = useState<EditDecisionVersion>("legacy");
+  const [junctionAuditEnabled, setJunctionAuditEnabled] = useState(true);
   const [segmentationBoundaryRule, setSegmentationBoundaryRule] =
     useState<SegmentationBoundaryRule>("word_boundary");
   const [language, setLanguage] = useState("ko");
@@ -168,6 +169,7 @@ export default function NewProjectPage() {
     const projectSettings: Record<string, unknown> = {
       edit_intensity: editIntensity,
       edit_decision_version: editDecisionVersion,
+      junction_audit_enabled: junctionAuditEnabled,
       segmentation_boundary_rule: segmentationBoundaryRule,
       diarize,
       tag_audio_events: tagAudioEvents,
@@ -188,6 +190,7 @@ export default function NewProjectPage() {
     diarize,
     editIntensity,
     editDecisionVersion,
+    junctionAuditEnabled,
     segmentationBoundaryRule,
     numSpeakers,
     overlapProtectionEnabled,
@@ -561,6 +564,22 @@ export default function NewProjectPage() {
               ))}
             </select>
           </div>
+
+          {/* Junction audit */}
+          <label className="flex items-center justify-between gap-4 rounded-lg border border-cyan-500/20 bg-cyan-500/[0.04] p-4 text-sm">
+            <span>
+              <span className="block font-medium">연결부 자동 검토</span>
+              <span className="mt-1 block text-xs leading-5 text-gray-500">
+                Edit Decision 이후 문법·인과·질문/답변 흐름이 명백히 끊긴 연결부만 검사하고 필요한 CUT을 최소 복구합니다.
+              </span>
+            </span>
+            <input
+              type="checkbox"
+              checked={junctionAuditEnabled}
+              onChange={(event) => setJunctionAuditEnabled(event.currentTarget.checked)}
+              className="h-4 w-4 shrink-0 accent-cyan-400"
+            />
+          </label>
 
           {/* Segmentation boundary rule */}
           <div>

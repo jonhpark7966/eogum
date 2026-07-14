@@ -36,6 +36,7 @@ from eogum.services.final_preview_cache import (
     preview_cache_ready,
     source_cache_path,
 )
+from eogum.services.review_payload import merge_saved_review_preferences
 
 logger = logging.getLogger(__name__)
 
@@ -801,6 +802,10 @@ def _process_project(project_id: str, job_id: str | None) -> None:
             edit_intensity=_output_edit_intensity(project),
             edit_decision_version=_output_edit_decision_version(project),
             segmentation_boundary_rule=_output_segmentation_boundary_rule(project),
+            junction_audit_enabled=(
+                _output_junction_audit_enabled(project)
+                and settings.junction_audit_global_enabled
+            ),
             llm_log_path=str(llm_log_path),
             **cut_style_kwargs,
         )
@@ -1220,6 +1225,11 @@ def _output_edit_intensity(project: dict) -> str:
 def _output_edit_decision_version(project: dict) -> str:
     value = (project.get("settings") or {}).get("edit_decision_version")
     return value if value in {"legacy", "boundary_aware_v1"} else "legacy"
+
+
+def _output_junction_audit_enabled(project: dict) -> bool:
+    value = (project.get("settings") or {}).get("junction_audit_enabled", True)
+    return value if isinstance(value, bool) else True
 
 
 def _output_segmentation_boundary_rule(project: dict) -> str:
@@ -1762,10 +1772,15 @@ def _reprocess_project(project_id: str, job_id: str | None) -> None:
         evaluation_path = None
         if eval_segments:
             evaluation_path = temp_dir / "evaluation.json"
-            serialized_evaluation = (
+            saved_evaluation = (
                 evaluation_payload
                 if isinstance(evaluation_payload, dict)
                 else {"segments": eval_segments}
+            )
+            base_review_payload = avid.review_segments(str(working_project_json))
+            serialized_evaluation = merge_saved_review_preferences(
+                base_review_payload,
+                saved_evaluation,
             )
             evaluation_path.write_text(
                 json.dumps(serialized_evaluation, ensure_ascii=False, indent=2),
@@ -2090,6 +2105,10 @@ def _cut_decision_project(project_id: str, job_id: str | None) -> None:
             extra_sources=extra_source_paths or None,
             edit_intensity=_output_edit_intensity(project),
             edit_decision_version=_output_edit_decision_version(project),
+            junction_audit_enabled=(
+                _output_junction_audit_enabled(project)
+                and settings.junction_audit_global_enabled
+            ),
             llm_log_path=str(llm_log_path),
             **cut_style_kwargs,
         )
@@ -2705,6 +2724,12 @@ def _render_final_preview(project_id: str, job_id: str | None) -> None:
         input_project_json.write_bytes(project_json_bytes)
 
         evaluation_path = temp_dir / "evaluation.json"
+        if existing_result_keys.get("preview_kind") != "junction":
+            base_review_payload = avid.review_segments(str(input_project_json))
+            evaluation_payload = merge_saved_review_preferences(
+                base_review_payload,
+                evaluation_payload,
+            )
         evaluation_path.write_text(
             json.dumps(evaluation_payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -4082,6 +4107,7 @@ def _guess_content_type(key: str) -> str:
         "storyline": "application/json",
         "segments_json": "application/json",
         "overlap_protection": "application/json",
+        "junction_audit": "application/json",
         "sync_diagnostics": "application/json",
         "llm_io_log": "application/x-ndjson",
         "preview": "video/mp4",

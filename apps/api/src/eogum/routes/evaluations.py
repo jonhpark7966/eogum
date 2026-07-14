@@ -34,6 +34,7 @@ from eogum.services.final_preview_cache import (
     preview_cache_paths,
     preview_cache_ready,
 )
+from eogum.services.review_payload import merge_saved_review_preferences
 from eogum.services.r2 import download_to_bytes, generate_presigned_stream
 from eogum.services.job_runner import enqueue_final_preview
 
@@ -43,7 +44,6 @@ router = APIRouter(prefix="/projects/{project_id}", tags=["evaluations"])
 
 STREAM_CHUNK_SIZE = 1024 * 1024
 PUBLIC_READONLY_ACTIVE_PREVIEW_LIMIT = 3
-REVIEW_METADATA_KEYS = ("schema_version", "review_scope", "join_strategy")
 
 
 def _select_with_access_columns(select: str) -> str:
@@ -341,28 +341,7 @@ def _canonical_final_preview_payload(db, project_id: str, owner_user_id: str) ->
     base_payload = _review_segments_payload_from_project_json(project_id, download_to_bytes(project_json_key))
     owner_payload = _owner_evaluation_payload(db, project_id, owner_user_id)
 
-    owner_segments_by_index = {}
-    if owner_payload:
-        owner_segments_by_index = {
-            _segment_index(segment): segment
-            for segment in owner_payload.get("segments") or []
-            if _segment_index(segment) is not None
-        }
-
-    merged_segments = []
-    for segment in base_payload.get("segments") or []:
-        merged = dict(segment)
-        owner_segment = owner_segments_by_index.get(_segment_index(merged))
-        owner_human = owner_segment.get("human") if isinstance(owner_segment, dict) else None
-        merged["human"] = owner_human if isinstance(owner_human, dict) else None
-        merged_segments.append(merged)
-
-    payload = {}
-    for key in REVIEW_METADATA_KEYS:
-        value = owner_payload.get(key) if owner_payload else None
-        payload[key] = value if value is not None else base_payload.get(key)
-    payload["segments"] = merged_segments
-    return payload
+    return merge_saved_review_preferences(base_payload, owner_payload)
 
 
 def _effective_ai_decision(ai: dict | None) -> dict:

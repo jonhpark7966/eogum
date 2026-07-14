@@ -554,6 +554,8 @@ def _validate_project_settings(req: ProjectCreate) -> None:
 
     if settings_value.get("overlap_protection_enabled") is None:
         settings_value["overlap_protection_enabled"] = False
+    if settings_value.get("junction_audit_enabled") is None:
+        settings_value["junction_audit_enabled"] = True
 
     for key in (
         "diarize",
@@ -561,6 +563,7 @@ def _validate_project_settings(req: ProjectCreate) -> None:
         "use_llm_segmentation",
         "use_llm_refinement",
         "overlap_protection_enabled",
+        "junction_audit_enabled",
     ):
         value = settings_value.get(key)
         if value is not None and not isinstance(value, bool):
@@ -726,6 +729,18 @@ def create_project_variant(project_id: str, req: ProjectVariantCreate, current_u
         if req.overlap_protection_enabled is not None
         else bool(source_settings.get("overlap_protection_enabled", False))
     )
+    if req.junction_audit_enabled is not None and not isinstance(req.junction_audit_enabled, bool):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="junction_audit_enabled 옵션은 true 또는 false여야 합니다",
+        )
+    junction_audit_enabled = (
+        req.junction_audit_enabled
+        if req.junction_audit_enabled is not None
+        else source_settings.get("junction_audit_enabled", True)
+    )
+    if not isinstance(junction_audit_enabled, bool):
+        junction_audit_enabled = True
 
     variant_settings = {
         **source_settings,
@@ -733,6 +748,7 @@ def create_project_variant(project_id: str, req: ProjectVariantCreate, current_u
         "edit_decision_version": edit_decision_version,
         "segmentation_boundary_rule": segmentation_boundary_rule,
         "overlap_protection_enabled": overlap_protection_enabled,
+        "junction_audit_enabled": junction_audit_enabled,
         "bypass_llm_segmentation_cache": True,
     }
     for internal_key in (

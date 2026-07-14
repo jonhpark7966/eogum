@@ -62,6 +62,7 @@ class ProjectVariantCreate(BaseModel):
     edit_decision_version: str | None = None
     segmentation_boundary_rule: str | None = None
     overlap_protection_enabled: bool | None = None
+    junction_audit_enabled: bool | None = None
     name: str | None = None
 
 

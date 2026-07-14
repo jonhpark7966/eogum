@@ -242,6 +242,61 @@ def test_public_final_preview_uses_owner_review_without_saving(monkeypatch):
     assert inserted["input_payload"]["segments"][1]["human"] is None
 
 
+def test_canonical_preview_overlays_only_saved_junction_repair_preference(monkeypatch):
+    base_segment = _segment(1)
+    base_segment["ai"] = {
+        "action": "keep",
+        "reason": "llm_junction_restore",
+        "confidence": 0.94,
+        "junction_repair": {
+            "type": "llm_junction_restore",
+            "original_action": "cut",
+            "original_reason": "tangent",
+            "repaired_to": "keep",
+            "reason": "base provenance",
+            "user_apply_junction_repair": True,
+        },
+    }
+    saved_segment = _segment(1)
+    saved_segment["ai"] = {
+        "action": "cut",
+        "reason": "tampered",
+        "confidence": 0.1,
+        "junction_repair": {
+            "reason": "tampered provenance",
+            "user_apply_junction_repair": False,
+        },
+    }
+    db = _FakeDb(
+        project=_project(),
+        jobs=[_artifact_job()],
+        evaluations_rows=[{
+            "project_id": "project-1",
+            "evaluator_id": "owner-1",
+            "segments": {"segments": [saved_segment]},
+        }],
+    )
+
+    monkeypatch.setattr(evaluations, "download_to_bytes", lambda _key: _project_json_bytes())
+    monkeypatch.setattr(
+        evaluations.avid,
+        "review_segments",
+        lambda _path: {
+            "schema_version": "review-segments/v1",
+            "review_scope": "content_segments",
+            "join_strategy": "source_segment_index",
+            "segments": [base_segment],
+        },
+    )
+
+    payload = evaluations._canonical_final_preview_payload(db, "project-1", "owner-1")
+
+    merged_repair = payload["segments"][0]["ai"]["junction_repair"]
+    assert merged_repair["user_apply_junction_repair"] is False
+    assert merged_repair["reason"] == "base provenance"
+    assert payload["segments"][0]["ai"]["reason"] == "llm_junction_restore"
+
+
 def test_public_final_preview_rejects_private_project(monkeypatch):
     db = _FakeDb(project=_project())
     monkeypatch.setattr(evaluations, "get_db", lambda: db)

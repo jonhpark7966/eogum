@@ -18,6 +18,7 @@ _DOWNLOAD_TYPES = {
     "preview",
     "sync_diagnostics",
     "llm_io_log",
+    "junction_audit",
 }
 
 
@@ -97,6 +98,7 @@ def download_file(project_id: str, file_type: str, current_user: CurrentUser = D
         "preview": ".mp4",
         "sync_diagnostics": ".sync_diagnostics.json",
         "llm_io_log": ".llm_io.jsonl",
+        "junction_audit": ".junction_audit.json",
     }
     filename = f"{project_data['name']}{ext_map.get(file_type, '')}"
 

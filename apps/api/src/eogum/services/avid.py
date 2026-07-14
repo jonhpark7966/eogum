@@ -249,6 +249,7 @@ def subtitle_cut(
     edit_decision_version: str = "legacy",
     segmentation_boundary_rule: str = "word_boundary",
     llm_log_path: str | None = None,
+    junction_audit_enabled: bool = True,
 ) -> dict[str, str]:
     """Run avid subtitle-cut (Pass 2). Returns result paths dict."""
     args = _apply_provider_args(["subtitle-cut", source_path, "--srt", srt_path])
@@ -263,12 +264,13 @@ def subtitle_cut(
     args += ["--edit-intensity", edit_intensity]
     args += ["--edit-decision-version", edit_decision_version]
     args += ["--segmentation-boundary-rule", segmentation_boundary_rule]
+    args += ["--junction-audit" if junction_audit_enabled else "--no-junction-audit"]
     for src in extra_sources or []:
         args += ["--extra-source", src]
 
     payload = _run_avid_json(
         args,
-        timeout=1800,
+        timeout=7200,
         extra_env=_llm_log_env(llm_log_path, "edit_decision"),
     )
     return {key: str(value) for key, value in (payload.get("artifacts") or {}).items()}
@@ -287,6 +289,7 @@ def podcast_cut(
     segmentation_boundary_rule: str = "word_boundary",
     llm_log_path: str | None = None,
     prompt_profile: str = "podcast",
+    junction_audit_enabled: bool = True,
 ) -> dict[str, str]:
     """Run avid podcast-cut (Pass 2). Returns result paths dict."""
     if prompt_profile not in {"podcast", "ai_frontier"}:
@@ -307,6 +310,7 @@ def podcast_cut(
     args += ["--edit-decision-version", edit_decision_version]
     args += ["--segmentation-boundary-rule", segmentation_boundary_rule]
     args += ["--prompt-profile", prompt_profile]
+    args += ["--junction-audit" if junction_audit_enabled else "--no-junction-audit"]
     for src in extra_sources or []:
         args += ["--extra-source", src]
 

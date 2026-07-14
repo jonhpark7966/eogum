@@ -100,7 +100,7 @@ def _decision(
 def _intervals_ms(path: Path) -> list[tuple[int, int]]:
     return [
         (round(start * 1000), round((start + duration) * 1000))
-        for start, duration in job_runner._final_preview_intervals_from_project_json(path)
+        for start, duration in job_runner._review_timeline_intervals_from_project_json(path)
     ]
 
 
@@ -135,6 +135,51 @@ def test_final_preview_merges_adjacent_enabled_same_speaker_segments(tmp_path: P
     )
 
     assert _intervals_ms(path) == [(1000, 3000), (3600, 3900)]
+
+
+def test_review_timeline_omits_untranscribed_intro_and_outro(tmp_path: Path):
+    path = _write_project_json(
+        tmp_path,
+        duration_ms=2500,
+        segments=[
+            _segment(1, 100, 1000),
+            _segment(2, 1000, 2000),
+        ],
+        decisions=[
+            _decision(1, 100, 1000),
+        ],
+    )
+
+    assert _intervals_ms(path) == [(1000, 2000)]
+
+
+def test_review_timeline_uses_primary_source_when_extra_video_track_comes_first(tmp_path: Path):
+    path = _write_project_json(
+        tmp_path,
+        segments=[
+            _segment(1, 0, 1000),
+            _segment(2, 1000, 2000),
+        ],
+        decisions=[
+            _decision(1, 0, 1000),
+            _decision(2, 1000, 2000, active_video_track_id="extra_video"),
+        ],
+    )
+    project = json.loads(path.read_text())
+    project["source_files"].append({
+        "id": "extra",
+        "path": str(tmp_path / "extra.mp4"),
+        "info": {"duration_ms": 100_000},
+    })
+    project["tracks"].insert(0, {
+        "id": "extra_video",
+        "source_file_id": "extra",
+        "track_type": "video",
+        "offset_ms": 0,
+    })
+    path.write_text(json.dumps(project), encoding="utf-8")
+
+    assert _intervals_ms(path) == [(1000, 2000)]
 
 
 def test_final_preview_treats_primary_track_mutes_as_removed(tmp_path: Path):

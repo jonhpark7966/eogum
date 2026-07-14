@@ -25,51 +25,6 @@ from eogum.services import ai_cut_render, job_runner, media_render  # noqa: E402
 NOW = "2026-07-13T00:00:00+00:00"
 
 
-def _project_json(*, decisions: list[dict]) -> dict:
-    return {
-        "source_files": [
-            {"id": "main", "info": {"duration_ms": 10_000}},
-            {"id": "extra", "info": {"duration_ms": 10_000}},
-        ],
-        "tracks": [
-            {"id": "extra_video", "source_file_id": "extra", "track_type": "video"},
-            {"id": "main_video", "source_file_id": "main", "track_type": "video"},
-        ],
-        "transcription": {
-            "segments": [
-                {"index": 1, "start_ms": 1000, "end_ms": 2000, "text": "only transcript"},
-            ],
-        },
-        "edit_decisions": decisions,
-    }
-
-
-def _decision(track: str, start_ms: int, end_ms: int, edit_type: str = "cut") -> dict:
-    return {
-        "active_video_track_id": track,
-        "edit_type": edit_type,
-        "range": {"start_ms": start_ms, "end_ms": end_ms},
-    }
-
-
-def test_ai_intervals_preserve_intro_outro_and_unmarked_silence():
-    data = _project_json(decisions=[_decision("main_video", 2000, 3000)])
-
-    assert ai_cut_render.keep_ranges_ms(data, 10_000) == [(0, 2000), (3000, 10_000)]
-
-
-def test_ai_intervals_merge_clamp_and_ignore_extra_source_track():
-    data = _project_json(decisions=[
-        _decision("main_video", -500, 1000),
-        _decision("main_video", 800, 2500, "mute"),
-        _decision("main_video", 9000, 12_000),
-        _decision("extra_video", 3000, 8000),
-        _decision("main_video", 3000, 4000, "keep"),
-    ])
-
-    assert ai_cut_render.keep_ranges_ms(data, 10_000) == [(2500, 9000)]
-
-
 def test_render_dedupe_is_canonical_and_changes_with_source_job():
     project = {"source_sha256": "abc"}
     source = {
@@ -391,6 +346,90 @@ def test_atomic_claim_skips_an_already_running_render(monkeypatch, tmp_path: Pat
     assert next(row for row in db.jobs if row["id"] == "render-running")["status"] == "running"
 
 
+def test_ai_cut_render_uses_review_timeline_planner(monkeypatch, tmp_path: Path):
+    db = _Db()
+    source_job = next(row for row in db.jobs if row["id"] == "ai-1")
+    dedupe_key = ai_cut_render.render_dedupe_key(db.project, source_job)
+    db.jobs.append({
+        "id": "render-pending",
+        "project_id": "project-1",
+        "user_id": "owner-1",
+        "type": "ai_cut_render",
+        "status": "pending",
+        "progress": 0,
+        "source_job_id": "ai-1",
+        "dedupe_key": dedupe_key,
+        "processing_metadata": {},
+        "result_r2_keys": None,
+        "created_at": NOW,
+    })
+    source_path = tmp_path / "source.mp4"
+    source_path.write_bytes(b"source")
+    project_payload = {"timeline": "from-ai-project-json"}
+    planned_intervals = [(1.0, 2.0), (4.0, 1.0)]
+    captured = {}
+
+    monkeypatch.setattr(job_runner, "get_db", lambda: db)
+    monkeypatch.setattr(job_runner.settings, "avid_temp_dir", tmp_path)
+    monkeypatch.setattr(job_runner.r2, "download_to_bytes", lambda _key: json.dumps(project_payload).encode())
+    monkeypatch.setattr(job_runner, "_get_cached_source_video", lambda *_args: source_path)
+    monkeypatch.setattr(
+        job_runner.media_render,
+        "probe_media",
+        lambda _path: {
+            "duration_ms": 6000,
+            "video_bitrate": 800_000,
+            "video_bitrate_estimated": False,
+        },
+    )
+
+    def plan_intervals(path: Path):
+        captured["project_payload"] = json.loads(path.read_text())
+        return planned_intervals
+
+    monkeypatch.setattr(job_runner, "_review_timeline_intervals_from_project_json", plan_intervals)
+
+    def render_intervals(_source, intervals, output, **kwargs):
+        captured["intervals"] = intervals
+        captured["profile"] = kwargs["profile"]
+        output.write_bytes(b"rendered")
+        return {"target_video_bitrate": 800_000}
+
+    monkeypatch.setattr(job_runner.media_render, "render_intervals", render_intervals)
+    monkeypatch.setattr(
+        job_runner.media_render,
+        "validate_output",
+        lambda *_args, **_kwargs: {
+            "duration_ms": 3000,
+            "size_bytes": 8,
+            "video_codec": "h264",
+            "audio_codec": "aac",
+            "audio_channels": 2,
+            "width": 320,
+            "height": 180,
+            "fps": 24.0,
+            "av_sync_diff_ms": 0,
+            "target_video_bitrate": 800_000,
+            "video_bitrate": 800_000,
+            "video_bitrate_delta_percent": 0.0,
+        },
+    )
+    monkeypatch.setattr(
+        job_runner.r2,
+        "upload_file",
+        lambda path, key, content_type: captured.update(upload=(path, key, content_type)),
+    )
+
+    job_runner._render_ai_cut("project-1", "render-pending")
+
+    render_job = next(row for row in db.jobs if row["id"] == "render-pending")
+    assert render_job["status"] == "completed"
+    assert captured["project_payload"] == project_payload
+    assert captured["intervals"] == planned_intervals
+    assert captured["profile"] == media_render.WEB_1080P_PROFILE
+    assert captured["upload"][2] == "video/mp4"
+
+
 def test_recovery_completes_a_verified_deterministic_upload(monkeypatch):
     db = _Db()
     job = {
@@ -639,4 +678,4 @@ def test_web_profile_rejects_video_bitrate_drift(monkeypatch, tmp_path: Path):
 
 def test_ai_cut_bitrate_policy_has_a_new_render_identity():
     assert ai_cut_render.WEB_RENDER_PROFILE == media_render.WEB_1080P_PROFILE == "web_1080p_v2"
-    assert ai_cut_render.RENDER_VERSION == 2
+    assert ai_cut_render.RENDER_VERSION == 3

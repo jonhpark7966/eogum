@@ -2252,6 +2252,12 @@ def _range_overlaps_any(start_ms: int, end_ms: int, ranges: list[tuple[int, int]
 
 
 def _primary_video_track(project_data: dict) -> dict | None:
+    source_files = project_data.get("source_files") or []
+    primary_source_id = source_files[0].get("id") if source_files else None
+    if primary_source_id is not None:
+        for track in project_data.get("tracks") or []:
+            if track.get("track_type") == "video" and track.get("source_file_id") == primary_source_id:
+                return track
     for track in project_data.get("tracks") or []:
         if track.get("track_type") == "video":
             return track
@@ -2422,7 +2428,7 @@ def _invert_removed_ranges(
     return keep_ranges
 
 
-def _final_preview_intervals_from_project_json(project_json_path: Path) -> list[tuple[float, float]]:
+def _review_timeline_intervals_from_project_json(project_json_path: Path) -> list[tuple[float, float]]:
     project_data = json.loads(project_json_path.read_text(encoding="utf-8"))
     primary_track = _primary_video_track(project_data)
     if not primary_track:
@@ -2713,7 +2719,7 @@ def _render_final_preview(project_id: str, job_id: str | None) -> None:
         )
         db.table("jobs").update({"progress": 35}).eq("id", job_id).execute()
 
-        intervals = _final_preview_intervals_from_project_json(applied_project_json)
+        intervals = _review_timeline_intervals_from_project_json(applied_project_json)
         if not intervals:
             raise RuntimeError("미리보기로 렌더링할 keep 구간이 없습니다")
         db.table("jobs").update({"progress": 50}).eq("id", job_id).execute()
@@ -2875,13 +2881,14 @@ def _render_ai_cut(project_id: str, job_id: str | None) -> None:
         output_dir.mkdir(exist_ok=True)
         project_json_path = temp_dir / "source.project.avid.json"
         project_json_path.write_bytes(r2.download_to_bytes(project_json_key))
-        project_data = json.loads(project_json_path.read_text(encoding="utf-8"))
 
         source_path = _get_cached_source_video(project, temp_dir)
         source_metadata = media_render.probe_media(source_path)
         db.table("jobs").update({"progress": 20}).eq("id", job_id).eq("status", "running").execute()
 
-        intervals = ai_cut_render.keep_intervals(project_data, source_metadata["duration_ms"])
+        # Keep AI decisions as the source of truth, but plan their rendered
+        # timeline exactly like final preview so both outputs share boundaries.
+        intervals = _review_timeline_intervals_from_project_json(project_json_path)
         if not intervals:
             raise RuntimeError("AI 컷편집 영상으로 렌더링할 keep 구간이 없습니다")
         db.table("jobs").update({"progress": 25}).eq("id", job_id).eq("status", "running").execute()
